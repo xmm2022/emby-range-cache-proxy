@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 
 from aiohttp import ClientError, ClientSession
@@ -43,6 +44,9 @@ class PrewarmWorker:
                     continue
 
                 raw_sources = await self._raw_media_sources(session, item_id)
+                if raw_sources is None:
+                    skipped += 1
+                    continue
                 for raw_source in raw_sources:
                     source = _media_source_from_payload(item_id, raw_source)
                     if source is None:
@@ -75,7 +79,7 @@ class PrewarmWorker:
 
         return PrewarmResult(scanned=len(items), prewarmed=prewarmed, skipped=skipped)
 
-    async def _recent_items(self, session: ClientSession) -> list[dict]:
+    async def _recent_items(self, session: ClientSession) -> list[object]:
         assert self.config.prewarm_api_key is not None
         url = f"{self.config.emby_base_url.rstrip('/')}/Items"
         params = {
@@ -86,24 +90,26 @@ class PrewarmWorker:
             "Recursive": "true",
             "Limit": str(self.config.prewarm.max_items_per_scan),
         }
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            payload = await response.json()
+        payload = await _get_json(session, url, params=params)
+        if not isinstance(payload, dict):
+            return []
         items = payload.get("Items", [])
         return items if isinstance(items, list) else []
 
-    async def _raw_media_sources(self, session: ClientSession, item_id: str) -> list[dict]:
+    async def _raw_media_sources(self, session: ClientSession, item_id: str) -> list[object] | None:
         assert self.config.prewarm_api_key is not None
         url = f"{self.config.emby_base_url.rstrip('/')}/Items/{item_id}/PlaybackInfo"
-        async with session.get(url, params={"api_key": self.config.prewarm_api_key}) as response:
-            response.raise_for_status()
-            payload = await response.json()
+        payload = await _get_json(session, url, params={"api_key": self.config.prewarm_api_key})
+        if payload is None:
+            return None
+        if not isinstance(payload, dict):
+            return None
         sources = payload.get("MediaSources", [])
         return sources if isinstance(sources, list) else []
 
     async def _prewarm_source(self, source: MediaSource) -> None:
         async with OriginClient(chunk_bytes=self.config.cache.chunk_bytes) as origin:
-            metadata = SourceMetadata(url=source.path, size=source.size) if source.size else await origin.head(source.path)
+            metadata = await origin.head(source.path)
             key = cache_key(source, metadata)
             for block_name, byte_range in _prewarm_ranges(metadata.size):
                 writer = self.cache.stage_block(key, block_name, byte_range)
@@ -153,3 +159,13 @@ def _prewarm_ranges(size: int) -> tuple[tuple[str, ByteRange], ...]:
 
 def _is_http_source(source: MediaSource) -> bool:
     return urlsplit(source.path).scheme.lower() in {"http", "https"}
+
+
+async def _get_json(session: ClientSession, url: str, *, params: dict[str, str]) -> Any | None:
+    try:
+        async with session.get(url, params=params) as response:
+            if response.status >= 400:
+                return None
+            return await response.json()
+    except (ClientError, TimeoutError, OSError, ValueError):
+        return None
