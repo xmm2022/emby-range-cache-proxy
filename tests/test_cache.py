@@ -1,5 +1,7 @@
+import pytest
+
 import emby_range_cache_proxy.cache as cache_module
-from emby_range_cache_proxy.cache import HeadTailCache, adaptive_head_tail, cache_key
+from emby_range_cache_proxy.cache import CacheReadError, HeadTailCache, adaptive_head_tail, cache_key
 from emby_range_cache_proxy.models import ByteRange, MediaSource, SourceMetadata
 
 
@@ -55,6 +57,43 @@ def test_store_and_read_head_block(tmp_path):
 
     assert cache.read_block(key, "head", ByteRange(2, 5)) == b"2345"
     assert cache.read_block(key, "head", ByteRange(10, 11)) is None
+
+
+def test_iter_block_yields_requested_range_in_chunks(tmp_path):
+    cache = HeadTailCache(tmp_path, max_bytes=1024 * 1024)
+    key = cache_key(_source(100), _metadata(100))
+    cache.store_block(key, "head", ByteRange(0, 9), b"0123456789")
+
+    chunks = cache.iter_block(key, "head", ByteRange(2, 8), chunk_bytes=3)
+
+    assert chunks is not None
+    assert list(chunks) == [b"234", b"567", b"8"]
+
+
+def test_iter_block_rejects_truncated_cache_entry(tmp_path):
+    cache = HeadTailCache(tmp_path, max_bytes=1024 * 1024)
+    key = cache_key(_source(100), _metadata(100))
+    cache.store_block(key, "head", ByteRange(0, 9), b"0123456789")
+    cache.block_path(key, "head").write_bytes(b"01234")
+
+    assert cache.iter_block(key, "head", ByteRange(0, 9), chunk_bytes=3) is None
+    assert not cache.block_path(key, "head").exists()
+    assert not cache.meta_path(key, "head").exists()
+
+
+def test_iter_block_raises_cache_error_when_file_is_truncated_during_read(tmp_path):
+    cache = HeadTailCache(tmp_path, max_bytes=1024 * 1024)
+    key = cache_key(_source(100), _metadata(100))
+    cache.store_block(key, "head", ByteRange(0, 9), b"0123456789")
+    chunks = cache.iter_block(key, "head", ByteRange(0, 9), chunk_bytes=3)
+
+    assert chunks is not None
+    assert next(chunks) == b"012"
+    cache.block_path(key, "head").write_bytes(b"012")
+    with pytest.raises(CacheReadError):
+        list(chunks)
+    assert not cache.block_path(key, "head").exists()
+    assert not cache.meta_path(key, "head").exists()
 
 
 def test_invalid_key_rejected_and_cannot_escape_root(tmp_path):

@@ -17,6 +17,10 @@ MIB = 1024**2
 KEY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
+class CacheReadError(Exception):
+    pass
+
+
 def adaptive_head_tail(size: int) -> tuple[int, int]:
     if size < 2 * GIB:
         return 16 * MIB, 4 * MIB
@@ -102,6 +106,64 @@ class HeadTailCache:
                 return None
             self._touch(path)
             return data
+
+    def iter_block(
+        self,
+        key: str,
+        block_name: str,
+        requested: ByteRange,
+        *,
+        chunk_bytes: int,
+    ) -> Iterator[bytes] | None:
+        if chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be positive")
+        block_name = self._validate_block_name(block_name)
+        with self._entry_lock(key, block_name):
+            path = self.block_path(key, block_name)
+            meta = self.meta_path(key, block_name)
+            if not path.exists() or not meta.exists():
+                return None
+            try:
+                stored = self._read_range(meta)
+            except (OSError, ValueError):
+                self._remove_entry(path, meta)
+                return None
+            try:
+                if path.stat().st_size != stored.length:
+                    self._remove_entry(path, meta)
+                    return None
+            except OSError:
+                self._remove_entry(path, meta)
+                return None
+            if requested.start < stored.start or requested.end > stored.end:
+                return None
+            try:
+                handle = path.open("rb", buffering=0)
+                handle.seek(requested.start - stored.start)
+            except OSError:
+                self._remove_entry(path, meta)
+                return None
+            self._touch(path)
+
+        def chunks() -> Iterator[bytes]:
+            remaining = requested.length
+            try:
+                while remaining > 0:
+                    expected = min(chunk_bytes, remaining)
+                    try:
+                        data = handle.read(expected)
+                    except OSError as error:
+                        self._remove_entry(path, meta)
+                        raise CacheReadError("failed to read cache block") from error
+                    if len(data) != expected:
+                        self._remove_entry(path, meta)
+                        raise CacheReadError("cache block ended early")
+                    remaining -= len(data)
+                    yield data
+            finally:
+                handle.close()
+
+        return chunks()
 
     def evict_if_needed(self) -> None:
         files = [path for path in self.root.glob("*/*.bin") if path.is_file()]

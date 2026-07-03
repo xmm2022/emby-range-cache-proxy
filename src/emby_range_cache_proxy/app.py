@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, urlsplit
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 from .auth import AuthUnavailable, AuthorizationError, EmbyAuthClient
-from .cache import HeadTailCache, adaptive_head_tail, cache_key
+from .cache import CacheReadError, HeadTailCache, adaptive_head_tail, cache_key
 from .config import Config
 from .models import ByteRange, MediaSource, RequestContext, SourceMetadata
 from .origin import OriginClient, OriginError
@@ -145,18 +145,17 @@ async def serve_authorized_range(
 
         if cache_block is not None:
             block_name, block_range = cache_block
-            cached = cache.read_block(key, block_name, byte_range)
-            if cached is not None:
+            cached_chunks = cache.iter_block(key, block_name, byte_range, chunk_bytes=config.cache.chunk_bytes)
+            if cached_chunks is not None:
                 return await _serve_cached_response(
                     request,
                     status=status,
                     headers=headers,
-                    cached=cached,
+                    cached_chunks=cached_chunks,
                     ctx=ctx,
                     byte_range=byte_range,
                     metadata=metadata,
                     started_at=started_at,
-                    chunk_bytes=config.cache.chunk_bytes,
                     block_name=block_name,
                     block_range=block_range,
                 )
@@ -164,18 +163,17 @@ async def serve_authorized_range(
             if build_lock.locked():
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(_wait_for_cache_build(build_lock), config.cache.build_wait_seconds)
-                cached = cache.read_block(key, block_name, byte_range)
-                if cached is not None:
+                cached_chunks = cache.iter_block(key, block_name, byte_range, chunk_bytes=config.cache.chunk_bytes)
+                if cached_chunks is not None:
                     return await _serve_cached_response(
                         request,
                         status=status,
                         headers=headers,
-                        cached=cached,
+                        cached_chunks=cached_chunks,
                         ctx=ctx,
                         byte_range=byte_range,
                         metadata=metadata,
                         started_at=started_at,
-                        chunk_bytes=config.cache.chunk_bytes,
                         block_name=block_name,
                         block_range=block_range,
                     )
@@ -185,37 +183,35 @@ async def serve_authorized_range(
                     build_lock = None
                 else:
                     await build_lock.acquire()
-                    cached = cache.read_block(key, block_name, byte_range)
-                    if cached is not None:
+                    cached_chunks = cache.iter_block(key, block_name, byte_range, chunk_bytes=config.cache.chunk_bytes)
+                    if cached_chunks is not None:
                         build_lock.release()
                         return await _serve_cached_response(
                             request,
                             status=status,
                             headers=headers,
-                            cached=cached,
+                            cached_chunks=cached_chunks,
                             ctx=ctx,
                             byte_range=byte_range,
                             metadata=metadata,
                             started_at=started_at,
-                            chunk_bytes=config.cache.chunk_bytes,
                             block_name=block_name,
                             block_range=block_range,
                         )
             else:
                 await build_lock.acquire()
-                cached = cache.read_block(key, block_name, byte_range)
-                if cached is not None:
+                cached_chunks = cache.iter_block(key, block_name, byte_range, chunk_bytes=config.cache.chunk_bytes)
+                if cached_chunks is not None:
                     build_lock.release()
                     return await _serve_cached_response(
                         request,
                         status=status,
                         headers=headers,
-                        cached=cached,
+                        cached_chunks=cached_chunks,
                         ctx=ctx,
                         byte_range=byte_range,
                         metadata=metadata,
                         started_at=started_at,
-                        chunk_bytes=config.cache.chunk_bytes,
                         block_name=block_name,
                         block_range=block_range,
                     )
@@ -307,21 +303,22 @@ async def _serve_cached_response(
     *,
     status: int,
     headers: dict[str, str],
-    cached: bytes,
+    cached_chunks,
     ctx: RequestContext,
     byte_range: ByteRange,
     metadata: SourceMetadata,
     started_at: float,
-    chunk_bytes: int,
     block_name: str,
     block_range: ByteRange,
 ) -> web.StreamResponse:
     response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
-    served_bytes = await _write_cached_body(response, cached, chunk_bytes=chunk_bytes)
+    served_bytes, cache_read_bytes, cache_error = await _write_cached_chunks(response, cached_chunks)
+    if cache_error:
+        response.force_close()
     await _write_eof_safely(response)
     _log_proxy_result(
-        "cache_hit",
+        "cache_error" if cache_error else "cache_hit",
         request,
         ctx=ctx,
         byte_range=byte_range,
@@ -330,22 +327,28 @@ async def _serve_cached_response(
         block_name=block_name,
         block_range=block_range,
         served_bytes=served_bytes,
-        cache_read_bytes=len(cached),
+        cache_read_bytes=cache_read_bytes,
         origin_read_bytes=0,
     )
     return response
 
 
-async def _write_cached_body(response: web.StreamResponse, cached: bytes, *, chunk_bytes: int) -> int:
+async def _write_cached_chunks(response: web.StreamResponse, cached_chunks) -> tuple[int, int, bool]:
     sent = 0
-    for offset in range(0, len(cached), chunk_bytes):
-        chunk = cached[offset : offset + chunk_bytes]
-        try:
+    read = 0
+    try:
+        for chunk in cached_chunks:
+            read += len(chunk)
             await response.write(chunk)
-        except (ConnectionError, RuntimeError, OSError):
-            break
-        sent += len(chunk)
-    return sent
+            sent += len(chunk)
+    except CacheReadError:
+        return sent, read, True
+    except (ConnectionError, RuntimeError, OSError):
+        close = getattr(cached_chunks, "close", None)
+        if close is not None:
+            close()
+        return sent, read, False
+    return sent, read, False
 
 
 async def stream_fallback(request: web.Request, config: Config) -> web.StreamResponse:

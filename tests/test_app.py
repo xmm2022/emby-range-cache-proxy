@@ -7,7 +7,9 @@ from aiohttp import web
 import emby_range_cache_proxy.app as app_module
 from emby_range_cache_proxy.auth import AuthUnavailable, AuthorizationError
 from emby_range_cache_proxy.app import create_app
+from emby_range_cache_proxy.cache import CacheReadError
 from emby_range_cache_proxy.config import Config, PathMapping, PrewarmConfig, RolloutConfig
+from emby_range_cache_proxy.models import ByteRange, RequestContext, SourceMetadata
 
 
 FULL_HEAD_BODY = b"0123456789" + b"H" * 90
@@ -409,9 +411,11 @@ async def test_cached_body_is_written_in_configured_chunks():
 
     response = FakeResponse()
 
-    written = await app_module._write_cached_body(response, b"0123456789", chunk_bytes=4)
+    written, read, cache_error = await app_module._write_cached_chunks(response, [b"0123", b"4567", b"89"])
 
     assert written == 10
+    assert read == 10
+    assert not cache_error
     assert response.chunks == [b"0123", b"4567", b"89"]
 
 
@@ -427,10 +431,155 @@ async def test_cached_body_reports_bytes_written_before_disconnect():
 
     response = FakeResponse()
 
-    written = await app_module._write_cached_body(response, b"0123456789", chunk_bytes=4)
+    written, read, cache_error = await app_module._write_cached_chunks(response, [b"0123", b"4567", b"89"])
 
     assert written == 8
+    assert read == 10
+    assert not cache_error
     assert response.chunks == [b"0123", b"4567"]
+
+
+async def test_cached_response_forces_close_when_cache_read_fails(monkeypatch, caplog):
+    class FakeRequest:
+        method = "GET"
+        path = "/emby/videos/1/original.mkv"
+        headers = {"Range": "bytes=0-3"}
+
+    class FakeResponse:
+        def __init__(self, *, status, headers):
+            self.status = status
+            self.headers = headers
+            self.chunks = []
+            self.force_closed = False
+            self.eof_written = False
+
+        async def prepare(self, request):
+            self.request = request
+
+        async def write(self, chunk):
+            self.chunks.append(chunk)
+
+        def force_close(self):
+            self.force_closed = True
+
+        async def write_eof(self):
+            self.eof_written = True
+
+    created = {}
+
+    def stream_response_factory(*, status, headers):
+        response = FakeResponse(status=status, headers=headers)
+        created["response"] = response
+        return response
+
+    def chunks():
+        yield b"01"
+        raise CacheReadError("cache ended early")
+
+    monkeypatch.setattr(app_module.web, "StreamResponse", stream_response_factory)
+
+    with caplog.at_level(logging.INFO, logger="emby_range_cache_proxy.app"):
+        response = await app_module._serve_cached_response(
+            FakeRequest(),
+            status=206,
+            headers={"Content-Length": "4", "Content-Range": "bytes 0-3/10"},
+            cached_chunks=chunks(),
+            ctx=RequestContext(
+                method="GET",
+                raw_path="/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=redacted",
+                item_id="1",
+                media_source_id="ms1",
+                token="redacted",
+                extension="mkv",
+            ),
+            byte_range=ByteRange(0, 3),
+            metadata=SourceMetadata(url="http://origin/movie.mkv", size=10),
+            started_at=0.0,
+            block_name="head",
+            block_range=ByteRange(0, 9),
+        )
+
+    assert response is created["response"]
+    assert response.chunks == [b"01"]
+    assert response.force_closed
+    assert response.eof_written
+    assert "proxy result=cache_error" in caplog.text
+    assert "proxy result=cache_hit" not in caplog.text
+
+
+async def test_cache_hit_streams_file_without_reading_entire_block(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
+    origin_get_calls = 0
+    body = b"0123456789abcdef" + b"T" * 84
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": len(body),
+                        "Container": "mkv",
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        nonlocal origin_get_calls
+        origin_get_calls += 1
+        assert request.headers["Range"] == "bytes=0-15"
+        return web.Response(status=206, body=body[0:16], headers={"Content-Range": "bytes 0-15/100"})
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": str(len(body)), "Content-Type": "video/x-matroska"})
+
+    async def fallback(request):
+        return web.Response(body=b"fallback")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    origin_app = web.Application()
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
+    origin_server = await aiohttp_client(origin_app)
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.get(
+        "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t",
+        headers={"Range": "bytes=0-3"},
+    )
+    assert response.status == 206
+    assert await response.read() == b"0123"
+
+    def forbidden_read_block(*args, **kwargs):
+        raise AssertionError("cache hits must stream from file instead of read_block")
+
+    monkeypatch.setattr(app["cache"], "read_block", forbidden_read_block)
+    response = await client.get(
+        "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t",
+        headers={"Range": "bytes=8-11"},
+    )
+
+    assert response.status == 206
+    assert await response.read() == b"89ab"
+    assert origin_get_calls == 1
 
 
 async def test_strm_media_source_is_resolved_and_cached(aiohttp_client, monkeypatch, tmp_path):
