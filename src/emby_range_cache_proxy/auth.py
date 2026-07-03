@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aiohttp import ClientSession, ClientTimeout
+from aiohttp import ClientError, ClientSession, ClientTimeout
 
 from .models import MediaSource, RequestContext
 
@@ -26,20 +26,38 @@ class EmbyAuthClient:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._session is not None:
-            await self._session.close()
+            try:
+                await self._session.close()
+            finally:
+                self._session = None
 
     async def authorize(self, ctx: RequestContext) -> MediaSource:
         if self._session is None:
             raise RuntimeError("EmbyAuthClient must be used as an async context manager")
         url = f"{self.base_url}/Items/{ctx.item_id}/PlaybackInfo"
-        async with self._session.get(
-            url,
-            params={"MediaSourceId": ctx.media_source_id, "api_key": ctx.token},
-        ) as response:
-            if response.status != 200:
-                raise AuthorizationError(f"Emby authorization failed: status={response.status}")
-            payload = await response.json()
-        for source in payload.get("MediaSources", []):
+        try:
+            async with self._session.get(
+                url,
+                params={"MediaSourceId": ctx.media_source_id, "api_key": ctx.token},
+            ) as response:
+                if response.status != 200:
+                    raise AuthorizationError(f"Emby authorization failed: status={response.status}")
+                try:
+                    payload = await response.json()
+                except (ClientError, ValueError):
+                    raise AuthorizationError("invalid PlaybackInfo response") from None
+        except ClientError:
+            raise AuthorizationError("Emby authorization failed: client error") from None
+
+        if not isinstance(payload, dict):
+            raise AuthorizationError("invalid PlaybackInfo response")
+        media_sources = payload.get("MediaSources", [])
+        if not isinstance(media_sources, list):
+            raise AuthorizationError("invalid PlaybackInfo response")
+
+        for source in media_sources:
+            if not isinstance(source, dict):
+                raise AuthorizationError("invalid PlaybackInfo response")
             if source.get("Id") == ctx.media_source_id:
                 path = source.get("Path")
                 if not path:
@@ -49,8 +67,17 @@ class EmbyAuthClient:
                     media_source_id=ctx.media_source_id,
                     path=path,
                     protocol=str(source.get("Protocol", "")),
-                    size=int(source["Size"]) if source.get("Size") is not None else None,
+                    size=_optional_int(source.get("Size"), "Size"),
                     container=source.get("Container"),
-                    bitrate=int(source["Bitrate"]) if source.get("Bitrate") is not None else None,
+                    bitrate=_optional_int(source.get("Bitrate"), "Bitrate"),
                 )
         raise AuthorizationError("media source not allowed")
+
+
+def _optional_int(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise AuthorizationError(f"invalid media source {field_name}") from None
