@@ -1,0 +1,18 @@
+from pathlib import Path
+
+
+def test_caddy_example_is_self_contained_site_block():
+    caddyfile = Path("deploy/Caddyfile.range-cache.example").read_text()
+    lines = [" ".join(line.split()) for line in caddyfile.splitlines() if line.strip()]
+
+    assert lines[0] == "a.inemby.pp.ua {"
+    assert "@emby_original {" in lines
+    assert "handle @emby_original {" in lines
+    assert "reverse_proxy 127.0.0.1:18180 127.0.0.1:8096 {" in lines
+    assert "lb_policy first" in lines
+    assert "lb_try_duration 2s" in lines
+    assert "lb_try_interval 100ms" in lines
+    assert "fail_duration 10s" in lines
+    assert "flush_interval -1" in lines
+    assert "handle {" in lines
+    assert "reverse_proxy 127.0.0.1:8096" in lines
