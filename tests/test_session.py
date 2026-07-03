@@ -51,17 +51,88 @@ def test_build_session_update_uses_synthetic_session_without_play_session_id():
     assert update.session_hash == hash_identifier("synthetic:1:ms1:" + hash_identifier("device1") + ":0")
 
 
+def test_build_session_update_uses_token_hash_when_play_session_and_device_missing():
+    metadata = SourceMetadata(url="http://origin/movie.mkv", size=1000)
+
+    update = build_session_update(
+        ctx=_ctx(play_session_id=None, device_id=None),
+        cache_key="a" * 64,
+        metadata=metadata,
+        byte_range=ByteRange(100, 199),
+        observed_at=600.0,
+    )
+
+    assert update.session_hash == hash_identifier(
+        "synthetic:1:ms1:" + hash_identifier("user") + ":0"
+    )
+
+
 async def test_session_recorder_queue_does_not_block_when_full(tmp_path):
     store = SessionStateStore(tmp_path / "state.sqlite3")
     recorder = SessionRecorder(store, queue_size=1)
     metadata = SourceMetadata(url="http://origin/movie.mkv", size=1000)
 
-    recorder.record_nowait(_ctx("play1"), "a" * 64, metadata, ByteRange(0, 9), observed_at=1.0)
-    recorder.record_nowait(_ctx("play2"), "b" * 64, metadata, ByteRange(10, 19), observed_at=2.0)
+    assert (
+        recorder.record_nowait(_ctx("play1"), "a" * 64, metadata, ByteRange(0, 9), observed_at=1.0)
+        is True
+    )
+    assert (
+        recorder.record_nowait(_ctx("play2"), "b" * 64, metadata, ByteRange(10, 19), observed_at=2.0)
+        is False
+    )
     await recorder.drain_once()
 
     assert store.get_session(hash_identifier("play1")) is not None
     assert store.get_session(hash_identifier("play2")) is None
+
+
+async def test_session_recorder_start_processes_updates_and_stop_drains_queue(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    recorder = SessionRecorder(store, queue_size=10)
+    metadata = SourceMetadata(url="http://origin/movie.mkv", size=1000)
+
+    recorder.start()
+    assert (
+        recorder.record_nowait(_ctx("play1"), "a" * 64, metadata, ByteRange(0, 9), observed_at=1.0)
+        is True
+    )
+    await recorder.stop()
+
+    assert store.get_session(hash_identifier("play1")) is not None
+    assert recorder._task is not None
+    assert recorder._task.done()
+
+
+async def test_session_recorder_start_is_idempotent(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    recorder = SessionRecorder(store, queue_size=10)
+
+    recorder.start()
+    task = recorder._task
+    recorder.start()
+
+    assert recorder._task is task
+    await recorder.stop()
+
+
+async def test_session_recorder_stop_drains_accepted_updates(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    recorder = SessionRecorder(store, queue_size=10)
+    metadata = SourceMetadata(url="http://origin/movie.mkv", size=1000)
+
+    assert (
+        recorder.record_nowait(_ctx("play1"), "a" * 64, metadata, ByteRange(0, 9), observed_at=1.0)
+        is True
+    )
+    assert (
+        recorder.record_nowait(_ctx("play2"), "b" * 64, metadata, ByteRange(10, 19), observed_at=2.0)
+        is True
+    )
+    recorder.start()
+    await recorder.stop()
+
+    assert store.get_session(hash_identifier("play1")) is not None
+    assert store.get_session(hash_identifier("play2")) is not None
 
 
 def test_mark_idle_and_expire_sessions(tmp_path):

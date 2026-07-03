@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from contextlib import suppress
 
 from .config import SessionConfig
 from .models import ByteRange, RequestContext, SourceMetadata
@@ -32,13 +31,19 @@ def build_session_update(
 ) -> PlaybackSessionUpdate:
     device_hash = hash_identifier(ctx.device_id)
     if ctx.play_session_id:
-        session_hash = hash_identifier(ctx.play_session_id)
+        play_session_hash = hash_identifier(ctx.play_session_id)
+        if play_session_hash is None:
+            raise ValueError("play_session_id did not produce a session hash")
+        session_hash = play_session_hash
     else:
         bucket = int(observed_at // 900)
+        token_hash = hash_identifier(ctx.token)
+        synthetic_identifier_hash = device_hash or token_hash or "anonymous"
         session_hash = hash_identifier(
-            f"synthetic:{ctx.item_id}:{ctx.media_source_id}:{device_hash}:{bucket}"
+            f"synthetic:{ctx.item_id}:{ctx.media_source_id}:{synthetic_identifier_hash}:{bucket}"
         )
-    assert session_hash is not None
+        if session_hash is None:
+            raise ValueError("synthetic session material did not produce a session hash")
     return PlaybackSessionUpdate(
         session_hash=session_hash,
         device_hash=device_hash,
@@ -55,9 +60,9 @@ def build_session_update(
 class SessionRecorder:
     def __init__(self, store: SessionStateStore, *, queue_size: int = 1000) -> None:
         self.store = store
-        self.queue: asyncio.Queue[PlaybackSessionUpdate] = asyncio.Queue(maxsize=queue_size)
+        self.queue: asyncio.Queue[PlaybackSessionUpdate | None] = asyncio.Queue(maxsize=queue_size)
         self._task: asyncio.Task[None] | None = None
-        self._stopped = asyncio.Event()
+        self._stopping = False
 
     def record_nowait(
         self,
@@ -68,6 +73,8 @@ class SessionRecorder:
         *,
         observed_at: float | None = None,
     ) -> bool:
+        if self._stopping:
+            return False
         update = build_session_update(
             ctx=ctx,
             cache_key=cache_key,
@@ -88,23 +95,35 @@ class SessionRecorder:
                 update = self.queue.get_nowait()
             except asyncio.QueueEmpty:
                 return count
+            if update is None:
+                continue
             await asyncio.to_thread(self.store.record_playback, update)
             count += 1
 
     async def run(self) -> None:
-        while not self._stopped.is_set():
+        while True:
             update = await self.queue.get()
+            if update is None:
+                await self.drain_once()
+                return
             await asyncio.to_thread(self.store.record_playback, update)
 
     def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stopping = False
         self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
-        self._stopped.set()
-        if self._task is not None:
-            self._task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._task
+        self._stopping = True
+        if self._task is None:
+            await self.drain_once()
+            return
+        if self._task.done():
+            await self._task
+            return
+        await self.queue.put(None)
+        await self._task
 
     def mark_idle_and_expired(
         self, config: SessionConfig, *, now: float
