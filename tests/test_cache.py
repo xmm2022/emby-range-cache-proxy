@@ -1,3 +1,4 @@
+import emby_range_cache_proxy.cache as cache_module
 from emby_range_cache_proxy.cache import HeadTailCache, adaptive_head_tail, cache_key
 from emby_range_cache_proxy.models import ByteRange, MediaSource, SourceMetadata
 
@@ -140,6 +141,58 @@ def test_stage_block_rejects_short_data_and_removes_temp(tmp_path):
 
     assert cache.read_block(key, "head", ByteRange(0, 4)) is None
     assert list(tmp_path.glob("*/*.tmp")) == []
+
+
+def test_stage_block_commit_failure_during_bin_replace_leaves_no_entry(monkeypatch, tmp_path):
+    cache = HeadTailCache(tmp_path, max_bytes=1024 * 1024)
+    key = _key("a")
+    original_replace = cache_module.os.replace
+
+    def fail_bin_replace(src, dst):
+        if str(dst).endswith("head.bin"):
+            raise OSError("simulated bin replace failure")
+        original_replace(src, dst)
+
+    monkeypatch.setattr(cache_module.os, "replace", fail_bin_replace)
+    writer = cache.stage_block(key, "head", ByteRange(0, 9))
+    writer.write(b"0123456789")
+
+    try:
+        writer.commit()
+    except OSError:
+        pass
+    else:
+        raise AssertionError("expected commit failure")
+
+    assert cache.read_block(key, "head", ByteRange(0, 9)) is None
+    assert not cache.block_path(key, "head").exists()
+    assert not cache.meta_path(key, "head").exists()
+
+
+def test_stage_block_commit_failure_during_meta_replace_removes_bin_and_range(monkeypatch, tmp_path):
+    cache = HeadTailCache(tmp_path, max_bytes=1024 * 1024)
+    key = _key("a")
+    original_replace = cache_module.os.replace
+
+    def fail_meta_replace(src, dst):
+        if str(dst).endswith("head.range"):
+            raise OSError("simulated meta replace failure")
+        original_replace(src, dst)
+
+    monkeypatch.setattr(cache_module.os, "replace", fail_meta_replace)
+    writer = cache.stage_block(key, "head", ByteRange(0, 9))
+    writer.write(b"0123456789")
+
+    try:
+        writer.commit()
+    except OSError:
+        pass
+    else:
+        raise AssertionError("expected commit failure")
+
+    assert cache.read_block(key, "head", ByteRange(0, 9)) is None
+    assert not cache.block_path(key, "head").exists()
+    assert not cache.meta_path(key, "head").exists()
 
 
 def test_evict_lru(tmp_path):

@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from .models import ByteRange, MediaSource, SourceMetadata
 
@@ -41,6 +44,8 @@ class HeadTailCache:
     def __init__(self, root: str | Path, *, max_bytes: int) -> None:
         self.root = Path(root)
         self.max_bytes = max_bytes
+        self._locks_guard = threading.Lock()
+        self._entry_locks: dict[tuple[str, str], threading.RLock] = {}
         self.root.mkdir(parents=True, exist_ok=True)
 
     def block_path(self, key: str, block_name: str) -> Path:
@@ -52,41 +57,51 @@ class HeadTailCache:
     def store_block(self, key: str, block_name: str, byte_range: ByteRange, data: bytes) -> None:
         if len(data) != byte_range.length:
             raise ValueError("data length must match byte_range length")
-        directory = self._cache_dir(key)
-        directory.mkdir(parents=True, exist_ok=True)
-        path = self.block_path(key, block_name)
-        tmp = path.with_name(f"{path.name}.tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, path)
-        meta = self.meta_path(key, block_name)
-        meta_tmp = meta.with_name(f"{meta.name}.tmp")
-        meta_tmp.write_text(f"{byte_range.start}-{byte_range.end}\n")
-        os.replace(meta_tmp, meta)
-        self._touch(path)
+        block_name = self._validate_block_name(block_name)
+        with self._entry_lock(key, block_name):
+            directory = self._cache_dir(key)
+            directory.mkdir(parents=True, exist_ok=True)
+            path = self.block_path(key, block_name)
+            tmp = path.with_name(f"{path.name}.tmp")
+            meta = self.meta_path(key, block_name)
+            meta_tmp = meta.with_name(f"{meta.name}.tmp")
+            try:
+                tmp.write_bytes(data)
+                os.replace(tmp, path)
+                meta_tmp.write_text(f"{byte_range.start}-{byte_range.end}\n")
+                os.replace(meta_tmp, meta)
+                self._touch(path)
+            except OSError:
+                self._remove_entry(path, meta)
+                tmp.unlink(missing_ok=True)
+                meta_tmp.unlink(missing_ok=True)
+                raise
 
     def stage_block(self, key: str, block_name: str, byte_range: ByteRange) -> "CacheBlockWriter":
         return CacheBlockWriter(self, key, block_name, byte_range)
 
     def read_block(self, key: str, block_name: str, requested: ByteRange) -> bytes | None:
-        path = self.block_path(key, block_name)
-        meta = self.meta_path(key, block_name)
-        if not path.exists() or not meta.exists():
-            return None
-        try:
-            stored = self._read_range(meta)
-        except (OSError, ValueError):
-            self._remove_entry(path, meta)
-            return None
-        if requested.start < stored.start or requested.end > stored.end:
-            return None
-        with path.open("rb") as handle:
-            handle.seek(requested.start - stored.start)
-            data = handle.read(requested.length)
-        if len(data) != requested.length:
-            self._remove_entry(path, meta)
-            return None
-        self._touch(path)
-        return data
+        block_name = self._validate_block_name(block_name)
+        with self._entry_lock(key, block_name):
+            path = self.block_path(key, block_name)
+            meta = self.meta_path(key, block_name)
+            if not path.exists() or not meta.exists():
+                return None
+            try:
+                stored = self._read_range(meta)
+            except (OSError, ValueError):
+                self._remove_entry(path, meta)
+                return None
+            if requested.start < stored.start or requested.end > stored.end:
+                return None
+            with path.open("rb") as handle:
+                handle.seek(requested.start - stored.start)
+                data = handle.read(requested.length)
+            if len(data) != requested.length:
+                self._remove_entry(path, meta)
+                return None
+            self._touch(path)
+            return data
 
     def evict_if_needed(self) -> None:
         files = [path for path in self.root.glob("*/*.bin") if path.is_file()]
@@ -124,17 +139,31 @@ class HeadTailCache:
         path.unlink(missing_ok=True)
         meta.unlink(missing_ok=True)
 
+    @contextmanager
+    def _entry_lock(self, key: str, block_name: str) -> Iterator[None]:
+        key = self._validate_key(key)
+        block_name = self._validate_block_name(block_name)
+        with self._locks_guard:
+            lock = self._entry_locks.setdefault((key, block_name), threading.RLock())
+        with lock:
+            yield
+
+    def _validate_key(self, key: str) -> str:
+        if not KEY_PATTERN.fullmatch(key):
+            raise ValueError("cache key must be 64 lowercase hex characters")
+        return key
+
 
 class CacheBlockWriter:
     def __init__(self, cache: HeadTailCache, key: str, block_name: str, byte_range: ByteRange) -> None:
         self.cache = cache
-        self.key = key
+        self.key = cache._validate_key(key)
         self.block_name = cache._validate_block_name(block_name)
         self.byte_range = byte_range
-        self.directory = cache._cache_dir(key)
+        self.directory = cache._cache_dir(self.key)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.path = cache.block_path(key, block_name)
-        self.meta = cache.meta_path(key, block_name)
+        self.path = cache.block_path(self.key, self.block_name)
+        self.meta = cache.meta_path(self.key, self.block_name)
         self.tmp = self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.tmp")
         self._handle = self.tmp.open("wb")
         self.bytes_written = 0
@@ -154,11 +183,18 @@ class CacheBlockWriter:
         if self.bytes_written != self.byte_range.length:
             self.tmp.unlink(missing_ok=True)
             raise ValueError("staged data length must match byte_range length")
-        meta_tmp = self.meta.with_name(f"{self.meta.name}.{uuid.uuid4().hex}.tmp")
-        meta_tmp.write_text(f"{self.byte_range.start}-{self.byte_range.end}\n")
-        os.replace(self.tmp, self.path)
-        os.replace(meta_tmp, self.meta)
-        self.cache._touch(self.path)
+        with self.cache._entry_lock(self.key, self.block_name):
+            meta_tmp = self.meta.with_name(f"{self.meta.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                meta_tmp.write_text(f"{self.byte_range.start}-{self.byte_range.end}\n")
+                os.replace(self.tmp, self.path)
+                os.replace(meta_tmp, self.meta)
+                self.cache._touch(self.path)
+            except OSError:
+                self.cache._remove_entry(self.path, self.meta)
+                self.tmp.unlink(missing_ok=True)
+                meta_tmp.unlink(missing_ok=True)
+                raise
 
     def abort(self) -> None:
         if not self._closed:

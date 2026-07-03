@@ -108,7 +108,7 @@ async def serve_authorized_range(
                 try:
                     writer.commit()
                     cache.evict_if_needed()
-                except ValueError:
+                except (ValueError, OSError):
                     writer.abort()
                     response.force_close()
 

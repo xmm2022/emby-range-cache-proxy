@@ -220,6 +220,68 @@ async def test_origin_ignoring_range_falls_back_before_proxy_response(aiohttp_cl
     assert await response.read() == b"emby"
 
 
+async def test_cache_evict_error_after_origin_stream_does_not_fallback(aiohttp_client, tmp_path):
+    fallback_calls = 0
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": 100,
+                        "Container": "mkv",
+                    }
+                ]
+            }
+        )
+
+    async def fallback(request):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return web.Response(status=206, body=b"fallback", headers={"Content-Range": "bytes 0-7/8"})
+
+    async def origin(request):
+        assert request.headers["Range"] == "bytes=0-9"
+        return web.Response(status=206, body=b"0123456789", headers={"Content-Range": "bytes 0-9/100"})
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": "100"})
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    origin_app = web.Application()
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
+    origin_server = await aiohttp_client(origin_app)
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+        )
+    )
+
+    def fail_evict():
+        raise OSError("simulated evict failure")
+
+    app["cache"].evict_if_needed = fail_evict
+    client = await aiohttp_client(app)
+
+    response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=0-9"})
+
+    assert response.status == 206
+    assert await response.read() == b"0123456789"
+    assert fallback_calls == 0
+
+
 async def test_matching_path_prefix_is_evaluated_after_authorization(aiohttp_client, tmp_path):
     playback_info_calls = 0
 
