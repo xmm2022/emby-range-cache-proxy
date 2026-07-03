@@ -69,11 +69,13 @@ install -d -o emby-cache -g emby-cache -m 0750 /home/nax/emby/cache/range-proxy
 For an interactive smoke test, run the proxy in the background and stop it on exit:
 
 ```bash
+(
 set -eu
 /opt/emby-range-cache-proxy/.venv/bin/emby-range-cache-proxy --config /etc/emby-range-cache-proxy/config.json &
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 curl -fsS http://127.0.0.1:18180/healthz
+)
 ```
 
 Expected: `ok`.
@@ -209,6 +211,7 @@ Expected: Caddy reaches the proxy, proxy cannot contact Emby auth, and the proxy
 Cache-proxy stopped Caddy fallback:
 
 ```bash
+(
 set -eu
 systemctl stop emby-range-cache-proxy.service
 trap 'systemctl start emby-range-cache-proxy.service' EXIT
@@ -216,6 +219,7 @@ curl -sS -D /tmp/proxy-stopped.headers -o /tmp/proxy-stopped.bin \
   -H 'Range: bytes=0-1048575' \
   -H "X-Emby-Token: $TOKEN" \
   "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID"
+)
 ```
 
 Expected: Caddy falls back to `127.0.0.1:8096` because `127.0.0.1:18180` is unavailable. This proves only the connection-failure fallback path.

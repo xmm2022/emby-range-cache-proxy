@@ -2,6 +2,7 @@ import logging
 from types import SimpleNamespace
 
 from aiohttp import web
+import pytest
 
 from emby_range_cache_proxy import cli
 import emby_range_cache_proxy.app as app_module
@@ -132,6 +133,53 @@ async def test_internal_prewarm_key_is_rejected_for_playback_without_auth_lookup
     response = await client.get(
         "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=internal-secret",
         headers={"Range": "bytes=0-3"},
+    )
+
+    assert response.status == 403
+    assert await response.text() == "forbidden\n"
+    assert playback_info_hits == 0
+    assert fallback_hits == 0
+
+
+@pytest.mark.parametrize(
+    "rollout",
+    [
+        RolloutConfig(enabled=False),
+        RolloutConfig(enabled=True, item_allowlist={"2"}),
+    ],
+)
+async def test_internal_prewarm_key_is_rejected_before_rollout_fallback(aiohttp_client, rollout, tmp_path):
+    fallback_hits = 0
+    playback_info_hits = 0
+
+    async def playback_info(request):
+        nonlocal playback_info_hits
+        playback_info_hits += 1
+        return web.json_response({"MediaSources": []})
+
+    async def fallback(request):
+        nonlocal fallback_hits
+        fallback_hits += 1
+        return web.Response(status=200, body=b"fallback")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal-secret",
+            rollout=rollout,
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.get(
+        "/emby/videos/1/original.mkv?MediaSourceId=ms1",
+        headers={"Range": "bytes=0-3", "X-Emby-Token": "internal-secret"},
     )
 
     assert response.status == 403
