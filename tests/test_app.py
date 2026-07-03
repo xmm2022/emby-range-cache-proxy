@@ -399,6 +399,40 @@ async def test_cache_build_and_hit_are_logged_without_token(
     assert origin_get_calls == 1
 
 
+async def test_cached_body_is_written_in_configured_chunks():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks = []
+
+        async def write(self, chunk):
+            self.chunks.append(chunk)
+
+    response = FakeResponse()
+
+    written = await app_module._write_cached_body(response, b"0123456789", chunk_bytes=4)
+
+    assert written == 10
+    assert response.chunks == [b"0123", b"4567", b"89"]
+
+
+async def test_cached_body_reports_bytes_written_before_disconnect():
+    class FakeResponse:
+        def __init__(self):
+            self.chunks = []
+
+        async def write(self, chunk):
+            if len(self.chunks) == 2:
+                raise ConnectionError("client disconnected")
+            self.chunks.append(chunk)
+
+    response = FakeResponse()
+
+    written = await app_module._write_cached_body(response, b"0123456789", chunk_bytes=4)
+
+    assert written == 8
+    assert response.chunks == [b"0123", b"4567"]
+
+
 async def test_strm_media_source_is_resolved_and_cached(aiohttp_client, monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
     origin_get_calls = 0

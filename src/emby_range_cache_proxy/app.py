@@ -156,6 +156,7 @@ async def serve_authorized_range(
                     byte_range=byte_range,
                     metadata=metadata,
                     started_at=started_at,
+                    chunk_bytes=config.cache.chunk_bytes,
                     block_name=block_name,
                     block_range=block_range,
                 )
@@ -174,6 +175,7 @@ async def serve_authorized_range(
                         byte_range=byte_range,
                         metadata=metadata,
                         started_at=started_at,
+                        chunk_bytes=config.cache.chunk_bytes,
                         block_name=block_name,
                         block_range=block_range,
                     )
@@ -195,6 +197,7 @@ async def serve_authorized_range(
                             byte_range=byte_range,
                             metadata=metadata,
                             started_at=started_at,
+                            chunk_bytes=config.cache.chunk_bytes,
                             block_name=block_name,
                             block_range=block_range,
                         )
@@ -212,6 +215,7 @@ async def serve_authorized_range(
                         byte_range=byte_range,
                         metadata=metadata,
                         started_at=started_at,
+                        chunk_bytes=config.cache.chunk_bytes,
                         block_name=block_name,
                         block_range=block_range,
                     )
@@ -308,15 +312,13 @@ async def _serve_cached_response(
     byte_range: ByteRange,
     metadata: SourceMetadata,
     started_at: float,
+    chunk_bytes: int,
     block_name: str,
     block_range: ByteRange,
 ) -> web.StreamResponse:
     response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
-    served_bytes = 0
-    with suppress(ConnectionError, RuntimeError, OSError):
-        await response.write(cached)
-        served_bytes = len(cached)
+    served_bytes = await _write_cached_body(response, cached, chunk_bytes=chunk_bytes)
     await _write_eof_safely(response)
     _log_proxy_result(
         "cache_hit",
@@ -332,6 +334,18 @@ async def _serve_cached_response(
         origin_read_bytes=0,
     )
     return response
+
+
+async def _write_cached_body(response: web.StreamResponse, cached: bytes, *, chunk_bytes: int) -> int:
+    sent = 0
+    for offset in range(0, len(cached), chunk_bytes):
+        chunk = cached[offset : offset + chunk_bytes]
+        try:
+            await response.write(chunk)
+        except (ConnectionError, RuntimeError, OSError):
+            break
+        sent += len(chunk)
+    return sent
 
 
 async def stream_fallback(request: web.Request, config: Config) -> web.StreamResponse:
