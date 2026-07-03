@@ -117,6 +117,19 @@ def test_middle_cache_evicts_exact_ttl_boundary(tmp_path):
     assert store.find_middle_block(_key(), ByteRange(0, 3)) is None
 
 
+def test_middle_cache_iter_treats_expired_record_as_miss(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    cache = MiddleRangeCache(tmp_path / "cache", store, max_bytes=1024 * 1024, ttl_seconds=10)
+
+    cache.store_block(_key(), ByteRange(0, 3), b"data", now=0.0)
+    result = cache.iter_block(_key(), ByteRange(0, 3), chunk_bytes=2, now=10.0)
+
+    assert result is None
+    assert store.find_middle_block(_key(), ByteRange(0, 3)) is None
+    assert not (tmp_path / "cache" / _key() / "mid" / "0-3.bin").exists()
+    assert not (tmp_path / "cache" / _key() / "mid" / "0-3.range").exists()
+
+
 def test_middle_cache_removes_files_when_metadata_upsert_fails(tmp_path, monkeypatch):
     store = SessionStateStore(tmp_path / "state.sqlite3")
     cache = MiddleRangeCache(tmp_path / "cache", store, max_bytes=1024 * 1024, ttl_seconds=60)

@@ -91,6 +91,9 @@ class MiddleRangeCache:
         if not self._record_covers(record, requested) or not self._valid_record(record):
             self._delete_metadata(record)
             return None
+        if record.expires_at <= now:
+            self.remove_block(record)
+            return None
 
         path, sidecar = self._record_paths(record)
         if not self._valid_files(record, path, sidecar):
