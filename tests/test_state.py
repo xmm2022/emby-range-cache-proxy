@@ -818,6 +818,48 @@ def test_old_cancellation_requeue_does_not_requeue_new_running_attempt(tmp_path)
     assert last_error_class is None
 
 
+def test_publish_middle_block_and_complete_checks_attempt_before_publish(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    task = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=0,
+        end=2,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=2.0)[0]
+    publish_called = False
+
+    def publish():
+        nonlocal publish_called
+        publish_called = True
+
+    result = store.publish_middle_block_and_complete_prefetch_task(
+        claimed.id,
+        expected_attempts=2,
+        block=MiddleBlockRecord(
+            cache_key="a" * 64,
+            start=0,
+            end=2,
+            path=("a" * 64) + "/mid/0-2.bin",
+            size=3,
+            created_at=3.0,
+            last_access_at=3.0,
+            expires_at=63.0,
+        ),
+        now=3.0,
+        publish=publish,
+    )
+
+    assert task is not None
+    assert result is False
+    assert publish_called is False
+    assert store.find_middle_block("a" * 64, ByteRange(0, 2)) is None
+
+
 def test_record_playback_keeps_max_observed_offset_when_later_update_has_smaller_range(
     tmp_path,
 ):

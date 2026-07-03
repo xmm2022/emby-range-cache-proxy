@@ -47,6 +47,61 @@ class MiddleRangeCache:
             key, byte_range, data, now=now, precommit=precommit
         )
 
+    def store_prefetch_block(
+        self,
+        task_id: int,
+        *,
+        expected_attempts: int,
+        key: str,
+        byte_range: ByteRange,
+        data: bytes,
+        now: float,
+    ) -> bool:
+        key = self._validate_key(key)
+        self._validate_byte_range(byte_range)
+        if len(data) != byte_range.length:
+            raise ValueError("data length must match byte_range length")
+        self.evict_expired(now=now)
+
+        path, sidecar = self._paths(key, byte_range.start, byte_range.end)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        sidecar_tmp = sidecar.with_name(f"{sidecar.name}.{uuid.uuid4().hex}.tmp")
+        block = MiddleBlockRecord(
+            cache_key=key,
+            start=byte_range.start,
+            end=byte_range.end,
+            path=self._relative_path(key, byte_range.start, byte_range.end),
+            size=len(data),
+            created_at=now,
+            last_access_at=now,
+            expires_at=now + self.ttl_seconds,
+        )
+
+        try:
+            tmp.write_bytes(data)
+            sidecar_tmp.write_text(f"{byte_range.start}-{byte_range.end}\n")
+
+            def publish() -> None:
+                os.replace(tmp, path)
+                os.replace(sidecar_tmp, sidecar)
+
+            published = self.store.publish_middle_block_and_complete_prefetch_task(
+                task_id,
+                expected_attempts=expected_attempts,
+                block=block,
+                now=now,
+                publish=publish,
+            )
+            if not published:
+                tmp.unlink(missing_ok=True)
+                sidecar_tmp.unlink(missing_ok=True)
+            return published
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            sidecar_tmp.unlink(missing_ok=True)
+            raise
+
     def _store_block(
         self,
         key: str,

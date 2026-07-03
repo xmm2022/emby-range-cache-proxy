@@ -46,6 +46,42 @@ def test_middle_cache_guarded_store_does_not_publish_when_precommit_fails(tmp_pa
     assert record.created_at == 10.0
 
 
+def test_middle_cache_prefetch_store_does_not_publish_when_attempt_mismatch(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    cache = MiddleRangeCache(
+        tmp_path / "cache", store, max_bytes=1024 * 1024, ttl_seconds=60
+    )
+    cache.store_block(_key(), ByteRange(0, 2), b"new", now=10.0)
+    task = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key=_key(),
+        start=0,
+        end=2,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=2.0)[0]
+
+    published = cache.store_prefetch_block(
+        claimed.id,
+        expected_attempts=2,
+        key=_key(),
+        byte_range=ByteRange(0, 2),
+        data=b"old",
+        now=9.0,
+    )
+    chunks = cache.iter_block(_key(), ByteRange(0, 2), chunk_bytes=3, now=11.0)
+    record = store.find_middle_block(_key(), ByteRange(0, 2))
+
+    assert task is not None
+    assert published is False
+    assert chunks is not None
+    assert b"".join(chunks) == b"new"
+    assert record.created_at == 10.0
+
+
 def test_middle_cache_miss_for_partial_coverage(tmp_path):
     store = SessionStateStore(tmp_path / "state.sqlite3")
     cache = MiddleRangeCache(tmp_path / "cache", store, max_bytes=1024 * 1024, ttl_seconds=60)

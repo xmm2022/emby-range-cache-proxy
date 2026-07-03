@@ -4,6 +4,7 @@ import hashlib
 import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable
 
 from .models import ByteRange
 
@@ -476,22 +477,6 @@ class SessionStateStore:
             )
             return cursor.rowcount == 1
 
-    def refresh_prefetch_task_attempt(
-        self, task_id: int, *, now: float, expected_attempts: int
-    ) -> bool:
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE prefetch_tasks
-                SET updated_at = ?
-                WHERE id = ?
-                  AND status = 'running'
-                  AND attempts = ?
-                """,
-                (now, task_id, expected_attempts),
-            )
-            return cursor.rowcount == 1
-
     def queue_depth(self) -> int:
         with self._connect() as conn:
             row = conn.execute(
@@ -501,31 +486,48 @@ class SessionStateStore:
 
     def upsert_middle_block(self, block: MiddleBlockRecord) -> None:
         with self._connect() as conn:
-            conn.execute(
+            _upsert_middle_block(conn, block)
+
+    def publish_middle_block_and_complete_prefetch_task(
+        self,
+        task_id: int,
+        *,
+        expected_attempts: int,
+        block: MiddleBlockRecord,
+        now: float,
+        publish: Callable[[], None],
+    ) -> bool:
+        with self._connect() as conn:
+            _begin_immediate(conn)
+            current = conn.execute(
                 """
-                INSERT INTO middle_blocks (
-                    cache_key, start, end, path, size, created_at,
-                    last_access_at, expires_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(cache_key, start, end) DO UPDATE SET
-                    path = excluded.path,
-                    size = excluded.size,
-                    created_at = excluded.created_at,
-                    last_access_at = excluded.last_access_at,
-                    expires_at = excluded.expires_at
+                SELECT 1
+                FROM prefetch_tasks
+                WHERE id = ?
+                  AND status = 'running'
+                  AND attempts = ?
                 """,
-                (
-                    block.cache_key,
-                    block.start,
-                    block.end,
-                    block.path,
-                    block.size,
-                    block.created_at,
-                    block.last_access_at,
-                    block.expires_at,
-                ),
+                (task_id, expected_attempts),
+            ).fetchone()
+            if current is None:
+                return False
+
+            publish()
+            _upsert_middle_block(conn, block)
+            cursor = conn.execute(
+                """
+                UPDATE prefetch_tasks
+                SET status = 'done',
+                    updated_at = ?,
+                    last_error_class = NULL,
+                    next_attempt_at = NULL
+                WHERE id = ?
+                  AND status = 'running'
+                  AND attempts = ?
+                """,
+                (now, task_id, expected_attempts),
             )
+            return cursor.rowcount == 1
 
     def find_middle_block(
         self, cache_key: str, byte_range: ByteRange
@@ -687,6 +689,34 @@ class SessionStateStore:
 
 def _begin_immediate(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN IMMEDIATE")
+
+
+def _upsert_middle_block(conn: sqlite3.Connection, block: MiddleBlockRecord) -> None:
+    conn.execute(
+        """
+        INSERT INTO middle_blocks (
+            cache_key, start, end, path, size, created_at,
+            last_access_at, expires_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(cache_key, start, end) DO UPDATE SET
+            path = excluded.path,
+            size = excluded.size,
+            created_at = excluded.created_at,
+            last_access_at = excluded.last_access_at,
+            expires_at = excluded.expires_at
+        """,
+        (
+            block.cache_key,
+            block.start,
+            block.end,
+            block.path,
+            block.size,
+            block.created_at,
+            block.last_access_at,
+            block.expires_at,
+        ),
+    )
 
 
 def _ensure_column(

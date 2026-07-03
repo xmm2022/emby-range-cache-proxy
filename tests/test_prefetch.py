@@ -1,8 +1,10 @@
 import asyncio
+import sqlite3
 
 import pytest
 from aiohttp import web
 
+from emby_range_cache_proxy import middle_cache as middle_cache_module
 from emby_range_cache_proxy.cache import cache_key
 from emby_range_cache_proxy.config import (
     Config,
@@ -320,6 +322,79 @@ async def test_prefetch_worker_old_attempt_does_not_publish_middle_cache(tmp_pat
     assert b"".join(chunks) == b"new"
     assert before.created_at == 13.0
     assert after.created_at == 13.0
+
+
+async def test_prefetch_worker_publish_cannot_be_reclaimed_before_complete(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "state.db"
+    store = SessionStateStore(db_path)
+    middle = MiddleRangeCache(
+        tmp_path / "mid", store, max_bytes=1024, ttl_seconds=60
+    )
+    task = store.enqueue_prefetch_task(
+        "1",
+        "ms1",
+        "a" * 64,
+        0,
+        2,
+        priority=1,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    first = store.claim_prefetch_tasks(limit=1, now=2.0)[0]
+    racing_store = SessionStateStore(db_path)
+
+    def connect_without_waiting():
+        conn = sqlite3.connect(db_path, timeout=0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    racing_store._connect = connect_without_waiting
+    race = {"attempted": False, "claimed": False, "locked": False}
+    original_replace = middle_cache_module.os.replace
+
+    def replace_and_try_reclaim(source, target):
+        if not race["attempted"]:
+            race["attempted"] = True
+            try:
+                claimed = racing_store.claim_prefetch_tasks(
+                    limit=1,
+                    now=24.0,
+                    running_stale_seconds=10,
+                )
+                race["claimed"] = bool(claimed)
+            except sqlite3.OperationalError as error:
+                race["locked"] = "locked" in str(error)
+        original_replace(source, target)
+
+    monkeypatch.setattr(middle_cache_module.os, "replace", replace_and_try_reclaim)
+    worker = PrefetchWorker(
+        Config(
+            emby_base_url="http://emby",
+            fallback_base_url="http://fallback",
+            cache_dir=str(tmp_path),
+        ),
+        store,
+        middle,
+    )
+
+    result = worker._store_completed_task(first, ByteRange(0, 2), b"old", 13.0)
+    chunks = middle.iter_block("a" * 64, ByteRange(0, 2), chunk_bytes=3, now=14.0)
+
+    assert task is not None
+    assert race["attempted"] is True
+    assert race["claimed"] is False
+    assert result is True
+    assert chunks is not None
+    assert b"".join(chunks) == b"old"
+    with sqlite3.connect(db_path) as conn:
+        status, attempts = conn.execute(
+            "SELECT status, attempts FROM prefetch_tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+    assert status == "done"
+    assert attempts == 1
 
 
 async def test_prefetch_worker_source_missing_skips_with_retry(tmp_path):

@@ -188,26 +188,19 @@ class PrefetchWorker:
         data: bytes,
         now: float,
     ) -> bool:
-        stored = self.middle_cache.store_block_if_current(
-            task.cache_key,
-            byte_range,
-            data,
+        stored = self.middle_cache.store_prefetch_block(
+            task.id,
+            expected_attempts=task.attempts,
+            key=task.cache_key,
+            byte_range=byte_range,
+            data=data,
             now=now,
-            precommit=lambda: self.store.refresh_prefetch_task_attempt(
-                task.id,
-                now=now,
-                expected_attempts=task.attempts,
-            ),
         )
         if not stored:
             return False
         self.middle_cache.evict_expired(now=now)
         self.middle_cache.evict_lru_if_needed()
-        return self.store.complete_prefetch_task(
-            task.id,
-            now=now,
-            expected_attempts=task.attempts,
-        )
+        return True
 
 
 def align_down(value: int, alignment: int) -> int:
