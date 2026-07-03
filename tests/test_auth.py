@@ -229,3 +229,22 @@ async def test_authorize_rejects_emby_403(aiohttp_client):
     async with EmbyAuthClient(str(server.make_url(""))) as client:
         with pytest.raises(AuthorizationError, match="Emby authorization failed"):
             await client.authorize(_ctx())
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+async def test_authorize_treats_emby_5xx_as_unavailable_without_leaking_token(aiohttp_client, status):
+    async def playback_info(request):
+        return web.Response(status=status, text="api_key=user-token")
+
+    app = web.Application()
+    app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    server = await aiohttp_client(app)
+
+    async with EmbyAuthClient(str(server.make_url(""))) as client:
+        with pytest.raises(AuthUnavailable, match=f"status={status}") as exc_info:
+            await client.authorize(_ctx())
+
+    message = str(exc_info.value)
+    assert "api_key" not in message
+    assert "user-token" not in message
+    assert str(server.make_url("")) not in message

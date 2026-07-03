@@ -51,6 +51,30 @@ def test_empty_allowlists_mean_allowed_when_rollout_enabled():
     assert config.rollout.in_scope(item_id="1", media_source_id="ms1") is True
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("item_allowlist", "1"),
+        ("media_source_allowlist", "ms1"),
+        ("path_prefix_allowlist", "http://origin/"),
+    ],
+)
+def test_load_config_rejects_string_allowlists(tmp_path, field, value):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "rollout": {"enabled": True, field: value},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match=field):
+        load_config(path)
+
+
 @pytest.mark.parametrize("interval_seconds", [0, -1, 59])
 def test_prewarm_config_rejects_short_interval(interval_seconds):
     with pytest.raises(ValueError, match="prewarm\\.interval_seconds"):

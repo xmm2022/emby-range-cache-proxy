@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from urllib.parse import parse_qsl, urlsplit
 
-from aiohttp import ClientError, ClientSession, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 from .auth import AuthUnavailable, AuthorizationError, EmbyAuthClient
 from .cache import HeadTailCache, adaptive_head_tail, cache_key
@@ -117,33 +117,53 @@ async def serve_authorized_range(
         metadata = await origin.head(source.path)
         byte_range = parse_range_header(request.headers.get("Range"), size=metadata.size)
         key = cache_key(source, metadata)
-        block_name = _cache_block_for_request(byte_range, metadata)
+        cache_block = _cache_block_for_request(byte_range, metadata)
         status = 206 if request.headers.get("Range") else 200
         headers = _range_response_headers(byte_range, metadata, include_content_range=status == 206)
 
         if request.method == "HEAD":
             return web.Response(status=status, headers=headers)
 
-        if block_name is not None:
+        if cache_block is not None:
+            block_name, block_range = cache_block
             cached = cache.read_block(key, block_name, byte_range)
             if cached is not None:
                 return web.Response(status=status, body=cached, headers=headers)
+        else:
+            block_name = None
+            block_range = byte_range
 
         response = web.StreamResponse(status=status, headers=headers)
-        async with origin.open_range(source.path, byte_range, size=metadata.size) as upstream:
+        async with origin.open_range(source.path, block_range, size=metadata.size) as upstream:
             await response.prepare(request)
-            writer = cache.stage_block(key, block_name, byte_range) if block_name is not None else None
+            writer = cache.stage_block(key, block_name, block_range) if block_name is not None else None
+            upstream_offset = block_range.start
+            response_bytes_written = 0
+            response_done = False
             try:
                 async for chunk in upstream.content.iter_chunked(config.cache.chunk_bytes):
                     if chunk:
-                        await response.write(chunk)
+                        chunk_start = upstream_offset
+                        chunk_end = upstream_offset + len(chunk) - 1
+                        upstream_offset += len(chunk)
                         if writer is not None:
                             writer.write(chunk)
+                        if not response_done:
+                            overlap_start = max(chunk_start, byte_range.start)
+                            overlap_end = min(chunk_end, byte_range.end)
+                            if overlap_start <= overlap_end:
+                                data = chunk[overlap_start - chunk_start : overlap_end - chunk_start + 1]
+                                await response.write(data)
+                                response_bytes_written += len(data)
+                                if response_bytes_written == byte_range.length:
+                                    await _write_eof_safely(response)
+                                    response_done = True
             except (OriginError, ClientError, TimeoutError, OSError):
                 if writer is not None:
                     writer.abort()
-                response.force_close()
-                await _write_eof_safely(response)
+                if not response_done:
+                    response.force_close()
+                    await _write_eof_safely(response)
                 return response
 
             if writer is not None:
@@ -152,9 +172,11 @@ async def serve_authorized_range(
                     cache.evict_if_needed()
                 except (ValueError, OSError):
                     writer.abort()
-                    response.force_close()
+                    if not response_done:
+                        response.force_close()
 
-        await _write_eof_safely(response)
+        if not response_done:
+            await _write_eof_safely(response)
         return response
 
 
@@ -162,7 +184,8 @@ async def stream_fallback(request: web.Request, config: Config) -> web.StreamRes
     url = f"{config.fallback_base_url.rstrip('/')}{request.raw_path}"
     headers = _forward_request_headers(request)
     body = None if request.method in {"GET", "HEAD"} else _request_body(request)
-    async with ClientSession() as session:
+    timeout = ClientTimeout(total=None, sock_connect=30.0, sock_read=None)
+    async with ClientSession(timeout=timeout) as session:
         async with session.request(
             request.method,
             url,
@@ -260,14 +283,14 @@ def _pre_authorization_rollout_scope(config: Config, *, item_id: str, media_sour
     )
 
 
-def _cache_block_for_request(byte_range: ByteRange, metadata: SourceMetadata) -> str | None:
+def _cache_block_for_request(byte_range: ByteRange, metadata: SourceMetadata) -> tuple[str, ByteRange] | None:
     head_size, tail_size = adaptive_head_tail(metadata.size)
     head_range = ByteRange(0, min(head_size, metadata.size) - 1)
     tail_range = ByteRange(max(0, metadata.size - tail_size), metadata.size - 1)
     if _range_contains(head_range, byte_range):
-        return "head"
+        return "head", head_range
     if _range_contains(tail_range, byte_range):
-        return "tail"
+        return "tail", tail_range
     return None
 
 

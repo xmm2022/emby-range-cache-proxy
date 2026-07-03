@@ -45,8 +45,10 @@ class EmbyAuthClient:
                 url,
                 params={"MediaSourceId": ctx.media_source_id, "api_key": ctx.token},
             ) as response:
-                if response.status != 200:
+                if response.status in {401, 403, 404}:
                     raise AuthorizationError(f"Emby authorization failed: status={response.status}")
+                if response.status != 200:
+                    raise AuthUnavailable(f"Emby authorization unavailable: status={response.status}")
                 try:
                     payload = await response.json()
                 except (ContentTypeError, ValueError):

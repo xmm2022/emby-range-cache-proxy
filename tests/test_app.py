@@ -1,11 +1,15 @@
 import asyncio
 
+from aiohttp import ClientTimeout
 from aiohttp import web
 
 import emby_range_cache_proxy.app as app_module
 from emby_range_cache_proxy.auth import AuthUnavailable, AuthorizationError
 from emby_range_cache_proxy.app import create_app
 from emby_range_cache_proxy.config import Config, PrewarmConfig, RolloutConfig
+
+
+FULL_HEAD_BODY = b"0123456789" + b"H" * 90
 
 
 async def test_healthz(aiohttp_client, tmp_path):
@@ -123,8 +127,8 @@ async def test_authorized_head_range_is_served_and_cached(aiohttp_client, tmp_pa
         origin_get_calls += 1
         if origin_get_calls > 1:
             return web.Response(status=500, body=b"origin should not be hit after cache fill")
-        assert request.headers["Range"] == "bytes=0-9"
-        return web.Response(status=206, body=b"0123456789", headers={"Content-Range": "bytes 0-9/100"})
+        assert request.headers["Range"] == "bytes=0-99"
+        return web.Response(status=206, body=FULL_HEAD_BODY, headers={"Content-Range": "bytes 0-99/100"})
 
     async def fallback(request):
         return web.Response(body=b"fallback")
@@ -161,6 +165,72 @@ async def test_authorized_head_range_is_served_and_cached(aiohttp_client, tmp_pa
 
     assert response.status == 206
     assert await response.read() == b"0123456789"
+    assert origin_get_calls == 1
+
+
+async def test_head_request_builds_full_adaptive_head_block_for_later_subrange(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
+    origin_get_calls = 0
+    body = b"0123456789abcdef" + b"T" * 84
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": len(body),
+                        "Container": "mkv",
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        nonlocal origin_get_calls
+        origin_get_calls += 1
+        assert request.headers["Range"] == "bytes=0-15"
+        return web.Response(status=206, body=body[0:16], headers={"Content-Range": "bytes 0-15/100"})
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": str(len(body))})
+
+    async def fallback(request):
+        return web.Response(body=b"fallback")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    origin_app = web.Application()
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
+    origin_server = await aiohttp_client(origin_app)
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=0-3"})
+
+    assert response.status == 206
+    assert await response.read() == b"0123"
+
+    response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=8-11"})
+
+    assert response.status == 206
+    assert await response.read() == b"89ab"
     assert origin_get_calls == 1
 
 
@@ -247,7 +317,7 @@ async def test_origin_ignoring_range_falls_back_before_proxy_response(aiohttp_cl
         return web.Response(status=206, body=b"emby", headers={"Content-Range": "bytes 0-3/4"})
 
     async def origin(request):
-        assert request.headers["Range"] == "bytes=0-3"
+        assert request.headers["Range"] == "bytes=0-99"
         return web.Response(status=200, body=b"0123456789")
 
     async def origin_head(request):
@@ -304,8 +374,8 @@ async def test_cache_evict_error_after_origin_stream_does_not_fallback(aiohttp_c
         return web.Response(status=206, body=b"fallback", headers={"Content-Range": "bytes 0-7/8"})
 
     async def origin(request):
-        assert request.headers["Range"] == "bytes=0-9"
-        return web.Response(status=206, body=b"0123456789", headers={"Content-Range": "bytes 0-9/100"})
+        assert request.headers["Range"] == "bytes=0-99"
+        return web.Response(status=206, body=FULL_HEAD_BODY, headers={"Content-Range": "bytes 0-99/100"})
 
     async def origin_head(request):
         return web.Response(headers={"Content-Length": "100"})
@@ -363,7 +433,8 @@ async def test_matching_path_prefix_is_evaluated_after_authorization(aiohttp_cli
         )
 
     async def origin(request):
-        return web.Response(status=206, body=b"0123456789", headers={"Content-Range": "bytes 0-9/100"})
+        assert request.headers["Range"] == "bytes=0-99"
+        return web.Response(status=206, body=FULL_HEAD_BODY, headers={"Content-Range": "bytes 0-99/100"})
 
     async def fallback(request):
         return web.Response(body=b"fallback")
@@ -531,3 +602,41 @@ async def test_authorization_unavailable_falls_back_to_emby(aiohttp_client, monk
     assert response.status == 206
     assert await response.read() == b"fallback"
     assert fallback_calls == 1
+
+
+async def test_stream_fallback_uses_long_stream_timeout(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeRequest:
+        method = "GET"
+        raw_path = "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t"
+        headers = {}
+
+    class FakeSession:
+        def __init__(self, *, timeout):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        def request(self, *args, **kwargs):
+            raise AssertionError("timeout should be asserted before network request")
+
+    monkeypatch.setattr(app_module, "ClientSession", FakeSession)
+
+    try:
+        await app_module.stream_fallback(
+            FakeRequest(),
+            Config(emby_base_url="http://emby", fallback_base_url="http://emby", cache_dir=str(tmp_path)),
+        )
+    except AssertionError:
+        pass
+
+    timeout = captured["timeout"]
+    assert isinstance(timeout, ClientTimeout)
+    assert timeout.total is None
+    assert timeout.sock_connect == 30.0
+    assert timeout.sock_read is None

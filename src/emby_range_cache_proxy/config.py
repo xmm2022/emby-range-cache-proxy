@@ -68,18 +68,24 @@ class Config:
     prewarm: PrewarmConfig = field(default_factory=PrewarmConfig)
 
 
-def _string_set(values: Any) -> set[str]:
+def _string_list(values: Any, field_name: str) -> list[str]:
     if values is None:
-        return set()
-    return {str(value) for value in values}
+        return []
+    if isinstance(values, (str, bytes)) or not isinstance(values, list):
+        raise ValueError(f"rollout.{field_name} must be a list")
+    return [str(value) for value in values]
+
+
+def _string_set(values: Any, field_name: str) -> set[str]:
+    return set(_string_list(values, field_name))
 
 
 def _rollout(data: dict[str, Any]) -> RolloutConfig:
     return RolloutConfig(
         enabled=bool(data.get("enabled", False)),
-        item_allowlist=_string_set(data.get("item_allowlist")),
-        media_source_allowlist=_string_set(data.get("media_source_allowlist")),
-        path_prefix_allowlist=tuple(str(v) for v in data.get("path_prefix_allowlist", [])),
+        item_allowlist=_string_set(data.get("item_allowlist"), "item_allowlist"),
+        media_source_allowlist=_string_set(data.get("media_source_allowlist"), "media_source_allowlist"),
+        path_prefix_allowlist=tuple(_string_list(data.get("path_prefix_allowlist"), "path_prefix_allowlist")),
     )
 
 
