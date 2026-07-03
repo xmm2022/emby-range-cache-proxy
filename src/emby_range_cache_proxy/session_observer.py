@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from aiohttp import ClientError, ClientSession
+from aiohttp import ClientError, ClientSession, ClientTimeout
 
 from .config import Config
 from .state import PlaybackSessionRecord, SessionStateStore, hash_identifier
@@ -33,15 +33,24 @@ def extract_observed_session_hashes(payload: Any) -> set[str]:
 
 
 class EmbySessionObserver:
-    def __init__(self, config: Config, store: SessionStateStore) -> None:
+    def __init__(
+        self,
+        config: Config,
+        store: SessionStateStore,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> None:
         self.config = config
         self.store = store
+        self.timeout_seconds = timeout_seconds
 
     async def run_once(self, *, now: float) -> ObserverResult:
         if not self.config.session.observer_enabled or not self.config.prewarm_api_key:
             return ObserverResult(observed=0, stopped=0)
         payload = await self._sessions_payload()
         if payload is None:
+            return ObserverResult(observed=0, stopped=0)
+        if not isinstance(payload, list):
             return ObserverResult(observed=0, stopped=0)
         observed = extract_observed_session_hashes(payload)
         self.store.record_observed_sessions(observed, observed_at=now)
@@ -58,7 +67,8 @@ class EmbySessionObserver:
     async def _sessions_payload(self) -> Any | None:
         url = f"{self.config.emby_base_url.rstrip('/')}/Sessions"
         try:
-            async with ClientSession() as session:
+            timeout = ClientTimeout(total=self.timeout_seconds)
+            async with ClientSession(timeout=timeout) as session:
                 async with session.get(
                     url,
                     params={"api_key": self.config.prewarm_api_key},
