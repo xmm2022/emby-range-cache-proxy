@@ -31,16 +31,14 @@ def plan_middle_ranges(
     if queued_until is not None:
         start = max(start, queued_until + 1)
         start = max(middle_start, align_down(start, segment))
-    window_end = min(max_observed_offset + prefetch.window_bytes - 1, middle_end)
+    window_end = min(start + prefetch.window_bytes - 1, middle_end)
     session_end = min(start + prefetch.max_session_bytes - 1, window_end)
 
     ranges: list[ByteRange] = []
     current = start
     while current <= session_end:
-        end = current + segment - 1
-        if end > session_end or end > middle_end:
-            break
-        if current >= middle_start:
-            ranges.append(ByteRange(current, end))
+        end = min(current + segment - 1, session_end, middle_end)
+        if end >= middle_start and current <= middle_end:
+            ranges.append(ByteRange(max(current, middle_start), end))
         current = end + 1
     return ranges

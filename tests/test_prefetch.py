@@ -19,7 +19,6 @@ def test_plan_middle_ranges_aligns_skips_head_tail_and_caps_window():
         ByteRange(320, 383),
         ByteRange(384, 447),
         ByteRange(448, 511),
-        ByteRange(512, 575),
     ]
 
 
@@ -34,12 +33,34 @@ def test_plan_middle_ranges_deduplicates_using_queued_until():
         middle_cache=MiddleCacheConfig(segment_bytes=64),
     )
 
-    assert ranges == [ByteRange(512, 575)]
+    assert ranges == [
+        ByteRange(512, 575),
+        ByteRange(576, 639),
+        ByteRange(640, 703),
+        ByteRange(704, 767),
+    ]
+
+
+def test_plan_middle_ranges_returns_partial_final_segment():
+    ranges = plan_middle_ranges(
+        media_size=1000,
+        head_size=0,
+        tail_size=0,
+        max_observed_offset=128,
+        queued_until=None,
+        prefetch=PrefetchConfig(window_bytes=100, resume_overlap_bytes=0, max_session_bytes=512),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+    )
+
+    assert ranges == [
+        ByteRange(128, 191),
+        ByteRange(192, 227),
+    ]
 
 
 def test_plan_middle_ranges_returns_empty_when_no_middle_space():
     ranges = plan_middle_ranges(
-        media_size=200,
+        media_size=192,
         head_size=128,
         tail_size=64,
         max_observed_offset=100,
