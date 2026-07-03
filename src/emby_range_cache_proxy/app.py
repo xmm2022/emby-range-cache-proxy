@@ -224,11 +224,13 @@ async def serve_authorized_range(
         try:
             async with origin.open_range(source.path, block_range, size=metadata.size) as upstream:
                 await response.prepare(request)
+                prepare_ms = _elapsed_ms_since(started_at)
                 writer = cache.stage_block(key, block_name, block_range) if block_name is not None else None
                 upstream_offset = block_range.start
                 response_bytes_written = 0
                 response_done = False
                 origin_read_bytes = 0
+                first_body_ms: int | None = None
                 try:
                     async for chunk in upstream.content.iter_chunked(config.cache.chunk_bytes):
                         if chunk:
@@ -244,6 +246,8 @@ async def serve_authorized_range(
                                 if overlap_start <= overlap_end:
                                     data = chunk[overlap_start - chunk_start : overlap_end - chunk_start + 1]
                                     await response.write(data)
+                                    if first_body_ms is None:
+                                        first_body_ms = _elapsed_ms_since(started_at)
                                     response_bytes_written += len(data)
                                     if response_bytes_written == byte_range.length:
                                         await _write_eof_safely(response)
@@ -272,6 +276,8 @@ async def serve_authorized_range(
                             served_bytes=response_bytes_written,
                             cache_read_bytes=0,
                             origin_read_bytes=origin_read_bytes,
+                            prepare_ms=prepare_ms,
+                            first_body_ms=first_body_ms,
                         )
                     except (ValueError, OSError):
                         writer.abort()
@@ -288,6 +294,8 @@ async def serve_authorized_range(
                         served_bytes=response_bytes_written,
                         cache_read_bytes=0,
                         origin_read_bytes=origin_read_bytes,
+                        prepare_ms=prepare_ms,
+                        first_body_ms=first_body_ms,
                     )
         finally:
             if build_lock is not None and build_lock.locked():
@@ -313,7 +321,10 @@ async def _serve_cached_response(
 ) -> web.StreamResponse:
     response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
-    served_bytes, cache_read_bytes, cache_error = await _write_cached_chunks(response, cached_chunks)
+    prepare_ms = _elapsed_ms_since(started_at)
+    served_bytes, cache_read_bytes, cache_error, first_body_ms = await _write_cached_chunks(
+        response, cached_chunks, started_at=started_at
+    )
     if cache_error:
         response.force_close()
     await _write_eof_safely(response)
@@ -329,26 +340,33 @@ async def _serve_cached_response(
         served_bytes=served_bytes,
         cache_read_bytes=cache_read_bytes,
         origin_read_bytes=0,
+        prepare_ms=prepare_ms,
+        first_body_ms=first_body_ms,
     )
     return response
 
 
-async def _write_cached_chunks(response: web.StreamResponse, cached_chunks) -> tuple[int, int, bool]:
+async def _write_cached_chunks(
+    response: web.StreamResponse, cached_chunks, *, started_at: float | None = None
+) -> tuple[int, int, bool, int | None]:
     sent = 0
     read = 0
+    first_body_ms: int | None = None
     try:
         for chunk in cached_chunks:
             read += len(chunk)
             await response.write(chunk)
+            if first_body_ms is None and started_at is not None:
+                first_body_ms = _elapsed_ms_since(started_at)
             sent += len(chunk)
     except CacheReadError:
-        return sent, read, True
+        return sent, read, True, first_body_ms
     except (ConnectionError, RuntimeError, OSError):
         close = getattr(cached_chunks, "close", None)
         if close is not None:
             close()
-        return sent, read, False
-    return sent, read, False
+        return sent, read, False, first_body_ms
+    return sent, read, False, first_body_ms
 
 
 async def stream_fallback(request: web.Request, config: Config) -> web.StreamResponse:
@@ -471,15 +489,18 @@ def _log_proxy_result(
     served_bytes: int = 0,
     cache_read_bytes: int = 0,
     origin_read_bytes: int = 0,
+    prepare_ms: int | None = None,
+    first_body_ms: int | None = None,
 ) -> None:
     request_range = request.headers.get("Range", "none")
     block = block_name or "none"
     block_value = "none" if block_range is None else f"{block_range.start}-{block_range.end}"
-    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    elapsed_ms = _elapsed_ms_since(started_at)
     LOGGER.info(
         "proxy result=%s item_id=%s media_source_id=%s method=%s path=%s "
         "request_range=%s planned_range=%s-%s total_size=%s block=%s block_range=%s "
-        "served_bytes=%s cache_read_bytes=%s origin_read_bytes=%s elapsed_ms=%s",
+        "served_bytes=%s cache_read_bytes=%s origin_read_bytes=%s "
+        "prepare_ms=%s first_body_ms=%s elapsed_ms=%s",
         result,
         ctx.item_id,
         ctx.media_source_id,
@@ -494,8 +515,18 @@ def _log_proxy_result(
         served_bytes,
         cache_read_bytes,
         origin_read_bytes,
+        _format_optional_ms(prepare_ms),
+        _format_optional_ms(first_body_ms),
         elapsed_ms,
     )
+
+
+def _elapsed_ms_since(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
+
+
+def _format_optional_ms(value: int | None) -> str:
+    return "none" if value is None else str(value)
 
 
 def _pre_authorization_rollout_scope(config: Config, *, item_id: str, media_source_id: str) -> bool:

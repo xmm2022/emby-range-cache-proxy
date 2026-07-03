@@ -386,6 +386,8 @@ async def test_cache_build_and_hit_are_logged_without_token(
         and "served_bytes=4" in message
         and "cache_read_bytes=0" in message
         and "origin_read_bytes=16" in message
+        and "prepare_ms=" in message
+        and "first_body_ms=" in message
         and "elapsed_ms=" in message
         for message in messages
     )
@@ -394,6 +396,8 @@ async def test_cache_build_and_hit_are_logged_without_token(
         and "served_bytes=4" in message
         and "cache_read_bytes=4" in message
         and "origin_read_bytes=0" in message
+        and "prepare_ms=" in message
+        and "first_body_ms=" in message
         and "elapsed_ms=" in message
         for message in messages
     )
@@ -411,11 +415,14 @@ async def test_cached_body_is_written_in_configured_chunks():
 
     response = FakeResponse()
 
-    written, read, cache_error = await app_module._write_cached_chunks(response, [b"0123", b"4567", b"89"])
+    written, read, cache_error, first_body_ms = await app_module._write_cached_chunks(
+        response, [b"0123", b"4567", b"89"]
+    )
 
     assert written == 10
     assert read == 10
     assert not cache_error
+    assert first_body_ms is None
     assert response.chunks == [b"0123", b"4567", b"89"]
 
 
@@ -431,11 +438,14 @@ async def test_cached_body_reports_bytes_written_before_disconnect():
 
     response = FakeResponse()
 
-    written, read, cache_error = await app_module._write_cached_chunks(response, [b"0123", b"4567", b"89"])
+    written, read, cache_error, first_body_ms = await app_module._write_cached_chunks(
+        response, [b"0123", b"4567", b"89"]
+    )
 
     assert written == 8
     assert read == 10
     assert not cache_error
+    assert first_body_ms is None
     assert response.chunks == [b"0123", b"4567"]
 
 
