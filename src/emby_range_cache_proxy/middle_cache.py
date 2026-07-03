@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import uuid
 from pathlib import Path
 from typing import Callable, Iterator
@@ -67,6 +68,10 @@ class MiddleRangeCache:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         sidecar_tmp = sidecar.with_name(f"{sidecar.name}.{uuid.uuid4().hex}.tmp")
+        path_backup: Path | None = None
+        sidecar_backup: Path | None = None
+        backups_prepared = False
+        published = False
         block = MiddleBlockRecord(
             cache_key=key,
             start=byte_range.start,
@@ -81,23 +86,39 @@ class MiddleRangeCache:
         try:
             tmp.write_bytes(data)
             sidecar_tmp.write_text(f"{byte_range.start}-{byte_range.end}\n")
+            path_backup = self._backup_existing(path)
+            sidecar_backup = self._backup_existing(sidecar)
+            backups_prepared = True
 
             def publish() -> None:
+                nonlocal published
                 os.replace(tmp, path)
                 os.replace(sidecar_tmp, sidecar)
+                published = True
 
-            published = self.store.publish_middle_block_and_complete_prefetch_task(
+            committed = self.store.publish_middle_block_and_complete_prefetch_task(
                 task_id,
                 expected_attempts=expected_attempts,
                 block=block,
                 now=now,
                 publish=publish,
             )
-            if not published:
+            if not committed and published:
+                self._restore_published(path, path_backup)
+                self._restore_published(sidecar, sidecar_backup)
+            self._cleanup_backup(path_backup)
+            self._cleanup_backup(sidecar_backup)
+            if not committed:
                 tmp.unlink(missing_ok=True)
                 sidecar_tmp.unlink(missing_ok=True)
-            return published
+            return committed
         except Exception:
+            if backups_prepared:
+                self._restore_published(path, path_backup)
+                self._restore_published(sidecar, sidecar_backup)
+            else:
+                self._cleanup_backup(path_backup)
+                self._cleanup_backup(sidecar_backup)
             tmp.unlink(missing_ok=True)
             sidecar_tmp.unlink(missing_ok=True)
             raise
@@ -260,6 +281,26 @@ class MiddleRangeCache:
     def _paths(self, key: str, start: int, end: int) -> tuple[Path, Path]:
         path = self.root / self._relative_path(key, start, end)
         return path, path.with_suffix(".range")
+
+    def _backup_existing(self, path: Path) -> Path | None:
+        if not path.exists():
+            return None
+        backup = path.with_name(f"{path.name}.{uuid.uuid4().hex}.bak")
+        try:
+            os.link(path, backup)
+        except OSError:
+            shutil.copy2(path, backup)
+        return backup
+
+    def _restore_published(self, path: Path, backup: Path | None) -> None:
+        if backup is None:
+            path.unlink(missing_ok=True)
+            return
+        os.replace(backup, path)
+
+    def _cleanup_backup(self, backup: Path | None) -> None:
+        if backup is not None:
+            backup.unlink(missing_ok=True)
 
     def _relative_path(self, key: str, start: int, end: int) -> str:
         return (Path(key) / "mid" / f"{start}-{end}.bin").as_posix()
