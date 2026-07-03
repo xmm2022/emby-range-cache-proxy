@@ -234,11 +234,11 @@ def plan_middle_ranges(
     if middle_end - middle_start + 1 < segment:
         return []
 
-    start = max(middle_start, max_observed_offset - prefetch.resume_overlap_bytes)
-    start = max(middle_start, align_down(start, segment))
-    if queued_until is not None:
-        start = max(start, queued_until + 1)
-        start = max(middle_start, start)
+    if queued_until is None:
+        start = max(middle_start, max_observed_offset - prefetch.resume_overlap_bytes)
+        start = max(middle_start, align_down(start, segment))
+    else:
+        start = max(middle_start, queued_until + 1)
     window_end = min(start + prefetch.window_bytes - 1, middle_end)
     session_end = min(start + prefetch.max_session_bytes - 1, window_end)
 

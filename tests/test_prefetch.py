@@ -755,6 +755,22 @@ def test_plan_middle_ranges_queued_until_non_boundary_fills_partial_gap():
     assert all(byte_range.start > 419 for byte_range in ranges)
 
 
+def test_plan_middle_ranges_queued_until_frontier_takes_priority_over_playback_offset():
+    ranges = plan_middle_ranges(
+        media_size=2000,
+        head_size=100,
+        tail_size=100,
+        max_observed_offset=1000,
+        queued_until=575,
+        prefetch=PrefetchConfig(window_bytes=512, resume_overlap_bytes=0, max_session_bytes=512),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+    )
+
+    assert ranges
+    assert ranges[0] == ByteRange(576, 639)
+    assert all(byte_range.start > 575 for byte_range in ranges)
+
+
 def test_plan_middle_ranges_caps_by_max_session_bytes():
     ranges = plan_middle_ranges(
         media_size=1000,
