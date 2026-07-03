@@ -23,7 +23,7 @@ class CacheReadError(Exception):
 
 def adaptive_head_tail(size: int) -> tuple[int, int]:
     if size < 2 * GIB:
-        return 16 * MIB, 4 * MIB
+        return 16 * MIB, 8 * MIB
     if size < 8 * GIB:
         return 32 * MIB, 8 * MIB
     if size <= 30 * GIB:

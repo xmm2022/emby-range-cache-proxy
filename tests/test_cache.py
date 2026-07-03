@@ -25,7 +25,7 @@ def _key(char: str) -> str:
 
 
 def test_adaptive_sizes():
-    assert adaptive_head_tail(1024**3) == (16 * 1024**2, 4 * 1024**2)
+    assert adaptive_head_tail(1024**3) == (16 * 1024**2, 8 * 1024**2)
     assert adaptive_head_tail(4 * 1024**3) == (32 * 1024**2, 8 * 1024**2)
     assert adaptive_head_tail(12 * 1024**3) == (64 * 1024**2, 8 * 1024**2)
     assert adaptive_head_tail(80 * 1024**3) == (128 * 1024**2, 16 * 1024**2)
