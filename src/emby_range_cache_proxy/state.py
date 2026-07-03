@@ -520,6 +520,36 @@ class SessionStateStore:
             ).fetchone()
         return row["count"]
 
+    def claimable_prefetch_task_count(
+        self,
+        *,
+        now: float,
+        running_stale_seconds: int | None = None,
+    ) -> int:
+        stale_cutoff = (
+            None if running_stale_seconds is None else now - running_stale_seconds
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM prefetch_tasks
+                WHERE status = 'queued'
+                   OR (
+                        status IN ('failed', 'skipped')
+                        AND next_attempt_at IS NOT NULL
+                        AND next_attempt_at <= ?
+                   )
+                   OR (
+                        ? IS NOT NULL
+                        AND status = 'running'
+                        AND updated_at <= ?
+                   )
+                """,
+                (now, running_stale_seconds, stale_cutoff),
+            ).fetchone()
+        return row["count"]
+
     def upsert_middle_block(self, block: MiddleBlockRecord) -> None:
         with self._connect() as conn:
             _upsert_middle_block(conn, block)

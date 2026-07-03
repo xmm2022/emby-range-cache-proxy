@@ -658,6 +658,127 @@ def test_claim_prefetch_tasks_reclaims_stale_running_task(tmp_path):
     assert stale[0].attempts == 2
 
 
+def test_claimable_prefetch_task_count_matches_retry_and_stale_claim_conditions(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+
+    failed_due = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=0,
+        end=63,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=2.0)[0]
+    store.fail_prefetch_task(
+        claimed.id,
+        error_class="OriginError",
+        now=3.0,
+        retry_after_seconds=10,
+    )
+
+    skipped_due = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="b" * 64,
+        start=64,
+        end=127,
+        priority=10,
+        now=4.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=5.0)[0]
+    store.skip_prefetch_task(
+        claimed.id,
+        error_class="SourceUnavailable",
+        now=6.0,
+        retry_after_seconds=10,
+    )
+
+    failed_pending = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="c" * 64,
+        start=128,
+        end=191,
+        priority=10,
+        now=7.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=8.0)[0]
+    store.fail_prefetch_task(
+        claimed.id,
+        error_class="OriginError",
+        now=9.0,
+        retry_after_seconds=100,
+    )
+
+    skipped_pending = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="d" * 64,
+        start=192,
+        end=255,
+        priority=10,
+        now=10.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=11.0)[0]
+    store.skip_prefetch_task(
+        claimed.id,
+        error_class="SourceUnavailable",
+        now=12.0,
+        retry_after_seconds=100,
+    )
+
+    running_stale = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="e" * 64,
+        start=256,
+        end=319,
+        priority=10,
+        now=13.0,
+        max_queue_depth=10,
+    )
+    store.claim_prefetch_tasks(limit=1, now=14.0)
+
+    running_fresh = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="f" * 64,
+        start=320,
+        end=383,
+        priority=100,
+        now=41.0,
+        max_queue_depth=10,
+    )
+    store.claim_prefetch_tasks(limit=1, now=42.0)
+
+    assert failed_due is not None
+    assert skipped_due is not None
+    assert failed_pending is not None
+    assert skipped_pending is not None
+    assert running_stale is not None
+    assert running_fresh is not None
+    assert (
+        store.claimable_prefetch_task_count(
+            now=50.0,
+            running_stale_seconds=10,
+        )
+        == 3
+    )
+    assert (
+        store.claimable_prefetch_task_count(
+            now=50.0,
+            running_stale_seconds=None,
+        )
+        == 2
+    )
+
+
 def test_existing_prefetch_task_table_gets_next_attempt_at_column(tmp_path):
     db_path = tmp_path / "state.sqlite3"
     with sqlite3.connect(db_path) as conn:

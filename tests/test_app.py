@@ -135,6 +135,157 @@ async def test_prefetch_lifecycle_starts_only_when_enabled(aiohttp_client, monke
     await client.close()
 
 
+async def test_prefetch_lifecycle_does_not_start_when_prefetch_disabled(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    class FakePrefetchWorker:
+        def __init__(self, config, store, middle_cache):
+            raise AssertionError("prefetch worker must not start when disabled")
+
+    monkeypatch.setattr(app_module, "PrefetchWorker", FakePrefetchWorker)
+    app = create_app(
+        Config(
+            emby_base_url="http://emby",
+            fallback_base_url="http://emby",
+            cache_dir=str(tmp_path / "cache"),
+            session=SessionConfig(enabled=True),
+            middle_cache=MiddleCacheConfig(enabled=True),
+            prefetch=PrefetchConfig(enabled=False),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    assert "prefetch_task" not in app
+
+    await client.close()
+
+
+async def test_prefetch_worker_loop_continues_after_iteration_probe_error(
+    monkeypatch, tmp_path
+):
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://emby",
+        cache_dir=str(tmp_path),
+        prefetch=PrefetchConfig(enabled=True, error_backoff_seconds=7),
+    )
+    original_sleep = asyncio.sleep
+    sleep_calls = []
+    run_calls = 0
+
+    class Store:
+        def __init__(self):
+            self.claimable_calls = 0
+
+        def queue_depth(self):
+            raise OSError("queue probe failed")
+
+        def claimable_prefetch_task_count(self, *, now, running_stale_seconds):
+            self.claimable_calls += 1
+            if self.claimable_calls == 1:
+                raise OSError("claimable probe failed")
+            return 0
+
+    class Worker:
+        def __init__(self):
+            self.store = Store()
+
+        async def run_once(self, *, now):
+            nonlocal run_calls
+            run_calls += 1
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 2:
+            raise asyncio.CancelledError
+        await original_sleep(0)
+
+    monkeypatch.setattr(app_module.asyncio, "sleep", fake_sleep)
+
+    with suppress(asyncio.CancelledError):
+        await app_module._prefetch_worker_loop(config, Worker())
+
+    assert run_calls == 2
+    assert sleep_calls == [7, 7]
+
+
+async def test_prefetch_worker_loop_uses_claimable_count_for_backoff(
+    monkeypatch, tmp_path
+):
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://emby",
+        cache_dir=str(tmp_path),
+        prefetch=PrefetchConfig(enabled=True, error_backoff_seconds=300),
+    )
+    sleep_calls = []
+
+    class Store:
+        def queue_depth(self):
+            return 0
+
+        def claimable_prefetch_task_count(self, *, now, running_stale_seconds):
+            return 1
+
+    class Worker:
+        store = Store()
+
+        async def run_once(self, *, now):
+            pass
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(app_module.asyncio, "sleep", fake_sleep)
+
+    with suppress(asyncio.CancelledError):
+        await app_module._prefetch_worker_loop(config, Worker())
+
+    assert sleep_calls == [1]
+
+
+async def test_prefetch_worker_loop_continues_after_run_once_error(
+    monkeypatch, tmp_path
+):
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://emby",
+        cache_dir=str(tmp_path),
+        prefetch=PrefetchConfig(enabled=True, error_backoff_seconds=9),
+    )
+    original_sleep = asyncio.sleep
+    sleep_calls = []
+    run_calls = 0
+
+    class Store:
+        def claimable_prefetch_task_count(self, *, now, running_stale_seconds):
+            return 0
+
+    class Worker:
+        store = Store()
+
+        async def run_once(self, *, now):
+            nonlocal run_calls
+            run_calls += 1
+            if run_calls == 1:
+                raise OSError("run failed")
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 2:
+            raise asyncio.CancelledError
+        await original_sleep(0)
+
+    monkeypatch.setattr(app_module.asyncio, "sleep", fake_sleep)
+
+    with suppress(asyncio.CancelledError):
+        await app_module._prefetch_worker_loop(config, Worker())
+
+    assert run_calls == 2
+    assert sleep_calls == [9, 9]
+
+
 async def test_session_planner_lifecycle_marks_idle_and_enqueues_prefetch(
     aiohttp_client, monkeypatch, tmp_path
 ):

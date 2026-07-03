@@ -156,12 +156,21 @@ async def prefetch_worker_lifecycle(app: web.Application) -> AsyncIterator[None]
 
 async def _prefetch_worker_loop(config: Config, worker: PrefetchWorker) -> None:
     while True:
+        sleep_seconds = config.prefetch.error_backoff_seconds
         try:
-            await worker.run_once(now=time.time())
-        except Exception as error:
-            LOGGER.warning("prefetch worker failed: error_type=%s", type(error).__name__)
-        queue_depth = await asyncio.to_thread(worker.store.queue_depth)
-        await asyncio.sleep(config.prefetch.error_backoff_seconds if queue_depth == 0 else 1)
+            now = time.time()
+            await worker.run_once(now=now)
+            claimable = await asyncio.to_thread(
+                worker.store.claimable_prefetch_task_count,
+                now=now,
+                running_stale_seconds=config.prefetch.error_backoff_seconds,
+            )
+            sleep_seconds = 1 if claimable else config.prefetch.error_backoff_seconds
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("prefetch worker iteration failed")
+        await asyncio.sleep(sleep_seconds)
 
 
 async def prewarm_lifecycle(app: web.Application) -> AsyncIterator[None]:
