@@ -332,7 +332,7 @@ def test_claim_prefetch_tasks_does_not_return_task_if_status_changed_before_upda
         "_connect",
         lambda: _InterleavingConnection(
             path,
-            "WHERE status = 'queued' ORDER BY priority DESC",
+            "WHERE status = 'queued' OR",
             mark_running,
         ),
     )
@@ -401,6 +401,165 @@ def test_complete_prefetch_task_marks_task_done(tmp_path):
             (claimed[0].id,),
         ).fetchone()[0]
     assert status == "done"
+
+
+def test_failed_prefetch_task_after_backoff_is_reclaimed(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    task = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=1024,
+        end=2047,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=2.0)
+
+    store.fail_prefetch_task(
+        claimed[0].id,
+        error_class="OriginError",
+        now=3.0,
+        retry_after_seconds=10,
+    )
+    early = store.claim_prefetch_tasks(limit=1, now=12.0)
+    retried = store.claim_prefetch_tasks(limit=1, now=13.0)
+
+    assert task is not None
+    assert early == []
+    assert len(retried) == 1
+    assert retried[0].id == task.id
+    assert retried[0].status == "running"
+    assert retried[0].attempts == 2
+    assert retried[0].next_attempt_at is None
+
+
+def test_skipped_prefetch_task_after_backoff_is_reclaimed(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    task = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=1024,
+        end=2047,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=2.0)
+
+    store.skip_prefetch_task(
+        claimed[0].id,
+        error_class="SourceUnavailable",
+        now=3.0,
+        retry_after_seconds=10,
+    )
+    early = store.claim_prefetch_tasks(limit=1, now=12.0)
+    retried = store.claim_prefetch_tasks(limit=1, now=13.0)
+
+    assert task is not None
+    assert early == []
+    assert len(retried) == 1
+    assert retried[0].id == task.id
+    assert retried[0].status == "running"
+    assert retried[0].attempts == 2
+    assert retried[0].next_attempt_at is None
+
+
+def test_requeue_prefetch_task_restores_running_task_to_queue(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    task = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=1024,
+        end=2047,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=2.0)
+
+    store.requeue_prefetch_task(
+        claimed[0].id,
+        now=3.0,
+        error_class="CancelledError",
+    )
+    requeued = store.claim_prefetch_tasks(limit=1, now=4.0)
+
+    assert task is not None
+    assert len(requeued) == 1
+    assert requeued[0].id == task.id
+    assert requeued[0].status == "running"
+    assert requeued[0].attempts == 2
+    assert requeued[0].last_error_class == "CancelledError"
+
+
+def test_claim_prefetch_tasks_reclaims_stale_running_task(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    task = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=1024,
+        end=2047,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    store.claim_prefetch_tasks(limit=1, now=2.0)
+
+    fresh = store.claim_prefetch_tasks(
+        limit=1,
+        now=11.0,
+        running_stale_seconds=10,
+    )
+    stale = store.claim_prefetch_tasks(
+        limit=1,
+        now=12.0,
+        running_stale_seconds=10,
+    )
+
+    assert task is not None
+    assert fresh == []
+    assert len(stale) == 1
+    assert stale[0].id == task.id
+    assert stale[0].status == "running"
+    assert stale[0].attempts == 2
+
+
+def test_existing_prefetch_task_table_gets_next_attempt_at_column(tmp_path):
+    db_path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE prefetch_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id TEXT NOT NULL,
+                media_source_id TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                start INTEGER NOT NULL,
+                end INTEGER NOT NULL,
+                priority INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_error_class TEXT,
+                UNIQUE(cache_key, start, end)
+            );
+            """
+        )
+
+    SessionStateStore(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(prefetch_tasks)").fetchall()
+        }
+    assert "next_attempt_at" in columns
 
 
 def test_record_playback_keeps_max_observed_offset_when_later_update_has_smaller_range(

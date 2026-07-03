@@ -6,9 +6,10 @@ from typing import Awaitable, Callable
 
 from aiohttp import ClientError
 
+from .cache import cache_key
 from .config import Config, MiddleCacheConfig, PrefetchConfig
 from .middle_cache import MiddleRangeCache
-from .models import ByteRange
+from .models import ByteRange, MediaSource
 from .origin import OriginClient, OriginError
 from .state import PrefetchTaskRecord, SessionStateStore
 
@@ -18,6 +19,10 @@ class PrefetchRunResult:
     completed: int = 0
     failed: int = 0
     skipped: int = 0
+
+
+class PrefetchSourceMismatch(Exception):
+    pass
 
 
 class BandwidthLimiter:
@@ -59,12 +64,17 @@ class PrefetchWorker:
         if not self.config.prefetch.enabled or not self.config.middle_cache.enabled:
             return PrefetchRunResult()
 
-        tasks = self.store.claim_prefetch_tasks(
-            limit=self.config.prefetch.concurrency,
-            now=now,
-        )
         result = PrefetchRunResult()
-        for task in tasks:
+        for _ in range(self.config.prefetch.concurrency):
+            tasks = await asyncio.to_thread(
+                self.store.claim_prefetch_tasks,
+                limit=1,
+                now=now,
+                running_stale_seconds=self.config.prefetch.error_backoff_seconds,
+            )
+            if not tasks:
+                break
+            task = tasks[0]
             task_result = await self._run_task(task, now=now)
             result.completed += task_result.completed
             result.failed += task_result.failed
@@ -74,25 +84,49 @@ class PrefetchWorker:
     async def _run_task(
         self, task: PrefetchTaskRecord, *, now: float
     ) -> PrefetchRunResult:
+        byte_range = ByteRange(task.start, task.end)
+        if byte_range.length > self.middle_cache.max_bytes:
+            await asyncio.to_thread(
+                self.store.skip_prefetch_task,
+                task.id,
+                error_class="RangeTooLarge",
+                now=now,
+            )
+            return PrefetchRunResult(skipped=1)
+
         url = self.source_lookup.get((task.item_id, task.media_source_id))
         if url is None:
-            self.store.fail_prefetch_task(
+            await asyncio.to_thread(
+                self.store.skip_prefetch_task,
                 task.id,
                 error_class="SourceUnavailable",
                 now=now,
+                retry_after_seconds=self.config.prefetch.error_backoff_seconds,
             )
             return PrefetchRunResult(skipped=1)
 
         try:
             data = bytearray()
-            byte_range = ByteRange(task.start, task.end)
             async with OriginClient(
                 chunk_bytes=self.config.cache.chunk_bytes
             ) as origin:
+                metadata = await origin.head(url)
+                expected_key = cache_key(
+                    MediaSource(
+                        item_id=task.item_id,
+                        media_source_id=task.media_source_id,
+                        path=url,
+                        protocol="Http",
+                        size=metadata.size,
+                    ),
+                    metadata,
+                )
+                if expected_key != task.cache_key:
+                    raise PrefetchSourceMismatch("prefetch source metadata mismatch")
                 async with origin.open_range(
                     url,
                     byte_range,
-                    size=max(task.end + 1, 1),
+                    size=metadata.size,
                 ) as response:
                     async for chunk in response.content.iter_chunked(
                         self.config.cache.chunk_bytes
@@ -102,17 +136,24 @@ class PrefetchWorker:
                         await self.limiter.consume(len(chunk))
                         data.extend(chunk)
 
-            self.middle_cache.store_block(
-                task.cache_key,
+            await asyncio.to_thread(
+                self._store_completed_task,
+                task,
                 byte_range,
                 bytes(data),
-                now=now,
+                now,
             )
-            self.middle_cache.evict_expired(now=now)
-            self.middle_cache.evict_lru_if_needed()
-            self.store.complete_prefetch_task(task.id, now=now)
             return PrefetchRunResult(completed=1)
+        except asyncio.CancelledError:
+            await asyncio.to_thread(
+                self.store.requeue_prefetch_task,
+                task.id,
+                now=now,
+                error_class="CancelledError",
+            )
+            raise
         except (
+            PrefetchSourceMismatch,
             OriginError,
             ClientError,
             asyncio.TimeoutError,
@@ -120,12 +161,36 @@ class PrefetchWorker:
             OSError,
             ValueError,
         ) as error:
-            self.store.fail_prefetch_task(
+            retry_after_seconds = (
+                None
+                if isinstance(error, PrefetchSourceMismatch)
+                else self.config.prefetch.error_backoff_seconds
+            )
+            await asyncio.to_thread(
+                self.store.fail_prefetch_task,
                 task.id,
                 error_class=error.__class__.__name__,
                 now=now,
+                retry_after_seconds=retry_after_seconds,
             )
             return PrefetchRunResult(failed=1)
+
+    def _store_completed_task(
+        self,
+        task: PrefetchTaskRecord,
+        byte_range: ByteRange,
+        data: bytes,
+        now: float,
+    ) -> None:
+        self.middle_cache.store_block(
+            task.cache_key,
+            byte_range,
+            data,
+            now=now,
+        )
+        self.middle_cache.evict_expired(now=now)
+        self.middle_cache.evict_lru_if_needed()
+        self.store.complete_prefetch_task(task.id, now=now)
 
 
 def align_down(value: int, alignment: int) -> int:

@@ -1,7 +1,9 @@
 import asyncio
 
+import pytest
 from aiohttp import web
 
+from emby_range_cache_proxy.cache import cache_key
 from emby_range_cache_proxy.config import (
     Config,
     MiddleCacheConfig,
@@ -9,7 +11,7 @@ from emby_range_cache_proxy.config import (
     RolloutConfig,
 )
 from emby_range_cache_proxy.middle_cache import MiddleRangeCache
-from emby_range_cache_proxy.models import ByteRange
+from emby_range_cache_proxy.models import ByteRange, MediaSource, SourceMetadata
 from emby_range_cache_proxy.prefetch import (
     BandwidthLimiter,
     PrefetchWorker,
@@ -34,18 +36,33 @@ async def test_bandwidth_limiter_waits_when_chunk_exceeds_rate():
 async def test_prefetch_worker_fetches_claimed_task_into_middle_cache(
     aiohttp_client, tmp_path
 ):
+    request_methods = []
+
     async def handler(request):
+        request_methods.append(request.method)
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "100", "ETag": '"v1"'})
         assert request.headers["Range"] == "bytes=10-19"
         return web.Response(
             status=206,
             body=b"0123456789",
-            headers={"Content-Range": "bytes 10-19/20"},
+            headers={"Content-Range": "bytes 10-19/100", "ETag": '"v1"'},
         )
 
     origin_app = web.Application()
-    origin_app.router.add_get("/movie.mkv", handler)
+    origin_app.router.add_route("*", "/movie.mkv", handler)
     origin = await aiohttp_client(origin_app)
     origin_url = str(origin.make_url("/movie.mkv"))
+    key = cache_key(
+        MediaSource(
+            item_id="1",
+            media_source_id="ms1",
+            path=origin_url,
+            protocol="Http",
+            size=100,
+        ),
+        SourceMetadata(url=origin_url, size=100, etag='"v1"'),
+    )
     store = SessionStateStore(tmp_path / "state.db")
     middle = MiddleRangeCache(
         tmp_path / "mid", store, max_bytes=1024, ttl_seconds=60
@@ -53,7 +70,7 @@ async def test_prefetch_worker_fetches_claimed_task_into_middle_cache(
     store.enqueue_prefetch_task(
         "1",
         "ms1",
-        "a" * 64,
+        key,
         10,
         19,
         priority=1,
@@ -79,9 +96,225 @@ async def test_prefetch_worker_fetches_claimed_task_into_middle_cache(
     assert result.completed == 1
     assert result.failed == 0
     assert result.skipped == 0
-    chunks = middle.iter_block("a" * 64, ByteRange(10, 19), chunk_bytes=4, now=3.0)
+    assert request_methods == ["HEAD", "GET"]
+    chunks = middle.iter_block(key, ByteRange(10, 19), chunk_bytes=4, now=3.0)
     assert chunks is not None
     assert b"".join(chunks) == b"0123456789"
+
+
+async def test_prefetch_worker_fails_cache_key_mismatch_without_writing_middle_cache(
+    aiohttp_client, tmp_path
+):
+    async def handler(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "20"})
+        assert request.headers["Range"] == "bytes=10-19"
+        return web.Response(
+            status=206,
+            body=b"0123456789",
+            headers={"Content-Range": "bytes 10-19/20"},
+        )
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", handler)
+    origin = await aiohttp_client(origin_app)
+    origin_url = str(origin.make_url("/movie.mkv"))
+    wrong_key = "a" * 64
+    store = SessionStateStore(tmp_path / "state.db")
+    middle = MiddleRangeCache(
+        tmp_path / "mid", store, max_bytes=1024, ttl_seconds=60
+    )
+    store.enqueue_prefetch_task(
+        "1",
+        "ms1",
+        wrong_key,
+        10,
+        19,
+        priority=1,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://fallback",
+        cache_dir=str(tmp_path),
+        middle_cache=MiddleCacheConfig(enabled=True),
+        prefetch=PrefetchConfig(enabled=True, bandwidth_bytes_per_second=1024),
+    )
+    worker = PrefetchWorker(
+        config, store, middle, source_lookup={("1", "ms1"): origin_url}
+    )
+
+    result = await worker.run_once(now=2.0)
+
+    assert result.completed == 0
+    assert result.failed == 1
+    assert result.skipped == 0
+    assert (
+        middle.iter_block(wrong_key, ByteRange(10, 19), chunk_bytes=4, now=3.0)
+        is None
+    )
+
+
+async def test_prefetch_worker_requeues_running_task_when_cancelled(
+    aiohttp_client, tmp_path
+):
+    async def handler(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "20"})
+        return web.Response(
+            status=206,
+            body=b"0123456789",
+            headers={"Content-Range": "bytes 10-19/20"},
+        )
+
+    class CancellingLimiter:
+        async def consume(self, byte_count):
+            raise asyncio.CancelledError
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", handler)
+    origin = await aiohttp_client(origin_app)
+    origin_url = str(origin.make_url("/movie.mkv"))
+    key = cache_key(
+        MediaSource(
+            item_id="1",
+            media_source_id="ms1",
+            path=origin_url,
+            protocol="Http",
+            size=20,
+        ),
+        SourceMetadata(url=origin_url, size=20),
+    )
+    store = SessionStateStore(tmp_path / "state.db")
+    middle = MiddleRangeCache(
+        tmp_path / "mid", store, max_bytes=1024, ttl_seconds=60
+    )
+    task = store.enqueue_prefetch_task(
+        "1",
+        "ms1",
+        key,
+        10,
+        19,
+        priority=1,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://fallback",
+        cache_dir=str(tmp_path),
+        middle_cache=MiddleCacheConfig(enabled=True),
+        prefetch=PrefetchConfig(enabled=True, bandwidth_bytes_per_second=1024),
+    )
+    worker = PrefetchWorker(
+        config, store, middle, source_lookup={("1", "ms1"): origin_url}
+    )
+    worker.limiter = CancellingLimiter()
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_once(now=2.0)
+
+    assert task is not None
+    requeued = store.claim_prefetch_tasks(limit=1, now=3.0)
+    assert len(requeued) == 1
+    assert requeued[0].id == task.id
+    assert requeued[0].attempts == 2
+    assert requeued[0].last_error_class == "CancelledError"
+
+
+async def test_prefetch_worker_skips_range_larger_than_middle_cache(
+    aiohttp_client, tmp_path
+):
+    request_methods = []
+
+    async def handler(request):
+        request_methods.append(request.method)
+        return web.Response(
+            status=206,
+            body=b"0123456789",
+            headers={"Content-Range": "bytes 10-19/20"},
+        )
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", handler)
+    origin = await aiohttp_client(origin_app)
+    origin_url = str(origin.make_url("/movie.mkv"))
+
+    store = SessionStateStore(tmp_path / "state.db")
+    middle = MiddleRangeCache(tmp_path / "mid", store, max_bytes=5, ttl_seconds=60)
+    store.enqueue_prefetch_task(
+        "1",
+        "ms1",
+        "a" * 64,
+        10,
+        19,
+        priority=1,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://fallback",
+        cache_dir=str(tmp_path),
+        middle_cache=MiddleCacheConfig(enabled=True),
+        prefetch=PrefetchConfig(enabled=True, bandwidth_bytes_per_second=1024),
+    )
+    worker = PrefetchWorker(
+        config,
+        store,
+        middle,
+        source_lookup={("1", "ms1"): origin_url},
+    )
+
+    result = await worker.run_once(now=2.0)
+
+    assert result.completed == 0
+    assert result.failed == 0
+    assert result.skipped == 1
+    assert request_methods == []
+
+
+async def test_prefetch_worker_source_missing_skips_with_retry(tmp_path):
+    store = SessionStateStore(tmp_path / "state.db")
+    middle = MiddleRangeCache(
+        tmp_path / "mid", store, max_bytes=1024, ttl_seconds=60
+    )
+    task = store.enqueue_prefetch_task(
+        "1",
+        "ms1",
+        "a" * 64,
+        10,
+        19,
+        priority=1,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://fallback",
+        cache_dir=str(tmp_path),
+        middle_cache=MiddleCacheConfig(enabled=True),
+        prefetch=PrefetchConfig(
+            enabled=True,
+            bandwidth_bytes_per_second=1024,
+            error_backoff_seconds=10,
+        ),
+    )
+    worker = PrefetchWorker(config, store, middle)
+
+    result = await worker.run_once(now=2.0)
+    early = store.claim_prefetch_tasks(limit=1, now=11.0)
+    retried = store.claim_prefetch_tasks(limit=1, now=12.0)
+
+    assert task is not None
+    assert result.completed == 0
+    assert result.failed == 0
+    assert result.skipped == 1
+    assert early == []
+    assert len(retried) == 1
+    assert retried[0].id == task.id
+    assert retried[0].status == "running"
 
 
 async def test_prefetch_worker_skips_when_disabled(tmp_path):
