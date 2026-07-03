@@ -30,6 +30,7 @@ def test_load_config_with_defaults(tmp_path):
     assert config.fallback_base_url == "http://127.0.0.1:8096"
     assert config.prewarm_api_key == "secret-prewarm-key"
     assert config.cache.max_bytes == 512 * 1024**3
+    assert config.cache.open_head_response_bytes is None
     assert config.prewarm.enabled is False
     assert config.path_mappings == ()
     assert config.rollout.enabled is True
@@ -150,3 +151,20 @@ def test_prewarm_interval_allows_sixty_seconds(tmp_path):
     )
 
     assert load_config(path).prewarm.interval_seconds == 60
+
+
+def test_load_config_reads_open_head_response_bytes(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "cache": {"open_head_response_bytes": 32 * 1024**2},
+            }
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.cache.open_head_response_bytes == 32 * 1024**2

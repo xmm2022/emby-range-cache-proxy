@@ -42,6 +42,7 @@ class CacheConfig:
     build_wait_seconds: float = 0.25
     chunk_bytes: int = 1024 * 1024
     default_open_range_bytes: int = 16 * 1024**2
+    open_head_response_bytes: int | None = None
 
 
 @dataclass
@@ -101,11 +102,13 @@ def _rollout(data: dict[str, Any]) -> RolloutConfig:
 
 
 def _cache(data: dict[str, Any]) -> CacheConfig:
+    open_head_response_bytes = data.get("open_head_response_bytes")
     return CacheConfig(
         max_bytes=int(data.get("max_bytes", 512 * 1024**3)),
         build_wait_seconds=float(data.get("build_wait_seconds", 0.25)),
         chunk_bytes=int(data.get("chunk_bytes", 1024 * 1024)),
         default_open_range_bytes=int(data.get("default_open_range_bytes", 16 * 1024**2)),
+        open_head_response_bytes=None if open_head_response_bytes is None else int(open_head_response_bytes),
     )
 
 

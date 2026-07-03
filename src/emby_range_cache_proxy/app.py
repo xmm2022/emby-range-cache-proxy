@@ -133,6 +133,7 @@ async def serve_authorized_range(
             head_bytes=head_size,
             tail_bytes=tail_size,
             default_open_range_bytes=config.cache.default_open_range_bytes,
+            open_head_response_bytes=config.cache.open_head_response_bytes,
         )
         key = cache_key(source, metadata)
         cache_block = _cache_block_for_request(byte_range, metadata, head_size=head_size, tail_size=tail_size)

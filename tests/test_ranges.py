@@ -35,6 +35,17 @@ def test_plan_open_ended_range_inside_head_to_head_window():
     ) == ByteRange(8, 15)
 
 
+def test_plan_open_ended_range_inside_head_can_use_smaller_response_window():
+    assert plan_playback_range(
+        "bytes=4-",
+        size=100,
+        head_bytes=16,
+        tail_bytes=4,
+        default_open_range_bytes=8,
+        open_head_response_bytes=8,
+    ) == ByteRange(4, 11)
+
+
 def test_plan_open_ended_range_inside_tail_to_eof():
     assert plan_playback_range(
         "bytes=97-",

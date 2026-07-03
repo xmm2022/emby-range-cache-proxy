@@ -41,6 +41,7 @@ def plan_playback_range(
     head_bytes: int,
     tail_bytes: int,
     default_open_range_bytes: int,
+    open_head_response_bytes: int | None = None,
 ) -> ByteRange:
     byte_range = parse_range_header(value, size=size)
     if not value:
@@ -56,7 +57,10 @@ def plan_playback_range(
     start = byte_range.start
     tail_start = max(0, size - tail_bytes)
     if start < min(head_bytes, size):
-        return ByteRange(start, min(head_bytes, size) - 1)
+        head_end = min(head_bytes, size) - 1
+        if open_head_response_bytes is None or open_head_response_bytes <= 0:
+            return ByteRange(start, head_end)
+        return ByteRange(start, min(start + open_head_response_bytes - 1, head_end))
     if start >= tail_start:
         return ByteRange(start, size - 1)
     return ByteRange(start, min(start + default_open_range_bytes - 1, size - 1))

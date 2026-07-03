@@ -8,7 +8,7 @@ import emby_range_cache_proxy.app as app_module
 from emby_range_cache_proxy.auth import AuthUnavailable, AuthorizationError
 from emby_range_cache_proxy.app import create_app
 from emby_range_cache_proxy.cache import CacheReadError
-from emby_range_cache_proxy.config import Config, PathMapping, PrewarmConfig, RolloutConfig
+from emby_range_cache_proxy.config import CacheConfig, Config, PathMapping, PrewarmConfig, RolloutConfig
 from emby_range_cache_proxy.models import ByteRange, RequestContext, SourceMetadata
 
 
@@ -298,6 +298,77 @@ async def test_open_ended_head_range_is_limited_and_served_from_head_cache(
     assert response.headers["Content-Range"] == "bytes 0-15/100"
     assert response.headers["Content-Length"] == "16"
     assert await response.read() == b"0123456789abcdef"
+
+    response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=8-"})
+
+    assert response.status == 206
+    assert response.headers["Content-Range"] == "bytes 8-15/100"
+    assert response.headers["Content-Length"] == "8"
+    assert await response.read() == b"89abcdef"
+    assert origin_get_calls == 1
+
+
+async def test_open_ended_head_range_can_be_smaller_than_cached_head_block(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
+    origin_get_calls = 0
+    body = b"0123456789abcdef" + b"T" * 84
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": len(body),
+                        "Container": "mkv",
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        nonlocal origin_get_calls
+        origin_get_calls += 1
+        assert request.headers["Range"] == "bytes=0-15"
+        return web.Response(status=206, body=body[0:16], headers={"Content-Range": "bytes 0-15/100"})
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": str(len(body)), "Content-Type": "video/x-matroska"})
+
+    async def fallback(request):
+        return web.Response(body=b"fallback")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    origin_app = web.Application()
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
+    origin_server = await aiohttp_client(origin_app)
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+            cache=CacheConfig(open_head_response_bytes=8),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=0-"})
+
+    assert response.status == 206
+    assert response.headers["Content-Range"] == "bytes 0-7/100"
+    assert response.headers["Content-Length"] == "8"
+    assert await response.read() == b"01234567"
 
     response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=8-"})
 
