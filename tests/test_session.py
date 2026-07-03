@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from emby_range_cache_proxy.config import SessionConfig
 from emby_range_cache_proxy.models import ByteRange, RequestContext, SourceMetadata
@@ -133,6 +134,41 @@ async def test_session_recorder_stop_drains_accepted_updates(tmp_path):
 
     assert store.get_session(hash_identifier("play1")) is not None
     assert store.get_session(hash_identifier("play2")) is not None
+
+
+async def test_session_recorder_worker_logs_failed_write_and_continues(caplog):
+    class FakeStore:
+        def __init__(self):
+            self.calls = 0
+            self.recorded = []
+
+        def record_playback(self, update):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("temporary sqlite failure")
+            self.recorded.append(update)
+
+    store = FakeStore()
+    recorder = SessionRecorder(store, queue_size=10)
+    metadata = SourceMetadata(url="http://origin/movie.mkv", size=1000)
+    caplog.set_level(logging.WARNING, logger="emby_range_cache_proxy.session")
+
+    recorder.start()
+    assert (
+        recorder.record_nowait(_ctx("play1"), "a" * 64, metadata, ByteRange(0, 9), observed_at=1.0)
+        is True
+    )
+    assert (
+        recorder.record_nowait(_ctx("play2"), "b" * 64, metadata, ByteRange(10, 19), observed_at=2.0)
+        is True
+    )
+    await recorder.stop()
+
+    assert recorder._task is not None
+    assert recorder._task.done()
+    assert store.calls == 2
+    assert [update.session_hash for update in store.recorded] == [hash_identifier("play2")]
+    assert "session recorder write failed" in caplog.text
 
 
 def test_mark_idle_and_expire_sessions(tmp_path):

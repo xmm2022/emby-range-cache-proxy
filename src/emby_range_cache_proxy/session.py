@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import time
 
 from .config import SessionConfig
@@ -12,6 +13,8 @@ from .state import (
     SessionStateStore,
     hash_identifier,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 def origin_signature(metadata: SourceMetadata) -> str:
@@ -97,8 +100,8 @@ class SessionRecorder:
                 return count
             if update is None:
                 continue
-            await asyncio.to_thread(self.store.record_playback, update)
-            count += 1
+            if await self._record_update(update):
+                count += 1
 
     async def run(self) -> None:
         while True:
@@ -106,7 +109,7 @@ class SessionRecorder:
             if update is None:
                 await self.drain_once()
                 return
-            await asyncio.to_thread(self.store.record_playback, update)
+            await self._record_update(update)
 
     def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -124,6 +127,14 @@ class SessionRecorder:
             return
         await self.queue.put(None)
         await self._task
+
+    async def _record_update(self, update: PlaybackSessionUpdate) -> bool:
+        try:
+            await asyncio.to_thread(self.store.record_playback, update)
+        except Exception as error:
+            LOGGER.warning("session recorder write failed: %s", type(error).__name__)
+            return False
+        return True
 
     def mark_idle_and_expired(
         self, config: SessionConfig, *, now: float

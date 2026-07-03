@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -166,9 +166,6 @@ async def serve_authorized_range(
             open_head_response_bytes=config.cache.open_head_response_bytes,
         )
         key = cache_key(source, metadata)
-        recorder: SessionRecorder | None = request.app.get("session_recorder")
-        if recorder is not None:
-            recorder.record_nowait(ctx, key, metadata, byte_range, observed_at=time.time())
         cache_block = _cache_block_for_request(byte_range, metadata, head_size=head_size, tail_size=tail_size)
         status = 206 if request.headers.get("Range") else 200
         headers = _range_response_headers(byte_range, metadata, include_content_range=status == 206)
@@ -176,6 +173,36 @@ async def serve_authorized_range(
         if request.method == "HEAD":
             _log_proxy_result("head", request, ctx=ctx, byte_range=byte_range, metadata=metadata, started_at=started_at)
             return web.Response(status=status, headers=headers)
+
+        def record_session() -> None:
+            _record_session_progress(request, ctx, key, metadata, byte_range)
+
+        middle_cache: MiddleRangeCache | None = request.app.get("middle_cache")
+        if config.middle_cache.enabled and middle_cache is not None:
+            try:
+                cached_chunks = middle_cache.iter_block(
+                    key,
+                    byte_range,
+                    chunk_bytes=config.cache.chunk_bytes,
+                    now=time.time(),
+                )
+            except Exception as error:
+                LOGGER.warning("middle cache read failed: %s", type(error).__name__)
+                cached_chunks = None
+            if cached_chunks is not None:
+                return await _serve_cached_response(
+                    request,
+                    status=status,
+                    headers=headers,
+                    cached_chunks=cached_chunks,
+                    ctx=ctx,
+                    byte_range=byte_range,
+                    metadata=metadata,
+                    started_at=started_at,
+                    block_name="middle",
+                    block_range=byte_range,
+                    record_session=record_session,
+                )
 
         if cache_block is not None:
             block_name, block_range = cache_block
@@ -192,6 +219,7 @@ async def serve_authorized_range(
                     started_at=started_at,
                     block_name=block_name,
                     block_range=block_range,
+                    record_session=record_session,
                 )
             build_lock = await _cache_build_lock(request.app, key, block_name)
             if build_lock.locked():
@@ -210,6 +238,7 @@ async def serve_authorized_range(
                         started_at=started_at,
                         block_name=block_name,
                         block_range=block_range,
+                        record_session=record_session,
                     )
                 if build_lock.locked():
                     block_name = None
@@ -231,6 +260,7 @@ async def serve_authorized_range(
                             started_at=started_at,
                             block_name=block_name,
                             block_range=block_range,
+                            record_session=record_session,
                         )
             else:
                 await build_lock.acquire()
@@ -248,36 +278,12 @@ async def serve_authorized_range(
                         started_at=started_at,
                         block_name=block_name,
                         block_range=block_range,
+                        record_session=record_session,
                     )
         else:
             block_name = None
             block_range = byte_range
             build_lock = None
-
-        middle_cache: MiddleRangeCache | None = request.app.get("middle_cache")
-        if config.middle_cache.enabled and middle_cache is not None:
-            cached_chunks = middle_cache.iter_block(
-                key,
-                byte_range,
-                chunk_bytes=config.cache.chunk_bytes,
-                now=time.time(),
-            )
-            if cached_chunks is not None:
-                if build_lock is not None and build_lock.locked():
-                    build_lock.release()
-                    build_lock = None
-                return await _serve_cached_response(
-                    request,
-                    status=status,
-                    headers=headers,
-                    cached_chunks=cached_chunks,
-                    ctx=ctx,
-                    byte_range=byte_range,
-                    metadata=metadata,
-                    started_at=started_at,
-                    block_name="middle",
-                    block_range=byte_range,
-                )
 
         response = web.StreamResponse(status=status, headers=headers)
         try:
@@ -338,6 +344,8 @@ async def serve_authorized_range(
                             prepare_ms=prepare_ms,
                             first_body_ms=first_body_ms,
                         )
+                        if response_done and response_bytes_written == byte_range.length:
+                            record_session()
                     except (ValueError, OSError):
                         writer.abort()
                         if not response_done:
@@ -356,6 +364,8 @@ async def serve_authorized_range(
                         prepare_ms=prepare_ms,
                         first_body_ms=first_body_ms,
                     )
+                    if response_done and response_bytes_written == byte_range.length:
+                        record_session()
         finally:
             if build_lock is not None and build_lock.locked():
                 build_lock.release()
@@ -377,6 +387,7 @@ async def _serve_cached_response(
     started_at: float,
     block_name: str,
     block_range: ByteRange,
+    record_session: Callable[[], None] | None = None,
 ) -> web.StreamResponse:
     response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
@@ -387,6 +398,8 @@ async def _serve_cached_response(
     if cache_error:
         response.force_close()
     await _write_eof_safely(response)
+    if not cache_error and served_bytes == byte_range.length and record_session is not None:
+        record_session()
     _log_proxy_result(
         "cache_error" if cache_error else "cache_hit",
         request,
@@ -403,6 +416,21 @@ async def _serve_cached_response(
         first_body_ms=first_body_ms,
     )
     return response
+
+
+def _record_session_progress(
+    request: web.Request,
+    ctx: RequestContext,
+    key: str,
+    metadata: SourceMetadata,
+    byte_range: ByteRange,
+) -> None:
+    if request.method != "GET":
+        return
+    recorder: SessionRecorder | None = request.app.get("session_recorder")
+    if recorder is None:
+        return
+    recorder.record_nowait(ctx, key, metadata, byte_range, observed_at=time.time())
 
 
 async def _write_cached_chunks(
