@@ -736,7 +736,23 @@ def test_plan_middle_ranges_queued_until_non_boundary_does_not_repeat_bytes():
 
     assert ranges
     assert all(byte_range.start > 550 for byte_range in ranges)
-    assert ranges[0] == ByteRange(576, 639)
+    assert ranges[0] == ByteRange(551, 575)
+
+
+def test_plan_middle_ranges_queued_until_non_boundary_fills_partial_gap():
+    ranges = plan_middle_ranges(
+        media_size=1000,
+        head_size=100,
+        tail_size=100,
+        max_observed_offset=350,
+        queued_until=419,
+        prefetch=PrefetchConfig(window_bytes=100, resume_overlap_bytes=0, max_session_bytes=512),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+    )
+
+    assert ranges
+    assert ranges[0] == ByteRange(420, 447)
+    assert all(byte_range.start > 419 for byte_range in ranges)
 
 
 def test_plan_middle_ranges_caps_by_max_session_bytes():
