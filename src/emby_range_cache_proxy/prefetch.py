@@ -32,6 +32,8 @@ def plan_middle_ranges(
     middle_end = tail_start - 1
     if middle_start > middle_end:
         return []
+    if middle_end - middle_start + 1 < segment:
+        return []
 
     start = max(middle_start, max_observed_offset - prefetch.resume_overlap_bytes)
     start = max(middle_start, align_down(start, segment))

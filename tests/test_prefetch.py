@@ -91,6 +91,20 @@ def test_plan_middle_ranges_returns_partial_final_segment():
     ]
 
 
+def test_plan_middle_ranges_returns_empty_when_middle_space_smaller_than_segment():
+    ranges = plan_middle_ranges(
+        media_size=200,
+        head_size=128,
+        tail_size=64,
+        max_observed_offset=100,
+        queued_until=None,
+        prefetch=PrefetchConfig(window_bytes=256, resume_overlap_bytes=0, max_session_bytes=512),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+    )
+
+    assert ranges == []
+
+
 def test_plan_middle_ranges_returns_empty_when_no_middle_space():
     ranges = plan_middle_ranges(
         media_size=192,
