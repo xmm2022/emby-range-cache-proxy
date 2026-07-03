@@ -6,7 +6,9 @@ from emby_range_cache_proxy.state import (
     MiddleBlockRecord,
     PlaybackSessionUpdate,
     PrefetchTaskRecord,
+    SESSION_STATUSES,
     SessionStateStore,
+    TASK_STATUSES,
     hash_identifier,
 )
 
@@ -20,6 +22,19 @@ def test_hash_identifier_is_stable_and_does_not_expose_value():
     assert len(hashed) == 64
     assert value not in hashed
     assert hash_identifier(None) is None
+
+
+def test_state_status_constants_match_public_contract():
+    assert SESSION_STATUSES == {"active", "idle", "stopped", "expired"}
+    assert TASK_STATUSES == {"queued", "running", "done", "failed", "skipped"}
+
+
+def test_state_store_accepts_public_path_keyword(tmp_path):
+    path = tmp_path / "state.sqlite3"
+
+    store = SessionStateStore(path=path)
+
+    assert store.path == path
 
 
 def test_record_playback_update_creates_and_advances_session(tmp_path):

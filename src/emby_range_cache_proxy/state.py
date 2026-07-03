@@ -8,6 +8,10 @@ from pathlib import Path
 from .models import ByteRange
 
 
+SESSION_STATUSES = {"active", "idle", "stopped", "expired"}
+TASK_STATUSES = {"queued", "running", "done", "failed", "skipped"}
+
+
 def hash_identifier(value: str | None) -> str | None:
     if value is None:
         return None
@@ -80,9 +84,9 @@ class MiddleBlockRecord:
 
 
 class SessionStateStore:
-    def __init__(self, db_path: str | Path) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
     def record_playback(self, update: PlaybackSessionUpdate) -> None:
@@ -526,7 +530,7 @@ class SessionStateStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         return conn
 
