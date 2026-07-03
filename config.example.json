@@ -1,0 +1,25 @@
+{
+  "emby_base_url": "http://127.0.0.1:8096",
+  "fallback_base_url": "http://127.0.0.1:8096",
+  "listen_host": "127.0.0.1",
+  "listen_port": 18180,
+  "cache_dir": "/home/nax/emby/cache/range-proxy",
+  "prewarm_api_key": null,
+  "rollout": {
+    "enabled": false,
+    "item_allowlist": [],
+    "media_source_allowlist": [],
+    "path_prefix_allowlist": []
+  },
+  "cache": {
+    "max_bytes": 549755813888,
+    "build_wait_seconds": 0.25,
+    "chunk_bytes": 1048576
+  },
+  "prewarm": {
+    "enabled": false,
+    "interval_seconds": 900,
+    "max_items_per_scan": 100,
+    "concurrency": 1
+  }
+}
