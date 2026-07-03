@@ -88,6 +88,17 @@ class MiddleBlockRecord:
     expires_at: float
 
 
+@dataclass(frozen=True)
+class SourceMetadataRecord:
+    item_id: str
+    media_source_id: str
+    cache_key: str
+    origin_url: str
+    origin_signature: str
+    media_size: int
+    updated_at: float
+
+
 class SessionStateStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -279,6 +290,64 @@ class SessionStateStore:
                 """,
                 (queued_until, queued_until, session_hash),
             )
+
+    def upsert_source_metadata(
+        self,
+        *,
+        item_id: str,
+        media_source_id: str,
+        cache_key: str,
+        origin_url: str,
+        origin_signature: str,
+        media_size: int,
+        updated_at: float,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO source_metadata (
+                    item_id, media_source_id, cache_key, origin_url,
+                    origin_signature, media_size, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_id, media_source_id, cache_key) DO UPDATE SET
+                    origin_url = excluded.origin_url,
+                    origin_signature = excluded.origin_signature,
+                    media_size = excluded.media_size,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    item_id,
+                    media_source_id,
+                    cache_key,
+                    origin_url,
+                    origin_signature,
+                    media_size,
+                    updated_at,
+                ),
+            )
+
+    def get_source_metadata(
+        self, item_id: str, media_source_id: str, cache_key: str
+    ) -> SourceMetadataRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM source_metadata
+                WHERE item_id = ? AND media_source_id = ? AND cache_key = ?
+                """,
+                (item_id, media_source_id, cache_key),
+            ).fetchone()
+        return _source_metadata_from_row(row) if row is not None else None
+
+    def delete_source_metadata_older_than(self, cutoff: float) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM source_metadata WHERE updated_at < ?",
+                (cutoff,),
+            )
+            return cursor.rowcount
 
     def enqueue_prefetch_task(
         self,
@@ -710,6 +779,16 @@ class SessionStateStore:
                     expires_at REAL NOT NULL,
                     PRIMARY KEY(cache_key, start, end)
                 );
+                CREATE TABLE IF NOT EXISTS source_metadata (
+                    item_id TEXT NOT NULL,
+                    media_source_id TEXT NOT NULL,
+                    cache_key TEXT NOT NULL,
+                    origin_url TEXT NOT NULL,
+                    origin_signature TEXT NOT NULL,
+                    media_size INTEGER NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(item_id, media_source_id, cache_key)
+                );
                 """
             )
             _ensure_column(conn, "prefetch_tasks", "next_attempt_at", "REAL")
@@ -871,4 +950,16 @@ def _middle_block_from_row(row: sqlite3.Row) -> MiddleBlockRecord:
         created_at=row["created_at"],
         last_access_at=row["last_access_at"],
         expires_at=row["expires_at"],
+    )
+
+
+def _source_metadata_from_row(row: sqlite3.Row) -> SourceMetadataRecord:
+    return SourceMetadataRecord(
+        item_id=row["item_id"],
+        media_source_id=row["media_source_id"],
+        cache_key=row["cache_key"],
+        origin_url=row["origin_url"],
+        origin_signature=row["origin_signature"],
+        media_size=row["media_size"],
+        updated_at=row["updated_at"],
     )

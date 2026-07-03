@@ -3,7 +3,12 @@ import logging
 
 from emby_range_cache_proxy.config import SessionConfig
 from emby_range_cache_proxy.models import ByteRange, RequestContext, SourceMetadata
-from emby_range_cache_proxy.session import SessionRecorder, build_session_update, origin_signature
+from emby_range_cache_proxy.session import (
+    SessionRecorder,
+    SourceMetadataRecorder,
+    build_session_update,
+    origin_signature,
+)
 from emby_range_cache_proxy.state import SessionStateStore, hash_identifier
 
 
@@ -169,6 +174,35 @@ async def test_session_recorder_worker_logs_failed_write_and_continues(caplog):
     assert store.calls == 2
     assert [update.session_hash for update in store.recorded] == [hash_identifier("play2")]
     assert "session recorder write failed" in caplog.text
+
+
+async def test_source_metadata_recorder_prunes_old_records(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    store.upsert_source_metadata(
+        item_id="old",
+        media_source_id="ms-old",
+        cache_key="a" * 64,
+        origin_url="http://origin/old.mkv?api_key=signed",
+        origin_signature="old",
+        media_size=100,
+        updated_at=1.0,
+    )
+    recorder = SourceMetadataRecorder(store, retention_seconds=5)
+
+    assert recorder.record_nowait(
+        item_id="new",
+        media_source_id="ms-new",
+        cache_key="b" * 64,
+        origin_url="http://origin/new.mkv?api_key=signed",
+        origin_signature="new",
+        media_size=200,
+        updated_at=10.0,
+    )
+
+    await recorder.drain_once()
+
+    assert store.get_source_metadata("old", "ms-old", "a" * 64) is None
+    assert store.get_source_metadata("new", "ms-new", "b" * 64) is not None
 
 
 def test_mark_idle_and_expire_sessions(tmp_path):

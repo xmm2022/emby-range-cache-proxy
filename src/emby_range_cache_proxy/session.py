@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from dataclasses import dataclass
 
 from .config import SessionConfig
 from .models import ByteRange, RequestContext, SourceMetadata
@@ -142,3 +143,120 @@ class SessionRecorder:
         idle = self.store.mark_idle_sessions(now=now, idle_seconds=config.idle_seconds)
         self.store.expire_old_sessions(now=now, expire_seconds=config.expire_seconds)
         return idle
+
+
+@dataclass(frozen=True)
+class SourceMetadataUpdate:
+    item_id: str
+    media_source_id: str
+    cache_key: str
+    origin_url: str
+    origin_signature: str
+    media_size: int
+    updated_at: float
+
+
+class SourceMetadataRecorder:
+    def __init__(
+        self,
+        store: SessionStateStore,
+        *,
+        retention_seconds: int,
+        queue_size: int = 1000,
+    ) -> None:
+        self.store = store
+        self.retention_seconds = retention_seconds
+        self.queue: asyncio.Queue[SourceMetadataUpdate | None] = asyncio.Queue(
+            maxsize=queue_size
+        )
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = False
+
+    def record_nowait(
+        self,
+        *,
+        item_id: str,
+        media_source_id: str,
+        cache_key: str,
+        origin_url: str,
+        origin_signature: str,
+        media_size: int,
+        updated_at: float,
+    ) -> bool:
+        if self._stopping:
+            return False
+        update = SourceMetadataUpdate(
+            item_id=item_id,
+            media_source_id=media_source_id,
+            cache_key=cache_key,
+            origin_url=origin_url,
+            origin_signature=origin_signature,
+            media_size=media_size,
+            updated_at=updated_at,
+        )
+        try:
+            self.queue.put_nowait(update)
+            return True
+        except asyncio.QueueFull:
+            return False
+
+    async def drain_once(self) -> int:
+        count = 0
+        while True:
+            try:
+                update = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return count
+            if update is None:
+                continue
+            if await self._record_update(update):
+                count += 1
+
+    async def run(self) -> None:
+        while True:
+            update = await self.queue.get()
+            if update is None:
+                await self.drain_once()
+                return
+            await self._record_update(update)
+
+    def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stopping = False
+        self._task = asyncio.create_task(self.run())
+
+    async def stop(self) -> None:
+        self._stopping = True
+        if self._task is None:
+            await self.drain_once()
+            return
+        if self._task.done():
+            await self._task
+            return
+        await self.queue.put(None)
+        await self._task
+
+    async def _record_update(self, update: SourceMetadataUpdate) -> bool:
+        try:
+            await asyncio.to_thread(self._write_update, update)
+        except Exception as error:
+            LOGGER.warning(
+                "source metadata recorder write failed: %s", type(error).__name__
+            )
+            return False
+        return True
+
+    def _write_update(self, update: SourceMetadataUpdate) -> None:
+        self.store.upsert_source_metadata(
+            item_id=update.item_id,
+            media_source_id=update.media_source_id,
+            cache_key=update.cache_key,
+            origin_url=update.origin_url,
+            origin_signature=update.origin_signature,
+            media_size=update.media_size,
+            updated_at=update.updated_at,
+        )
+        self.store.delete_source_metadata_older_than(
+            update.updated_at - self.retention_seconds
+        )

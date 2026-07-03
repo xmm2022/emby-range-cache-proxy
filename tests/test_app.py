@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 import time
 from contextlib import suppress
 
@@ -23,6 +24,7 @@ from emby_range_cache_proxy.config import (
 )
 from emby_range_cache_proxy.middle_cache import MiddleRangeCache
 from emby_range_cache_proxy.models import ByteRange, RequestContext, SourceMetadata
+from emby_range_cache_proxy.session import origin_signature
 from emby_range_cache_proxy.state import (
     PlaybackSessionUpdate,
     SessionStateStore,
@@ -151,6 +153,30 @@ async def test_prefetch_lifecycle_does_not_start_when_prefetch_disabled(
             session=SessionConfig(enabled=True),
             middle_cache=MiddleCacheConfig(enabled=True),
             prefetch=PrefetchConfig(enabled=False),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    assert "prefetch_task" not in app
+
+    await client.close()
+
+
+async def test_prefetch_lifecycle_does_not_start_without_middle_cache(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    class ForbiddenPrefetchWorker:
+        def __init__(self, config, store, middle_cache):
+            raise AssertionError("prefetch worker must not start without middle cache")
+
+    monkeypatch.setattr(app_module, "PrefetchWorker", ForbiddenPrefetchWorker)
+    app = create_app(
+        Config(
+            emby_base_url="http://emby",
+            fallback_base_url="http://emby",
+            cache_dir=str(tmp_path / "cache"),
+            middle_cache=MiddleCacheConfig(enabled=False),
+            prefetch=PrefetchConfig(enabled=True),
         )
     )
     client = await aiohttp_client(app)
@@ -637,6 +663,175 @@ async def test_authorized_request_records_session_state(aiohttp_client, monkeypa
     assert session is not None
     assert session.item_id == "1"
     assert session.max_observed_offset == 9
+
+
+async def test_authorized_request_stores_source_metadata_for_prefetch(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
+    monkeypatch.setattr(app_module.time, "time", lambda: 123.0)
+    db_path = tmp_path / "state.sqlite3"
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": 100,
+                        "Container": "mkv",
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        assert request.headers["Range"] == "bytes=0-15"
+        return web.Response(
+            status=206,
+            body=b"0123456789abcdef",
+            headers={"Content-Range": "bytes 0-15/100", "ETag": '"v1"'},
+        )
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": "100", "ETag": '"v1"'})
+
+    async def fallback(request):
+        return web.Response(status=500, body=b"fallback must not be used")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    origin_app = web.Application()
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
+    origin_server = await aiohttp_client(origin_app)
+    origin_url = str(origin_server.make_url("/movie.mkv"))
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path / "cache"),
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+            session=SessionConfig(enabled=False, state_db=str(db_path)),
+            middle_cache=MiddleCacheConfig(enabled=True),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.get(
+        "/emby/videos/1/original.mkv"
+        "?MediaSourceId=ms1&api_key=user-secret"
+        "&PlaySessionId=play-secret&DeviceId=device-secret",
+        headers={"Range": "bytes=0-9"},
+    )
+
+    assert response.status == 206
+    assert await response.read() == b"0123456789"
+    await app["source_metadata_recorder"].stop()
+
+    source = app_module.MediaSource("1", "ms1", origin_url, "Http", 100)
+    metadata = SourceMetadata(url=origin_url, size=100, etag='"v1"')
+    key = app_module.cache_key(source, metadata)
+    store: SessionStateStore = app["phase2_store"]
+    stored = store.get_source_metadata("1", "ms1", key)
+
+    assert stored is not None
+    assert stored.origin_url == origin_url
+    assert stored.origin_signature == origin_signature(metadata)
+    assert stored.media_size == 100
+    assert stored.updated_at == 123.0
+    db_bytes = db_path.read_bytes()
+    assert b"user-secret" not in db_bytes
+    assert b"play-secret" not in db_bytes
+    assert b"device-secret" not in db_bytes
+
+
+async def test_source_metadata_recording_does_not_delay_origin_response(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
+    started = threading.Event()
+    release = threading.Event()
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": 100,
+                        "Container": "mkv",
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        assert request.headers["Range"] == "bytes=0-15"
+        return web.Response(
+            status=206,
+            body=b"0123456789abcdef",
+            headers={"Content-Range": "bytes 0-15/100"},
+        )
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": "100"})
+
+    async def fallback(request):
+        return web.Response(status=500, body=b"fallback must not be used")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    origin_app = web.Application()
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
+    origin_server = await aiohttp_client(origin_app)
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path / "cache"),
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+            middle_cache=MiddleCacheConfig(enabled=True),
+        )
+    )
+    store: SessionStateStore = app["phase2_store"]
+
+    def blocking_upsert(**kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+
+    monkeypatch.setattr(store, "upsert_source_metadata", blocking_upsert)
+    client = await aiohttp_client(app)
+    request_task = asyncio.create_task(
+        client.get(
+            "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t",
+            headers={"Range": "bytes=0-9"},
+        )
+    )
+
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        response = await asyncio.wait_for(asyncio.shield(request_task), timeout=0.5)
+        assert response.status == 206
+        assert await response.read() == b"0123456789"
+    finally:
+        release.set()
+        if not request_task.done():
+            with suppress(Exception):
+                await request_task
 
 
 async def test_authorized_head_request_does_not_record_session_state(

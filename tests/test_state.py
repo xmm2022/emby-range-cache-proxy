@@ -92,6 +92,135 @@ def test_state_store_accepts_public_path_keyword(tmp_path):
     assert store.path == path
 
 
+def test_source_metadata_is_stored_for_prefetch(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+
+    store.upsert_source_metadata(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_url="http://origin/movie.mkv",
+        origin_signature="sig",
+        media_size=1000,
+        updated_at=1.0,
+    )
+    store.upsert_source_metadata(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_url="http://origin/movie-new.mkv",
+        origin_signature="sig-new",
+        media_size=2000,
+        updated_at=2.0,
+    )
+
+    source = store.get_source_metadata("1", "ms1", "a" * 64)
+
+    assert source is not None
+    assert source.item_id == "1"
+    assert source.media_source_id == "ms1"
+    assert source.cache_key == "a" * 64
+    assert source.origin_url == "http://origin/movie-new.mkv"
+    assert source.origin_signature == "sig-new"
+    assert source.media_size == 2000
+    assert source.updated_at == 2.0
+    assert store.get_source_metadata("1", "ms1", "b" * 64) is None
+
+
+def test_source_metadata_can_be_pruned_by_update_time(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    store.upsert_source_metadata(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_url="http://origin/old.mkv?api_key=signed",
+        origin_signature="old",
+        media_size=1000,
+        updated_at=1.0,
+    )
+    store.upsert_source_metadata(
+        item_id="2",
+        media_source_id="ms2",
+        cache_key="b" * 64,
+        origin_url="http://origin/new.mkv?api_key=signed",
+        origin_signature="new",
+        media_size=2000,
+        updated_at=10.0,
+    )
+
+    deleted = store.delete_source_metadata_older_than(5.0)
+
+    assert deleted == 1
+    assert store.get_source_metadata("1", "ms1", "a" * 64) is None
+    assert store.get_source_metadata("2", "ms2", "b" * 64) is not None
+
+
+def test_existing_state_db_gets_source_metadata_table(tmp_path):
+    db_path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE playback_sessions (
+                session_hash TEXT PRIMARY KEY,
+                device_hash TEXT,
+                item_id TEXT NOT NULL,
+                media_source_id TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                origin_signature TEXT NOT NULL,
+                media_size INTEGER NOT NULL,
+                last_range_start INTEGER NOT NULL,
+                last_range_end INTEGER NOT NULL,
+                max_observed_offset INTEGER NOT NULL,
+                first_seen_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL,
+                last_emby_observed_at REAL,
+                status TEXT NOT NULL,
+                queued_until INTEGER
+            );
+            CREATE TABLE prefetch_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id TEXT NOT NULL,
+                media_source_id TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                start INTEGER NOT NULL,
+                end INTEGER NOT NULL,
+                priority INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_error_class TEXT,
+                next_attempt_at REAL,
+                UNIQUE(cache_key, start, end)
+            );
+            CREATE TABLE middle_blocks (
+                cache_key TEXT NOT NULL,
+                start INTEGER NOT NULL,
+                end INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                last_access_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY(cache_key, start, end)
+            );
+            """
+        )
+
+    store = SessionStateStore(db_path)
+    store.upsert_source_metadata(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_url="http://origin/movie.mkv",
+        origin_signature="sig",
+        media_size=1000,
+        updated_at=1.0,
+    )
+
+    assert store.get_source_metadata("1", "ms1", "a" * 64) is not None
+
+
 def test_record_playback_update_creates_and_advances_session(tmp_path):
     store = SessionStateStore(tmp_path / "state.sqlite3")
     update = PlaybackSessionUpdate(

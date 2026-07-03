@@ -130,6 +130,82 @@ async def test_prefetch_worker_fetches_claimed_task_into_middle_cache(
     assert b"".join(chunks) == b"0123456789"
 
 
+async def test_prefetch_worker_uses_stored_source_metadata(
+    aiohttp_client, tmp_path
+):
+    request_methods = []
+
+    async def handler(request):
+        request_methods.append(request.method)
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "100", "ETag": '"v1"'})
+        assert request.headers["Range"] == "bytes=10-19"
+        return web.Response(
+            status=206,
+            body=b"abcdefghij",
+            headers={"Content-Range": "bytes 10-19/100", "ETag": '"v1"'},
+        )
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", handler)
+    origin = await aiohttp_client(origin_app)
+    origin_url = str(origin.make_url("/movie.mkv"))
+    key = cache_key(
+        MediaSource(
+            item_id="1",
+            media_source_id="ms1",
+            path=origin_url,
+            protocol="Http",
+            size=100,
+        ),
+        SourceMetadata(url=origin_url, size=100, etag='"v1"'),
+    )
+    store = SessionStateStore(tmp_path / "state.db")
+    store.upsert_source_metadata(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key=key,
+        origin_url=origin_url,
+        origin_signature="sig",
+        media_size=100,
+        updated_at=1.0,
+    )
+    middle = MiddleRangeCache(
+        tmp_path / "mid", store, max_bytes=1024, ttl_seconds=60
+    )
+    store.enqueue_prefetch_task(
+        "1",
+        "ms1",
+        key,
+        10,
+        19,
+        priority=1,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://fallback",
+        cache_dir=str(tmp_path),
+        rollout=RolloutConfig(enabled=True),
+        middle_cache=MiddleCacheConfig(enabled=True),
+        prefetch=PrefetchConfig(
+            enabled=True, bandwidth_bytes_per_second=1024, concurrency=1
+        ),
+    )
+    worker = PrefetchWorker(config, store, middle)
+
+    result = await worker.run_once(now=2.0)
+
+    assert result.completed == 1
+    assert result.failed == 0
+    assert result.skipped == 0
+    assert request_methods == ["HEAD", "GET"]
+    chunks = middle.iter_block(key, ByteRange(10, 19), chunk_bytes=4, now=3.0)
+    assert chunks is not None
+    assert b"".join(chunks) == b"abcdefghij"
+
+
 async def test_prefetch_worker_fails_cache_key_mismatch_without_writing_middle_cache(
     aiohttp_client, tmp_path
 ):
@@ -172,6 +248,67 @@ async def test_prefetch_worker_fails_cache_key_mismatch_without_writing_middle_c
     worker = PrefetchWorker(
         config, store, middle, source_lookup={("1", "ms1"): origin_url}
     )
+
+    result = await worker.run_once(now=2.0)
+
+    assert result.completed == 0
+    assert result.failed == 1
+    assert result.skipped == 0
+    assert (
+        middle.iter_block(wrong_key, ByteRange(10, 19), chunk_bytes=4, now=3.0)
+        is None
+    )
+
+
+async def test_prefetch_worker_stored_source_mismatch_does_not_write_middle_cache(
+    aiohttp_client, tmp_path
+):
+    async def handler(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "20"})
+        assert request.headers["Range"] == "bytes=10-19"
+        return web.Response(
+            status=206,
+            body=b"0123456789",
+            headers={"Content-Range": "bytes 10-19/20"},
+        )
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", handler)
+    origin = await aiohttp_client(origin_app)
+    origin_url = str(origin.make_url("/movie.mkv"))
+    wrong_key = "b" * 64
+    store = SessionStateStore(tmp_path / "state.db")
+    store.upsert_source_metadata(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key=wrong_key,
+        origin_url=origin_url,
+        origin_signature="sig",
+        media_size=20,
+        updated_at=1.0,
+    )
+    middle = MiddleRangeCache(
+        tmp_path / "mid", store, max_bytes=1024, ttl_seconds=60
+    )
+    store.enqueue_prefetch_task(
+        "1",
+        "ms1",
+        wrong_key,
+        10,
+        19,
+        priority=1,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://fallback",
+        cache_dir=str(tmp_path),
+        middle_cache=MiddleCacheConfig(enabled=True),
+        prefetch=PrefetchConfig(enabled=True, bandwidth_bytes_per_second=1024),
+    )
+    worker = PrefetchWorker(config, store, middle)
 
     result = await worker.run_once(now=2.0)
 

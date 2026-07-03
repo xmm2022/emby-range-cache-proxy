@@ -20,7 +20,7 @@ from .prefetch import PrefetchWorker, enqueue_prefetch_for_session
 from .prewarm import PrewarmWorker
 from .ranges import content_range_header, plan_playback_range
 from .requests import parse_original_request
-from .session import SessionRecorder
+from .session import SessionRecorder, SourceMetadataRecorder, origin_signature
 from .session_observer import EmbySessionObserver
 from .sources import resolve_media_source
 from .state import SessionStateStore
@@ -59,6 +59,11 @@ def create_app(config: Config) -> web.Application:
             max_bytes=config.middle_cache.max_bytes,
             ttl_seconds=config.middle_cache.ttl_seconds,
         )
+        app["source_metadata_recorder"] = SourceMetadataRecorder(
+            phase2_store,
+            retention_seconds=config.session.expire_seconds,
+        )
+        app.cleanup_ctx.append(source_metadata_recorder_lifecycle)
         if config.session.enabled:
             app["session_recorder"] = SessionRecorder(phase2_store)
             app.cleanup_ctx.append(session_recorder_lifecycle)
@@ -74,6 +79,17 @@ def create_app(config: Config) -> web.Application:
 
 async def session_recorder_lifecycle(app: web.Application) -> AsyncIterator[None]:
     recorder: SessionRecorder = app["session_recorder"]
+    recorder.start()
+    try:
+        yield
+    finally:
+        await recorder.stop()
+
+
+async def source_metadata_recorder_lifecycle(
+    app: web.Application,
+) -> AsyncIterator[None]:
+    recorder: SourceMetadataRecorder = app["source_metadata_recorder"]
     recorder.start()
     try:
         yield
@@ -263,6 +279,7 @@ async def serve_authorized_range(
             open_head_response_bytes=config.cache.open_head_response_bytes,
         )
         key = cache_key(source, metadata)
+        await _store_source_metadata(request, ctx, key, metadata)
         cache_block = _cache_block_for_request(byte_range, metadata, head_size=head_size, tail_size=tail_size)
         status = 206 if request.headers.get("Range") else 200
         headers = _range_response_headers(byte_range, metadata, include_content_range=status == 206)
@@ -534,6 +551,28 @@ def _record_session_progress(
     if recorder is None:
         return
     recorder.record_nowait(ctx, key, metadata, byte_range, observed_at=time.time())
+
+
+async def _store_source_metadata(
+    request: web.Request,
+    ctx: RequestContext,
+    key: str,
+    metadata: SourceMetadata,
+) -> None:
+    recorder: SourceMetadataRecorder | None = request.app.get("source_metadata_recorder")
+    if recorder is None:
+        return
+    recorded = recorder.record_nowait(
+        item_id=ctx.item_id,
+        media_source_id=ctx.media_source_id,
+        cache_key=key,
+        origin_url=metadata.url,
+        origin_signature=origin_signature(metadata),
+        media_size=metadata.size,
+        updated_at=time.time(),
+    )
+    if not recorded:
+        LOGGER.warning("source metadata recorder queue full")
 
 
 async def _write_cached_chunks(

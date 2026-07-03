@@ -97,6 +97,15 @@ class PrefetchWorker:
 
         url = self.source_lookup.get((task.item_id, task.media_source_id))
         if url is None:
+            source_metadata = await asyncio.to_thread(
+                self.store.get_source_metadata,
+                task.item_id,
+                task.media_source_id,
+                task.cache_key,
+            )
+            if source_metadata is not None:
+                url = source_metadata.origin_url
+        if url is None:
             await asyncio.to_thread(
                 self.store.skip_prefetch_task,
                 task.id,
