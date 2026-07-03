@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from aiohttp import ClientError, ClientSession, ClientTimeout
+from aiohttp import ClientError, ClientSession, ClientTimeout, ContentTypeError
 
 from .models import MediaSource, RequestContext
 
 
 class AuthorizationError(Exception):
+    pass
+
+
+class AuthUnavailable(Exception):
     pass
 
 
@@ -45,12 +49,16 @@ class EmbyAuthClient:
                     raise AuthorizationError(f"Emby authorization failed: status={response.status}")
                 try:
                     payload = await response.json()
-                except (ClientError, ValueError):
+                except (ContentTypeError, ValueError):
                     raise AuthorizationError("invalid PlaybackInfo response") from None
+        except AuthorizationError:
+            raise
         except (asyncio.TimeoutError, TimeoutError):
-            raise AuthorizationError("Emby authorization failed: timeout") from None
+            raise AuthUnavailable("Emby authorization unavailable: timeout") from None
         except ClientError:
-            raise AuthorizationError("Emby authorization failed: client error") from None
+            raise AuthUnavailable("Emby authorization unavailable: client error") from None
+        except OSError:
+            raise AuthUnavailable("Emby authorization unavailable: os error") from None
 
         if not isinstance(payload, dict):
             raise AuthorizationError("invalid PlaybackInfo response")

@@ -3,7 +3,7 @@ import asyncio
 from aiohttp import web
 import pytest
 
-from emby_range_cache_proxy.auth import AuthorizationError, EmbyAuthClient
+from emby_range_cache_proxy.auth import AuthUnavailable, AuthorizationError, EmbyAuthClient
 from emby_range_cache_proxy.models import RequestContext
 
 
@@ -68,7 +68,7 @@ async def test_authorize_rejects_non_json_without_leaking_token(aiohttp_client):
     assert "api_key" not in message
 
 
-async def test_authorize_wraps_timeout_without_leaking_token(aiohttp_client):
+async def test_authorize_wraps_timeout_as_auth_unavailable_without_leaking_token(aiohttp_client):
     async def playback_info(request):
         await asyncio.sleep(0.05)
         return web.json_response({"MediaSources": []})
@@ -78,13 +78,26 @@ async def test_authorize_wraps_timeout_without_leaking_token(aiohttp_client):
     server = await aiohttp_client(app)
 
     async with EmbyAuthClient(str(server.make_url("")), timeout_seconds=0.001) as client:
-        with pytest.raises(AuthorizationError, match="Emby authorization failed: timeout") as exc_info:
+        with pytest.raises(AuthUnavailable, match="Emby authorization unavailable: timeout") as exc_info:
             await client.authorize(_ctx())
 
     message = str(exc_info.value)
     assert "api_key" not in message
     assert "user-token" not in message
     assert str(server.make_url("")) not in message
+
+
+async def test_authorize_wraps_client_error_as_auth_unavailable_without_leaking_token(unused_tcp_port):
+    base_url = f"http://127.0.0.1:{unused_tcp_port}"
+
+    async with EmbyAuthClient(base_url, timeout_seconds=0.1) as client:
+        with pytest.raises(AuthUnavailable, match="Emby authorization unavailable: client error") as exc_info:
+            await client.authorize(_ctx(token="secret-token"))
+
+    message = str(exc_info.value)
+    assert "api_key" not in message
+    assert "secret-token" not in message
+    assert base_url not in message
 
 
 @pytest.mark.parametrize(

@@ -37,11 +37,10 @@ def test_main_runs_app_from_config(monkeypatch):
 
     monkeypatch.setattr(cli, "load_config", fake_load_config)
     monkeypatch.setattr(cli, "create_app", fake_create_app)
-    monkeypatch.setattr(
-        cli.web,
-        "run_app",
-        lambda built_app, *, host, port: calls.update(app=built_app, host=host, port=port),
-    )
+    def fake_run_app(built_app, **kwargs):
+        calls.update(app=built_app, **kwargs)
+
+    monkeypatch.setattr(cli.web, "run_app", fake_run_app)
     monkeypatch.setattr(
         "sys.argv",
         ["emby-range-cache-proxy", "--config", "/etc/emby-range-cache-proxy/config.json"],
@@ -55,6 +54,7 @@ def test_main_runs_app_from_config(monkeypatch):
         "app": app,
         "host": "127.0.0.1",
         "port": 18180,
+        "access_log": None,
     }
 
 

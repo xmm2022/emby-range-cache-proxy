@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import ClientError, ClientSession, web
 
-from .auth import AuthorizationError, EmbyAuthClient
+from .auth import AuthUnavailable, AuthorizationError, EmbyAuthClient
 from .cache import HeadTailCache, adaptive_head_tail, cache_key
 from .config import Config
 from .models import ByteRange, MediaSource, RequestContext, SourceMetadata
@@ -85,7 +85,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     except AuthorizationError:
         _log_decision("deny", "authorization_failed", request, ctx=ctx)
         raise web.HTTPForbidden(text="forbidden\n") from None
-    except (ClientError, TimeoutError, OSError) as error:
+    except (AuthUnavailable, ClientError, TimeoutError, OSError) as error:
         _log_decision("fallback", "auth_unavailable", request, ctx=ctx, error=error, level=logging.WARNING)
         return await stream_fallback(request, config)
 

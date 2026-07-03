@@ -21,9 +21,9 @@ Unified local cache proxy for Emby original media direct-play requests.
 
 ## Caddy Fallback Boundary
 
-The deployment example uses Caddy upstream fallback so Emby can receive the request quickly if the cache proxy is unavailable or cannot be connected to.
+The deployment example uses Caddy upstream fallback so Emby can receive the request quickly if the cache proxy cannot be connected to or is unavailable before a proxy response exists.
 
-That boundary is limited. If the cache proxy has already started a response and the downstream stream later breaks, Caddy cannot promise a transparent fallback to Emby for that same client response. The proxy keeps pre-response errors eligible for fallback and avoids falling back after it has begun streaming proxy data.
+That boundary is limited. If the cache proxy has already returned `403` or `5xx`, or if it has already started a response and the downstream stream later breaks, Caddy will not transparently replay that same client response through Emby. The proxy keeps pre-response internal proxy errors eligible for fallback and avoids falling back after it has begun streaming proxy data.
 
 ## Cache Scope
 

@@ -18,7 +18,7 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
     config = load_config(args.config)
-    web.run_app(create_app(config), host=config.listen_host, port=config.listen_port)
+    web.run_app(create_app(config), host=config.listen_host, port=config.listen_port, access_log=None)
 
 
 if __name__ == "__main__":

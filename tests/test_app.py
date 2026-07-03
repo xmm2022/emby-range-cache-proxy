@@ -3,7 +3,7 @@ import asyncio
 from aiohttp import web
 
 import emby_range_cache_proxy.app as app_module
-from emby_range_cache_proxy.auth import AuthorizationError
+from emby_range_cache_proxy.auth import AuthUnavailable, AuthorizationError
 from emby_range_cache_proxy.app import create_app
 from emby_range_cache_proxy.config import Config, PrewarmConfig, RolloutConfig
 
@@ -490,7 +490,9 @@ async def test_authorization_error_returns_403_without_origin_or_fallback(aiohtt
     assert await response.text() == "forbidden\n"
 
 
-async def test_authorization_timeout_error_returns_403_without_fallback(aiohttp_client, monkeypatch, tmp_path):
+async def test_authorization_unavailable_falls_back_to_emby(aiohttp_client, monkeypatch, tmp_path):
+    fallback_calls = 0
+
     class FakeAuthClient:
         def __init__(self, base_url):
             pass
@@ -502,10 +504,12 @@ async def test_authorization_timeout_error_returns_403_without_fallback(aiohttp_
             return None
 
         async def authorize(self, ctx):
-            raise AuthorizationError("Emby authorization failed: timeout")
+            raise AuthUnavailable("Emby authorization unavailable: timeout")
 
     async def fallback(request):
-        raise AssertionError("fallback must not be read after AuthorizationError")
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return web.Response(status=206, body=b"fallback", headers={"Content-Range": "bytes 0-7/8"})
 
     fallback_app = web.Application()
     fallback_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
@@ -524,5 +528,6 @@ async def test_authorization_timeout_error_returns_403_without_fallback(aiohttp_
 
     response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=0-9"})
 
-    assert response.status == 403
-    assert await response.text() == "forbidden\n"
+    assert response.status == 206
+    assert await response.read() == b"fallback"
+    assert fallback_calls == 1
