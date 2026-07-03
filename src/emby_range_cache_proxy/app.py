@@ -42,7 +42,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     config: Config = request.app["config"]
     cache: HeadTailCache = request.app["cache"]
     ctx = parse_original_request(request.method, request.raw_path, request.headers)
-    if ctx is None or not config.rollout.in_scope(item_id=ctx.item_id, media_source_id=ctx.media_source_id):
+    if ctx is None or not _pre_authorization_rollout_scope(config, item_id=ctx.item_id, media_source_id=ctx.media_source_id):
         return await stream_fallback(request, config)
 
     try:
@@ -55,7 +55,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
     if not _is_http_source(source):
         return await stream_fallback(request, config)
-    if not config.rollout.path_allowed(source.path):
+    if not config.rollout.in_scope(item_id=ctx.item_id, media_source_id=ctx.media_source_id, path=source.path):
         return await stream_fallback(request, config)
 
     try:
@@ -133,6 +133,14 @@ async def stream_fallback(request: web.Request, config: Config) -> web.StreamRes
 def _is_http_source(source: MediaSource) -> bool:
     scheme = urlsplit(source.path).scheme.lower()
     return scheme in {"http", "https"}
+
+
+def _pre_authorization_rollout_scope(config: Config, *, item_id: str, media_source_id: str) -> bool:
+    return (
+        config.rollout.enabled
+        and config.rollout.item_allowed(item_id)
+        and config.rollout.media_source_allowed(media_source_id)
+    )
 
 
 def _cache_block_for_request(byte_range: ByteRange, metadata: SourceMetadata) -> str | None:
