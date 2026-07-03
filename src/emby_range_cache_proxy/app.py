@@ -48,9 +48,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     try:
         async with EmbyAuthClient(config.emby_base_url) as auth:
             source = await auth.authorize(ctx)
-    except AuthorizationError as error:
-        if _auth_error_can_fallback(error):
-            return await stream_fallback(request, config)
+    except AuthorizationError:
         raise web.HTTPForbidden(text="forbidden\n") from None
     except (ClientError, TimeoutError, OSError):
         return await stream_fallback(request, config)
@@ -76,7 +74,7 @@ async def serve_authorized_range(
         metadata = await origin.head(source.path)
         byte_range = parse_range_header(request.headers.get("Range"), size=metadata.size)
         key = cache_key(source, metadata)
-        block_name, block_range = _cache_block_for_request(byte_range, metadata)
+        block_name = _cache_block_for_request(byte_range, metadata)
         status = 206 if request.headers.get("Range") else 200
         headers = _range_response_headers(byte_range, metadata, include_content_range=status == 206)
 
@@ -91,7 +89,7 @@ async def serve_authorized_range(
         response = web.StreamResponse(status=status, headers=headers)
         await response.prepare(request)
 
-        chunks_for_cache: list[bytes] | None = [] if _can_store_request(block_range, byte_range) else None
+        chunks_for_cache: list[bytes] | None = [] if block_name is not None else None
         async for chunk in origin.stream_range(source.path, byte_range):
             await response.write(chunk)
             if chunks_for_cache is not None:
@@ -137,28 +135,19 @@ def _is_http_source(source: MediaSource) -> bool:
     return scheme in {"http", "https"}
 
 
-def _auth_error_can_fallback(error: AuthorizationError) -> bool:
-    message = str(error)
-    return "timeout" in message or "client error" in message
-
-
-def _cache_block_for_request(byte_range: ByteRange, metadata: SourceMetadata) -> tuple[str | None, ByteRange | None]:
+def _cache_block_for_request(byte_range: ByteRange, metadata: SourceMetadata) -> str | None:
     head_size, tail_size = adaptive_head_tail(metadata.size)
     head_range = ByteRange(0, min(head_size, metadata.size) - 1)
     tail_range = ByteRange(max(0, metadata.size - tail_size), metadata.size - 1)
     if _range_contains(head_range, byte_range):
-        return "head", head_range
+        return "head"
     if _range_contains(tail_range, byte_range):
-        return "tail", tail_range
-    return None, None
+        return "tail"
+    return None
 
 
 def _range_contains(container: ByteRange, requested: ByteRange) -> bool:
     return requested.start >= container.start and requested.end <= container.end
-
-
-def _can_store_request(block_range: ByteRange | None, requested: ByteRange) -> bool:
-    return block_range == requested
 
 
 def _range_response_headers(
