@@ -35,6 +35,8 @@ def create_app(config: Config) -> web.Application:
     app = web.Application()
     app["config"] = config
     app["cache"] = HeadTailCache(config.cache_dir, max_bytes=config.cache.max_bytes)
+    app["cache_build_locks"] = {}
+    app["cache_build_locks_guard"] = asyncio.Lock()
     if config.prewarm.enabled and config.prewarm_api_key:
         app.cleanup_ctx.append(prewarm_lifecycle)
     app.router.add_get("/healthz", healthz)
@@ -129,51 +131,79 @@ async def serve_authorized_range(
             cached = cache.read_block(key, block_name, byte_range)
             if cached is not None:
                 return web.Response(status=status, body=cached, headers=headers)
+            build_lock = await _cache_build_lock(request.app, key, block_name)
+            if build_lock.locked():
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(_wait_for_cache_build(build_lock), config.cache.build_wait_seconds)
+                cached = cache.read_block(key, block_name, byte_range)
+                if cached is not None:
+                    return web.Response(status=status, body=cached, headers=headers)
+                if build_lock.locked():
+                    block_name = None
+                    block_range = byte_range
+                    build_lock = None
+                else:
+                    await build_lock.acquire()
+                    cached = cache.read_block(key, block_name, byte_range)
+                    if cached is not None:
+                        build_lock.release()
+                        return web.Response(status=status, body=cached, headers=headers)
+            else:
+                await build_lock.acquire()
+                cached = cache.read_block(key, block_name, byte_range)
+                if cached is not None:
+                    build_lock.release()
+                    return web.Response(status=status, body=cached, headers=headers)
         else:
             block_name = None
             block_range = byte_range
+            build_lock = None
 
         response = web.StreamResponse(status=status, headers=headers)
-        async with origin.open_range(source.path, block_range, size=metadata.size) as upstream:
-            await response.prepare(request)
-            writer = cache.stage_block(key, block_name, block_range) if block_name is not None else None
-            upstream_offset = block_range.start
-            response_bytes_written = 0
-            response_done = False
-            try:
-                async for chunk in upstream.content.iter_chunked(config.cache.chunk_bytes):
-                    if chunk:
-                        chunk_start = upstream_offset
-                        chunk_end = upstream_offset + len(chunk) - 1
-                        upstream_offset += len(chunk)
-                        if writer is not None:
-                            writer.write(chunk)
-                        if not response_done:
-                            overlap_start = max(chunk_start, byte_range.start)
-                            overlap_end = min(chunk_end, byte_range.end)
-                            if overlap_start <= overlap_end:
-                                data = chunk[overlap_start - chunk_start : overlap_end - chunk_start + 1]
-                                await response.write(data)
-                                response_bytes_written += len(data)
-                                if response_bytes_written == byte_range.length:
-                                    await _write_eof_safely(response)
-                                    response_done = True
-            except (OriginError, ClientError, TimeoutError, OSError):
-                if writer is not None:
-                    writer.abort()
-                if not response_done:
-                    response.force_close()
-                    await _write_eof_safely(response)
-                return response
-
-            if writer is not None:
+        try:
+            async with origin.open_range(source.path, block_range, size=metadata.size) as upstream:
+                await response.prepare(request)
+                writer = cache.stage_block(key, block_name, block_range) if block_name is not None else None
+                upstream_offset = block_range.start
+                response_bytes_written = 0
+                response_done = False
                 try:
-                    writer.commit()
-                    cache.evict_if_needed()
-                except (ValueError, OSError):
-                    writer.abort()
+                    async for chunk in upstream.content.iter_chunked(config.cache.chunk_bytes):
+                        if chunk:
+                            chunk_start = upstream_offset
+                            chunk_end = upstream_offset + len(chunk) - 1
+                            upstream_offset += len(chunk)
+                            if writer is not None:
+                                writer.write(chunk)
+                            if not response_done:
+                                overlap_start = max(chunk_start, byte_range.start)
+                                overlap_end = min(chunk_end, byte_range.end)
+                                if overlap_start <= overlap_end:
+                                    data = chunk[overlap_start - chunk_start : overlap_end - chunk_start + 1]
+                                    await response.write(data)
+                                    response_bytes_written += len(data)
+                                    if response_bytes_written == byte_range.length:
+                                        await _write_eof_safely(response)
+                                        response_done = True
+                except (OriginError, ClientError, TimeoutError, OSError):
+                    if writer is not None:
+                        writer.abort()
                     if not response_done:
                         response.force_close()
+                        await _write_eof_safely(response)
+                    return response
+
+                if writer is not None:
+                    try:
+                        writer.commit()
+                        cache.evict_if_needed()
+                    except (ValueError, OSError):
+                        writer.abort()
+                        if not response_done:
+                            response.force_close()
+        finally:
+            if build_lock is not None and build_lock.locked():
+                build_lock.release()
 
         if not response_done:
             await _write_eof_safely(response)
@@ -215,6 +245,18 @@ async def _write_eof_safely(response: web.StreamResponse) -> None:
 def _is_http_source(source: MediaSource) -> bool:
     scheme = urlsplit(source.path).scheme.lower()
     return scheme in {"http", "https"}
+
+
+async def _cache_build_lock(app: web.Application, key: str, block_name: str) -> asyncio.Lock:
+    locks: dict[tuple[str, str], asyncio.Lock] = app["cache_build_locks"]
+    guard: asyncio.Lock = app["cache_build_locks_guard"]
+    async with guard:
+        return locks.setdefault((key, block_name), asyncio.Lock())
+
+
+async def _wait_for_cache_build(lock: asyncio.Lock) -> None:
+    async with lock:
+        pass
 
 
 def _request_contains_internal_key(request: web.Request, internal_key: str) -> bool:
