@@ -8,6 +8,7 @@ Unified local cache proxy for Emby original media direct-play requests.
 - User playback requests are authorized with the user's own Emby token by calling Emby `PlaybackInfo`.
 - The internal prewarm key is only used by the prewarm worker. It is not used to authorize user playback requests.
 - The proxy accepts HTTP and HTTPS media source paths returned by Emby after authorization.
+- `.strm` media source paths can be resolved through configured path mappings such as `/strm/` to `/home/nax/emby/strm`, then cached from the HTTP URL inside the `.strm` file when that URL also matches `rollout.path_prefix_allowlist`.
 - The cache stores adaptive head and tail ranges for startup, probing, and container metadata reads.
 - The proxy does not actively cache arbitrary middle playback ranges.
 - Out-of-scope requests fall back to the normal Emby proxy path.
@@ -17,6 +18,7 @@ Unified local cache proxy for Emby original media direct-play requests.
 - Explicit Emby authorization failures return `403` and do not read origin, cache, or fallback.
 - Logs must not include user tokens, `api_key`, `X-Emby-Token`, `PlaySessionId`, `DeviceId`, origin URLs, or raw query strings.
 - Cache entries are shared by media source and origin metadata, not by user. Authorization remains per request.
+- Local `.strm` reads are limited to configured path mappings, and resolved `.strm` URLs are limited by `rollout.path_prefix_allowlist`.
 - The prewarm API key only discovers and warms rollout-scoped media. It does not replace user token checks.
 
 ## Caddy Fallback Boundary

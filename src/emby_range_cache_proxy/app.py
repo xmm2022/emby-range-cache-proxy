@@ -16,6 +16,7 @@ from .origin import OriginClient, OriginError
 from .prewarm import PrewarmWorker
 from .ranges import content_range_header, parse_range_header
 from .requests import parse_original_request
+from .sources import resolve_media_source
 
 LOGGER = logging.getLogger(__name__)
 
@@ -95,6 +96,11 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         _log_decision("fallback", "auth_unavailable", request, ctx=ctx, error=error, level=logging.WARNING)
         return await stream_fallback(request, config)
 
+    source = resolve_media_source(
+        source,
+        config.path_mappings,
+        url_prefix_allowlist=config.rollout.path_prefix_allowlist,
+    )
     if not _is_http_source(source):
         _log_decision("fallback", "non_http_source", request, ctx=ctx)
         return await stream_fallback(request, config)
@@ -352,6 +358,8 @@ def _range_response_headers(
     }
     if include_content_range:
         headers["Content-Range"] = content_range_header(byte_range, size=metadata.size)
+    if metadata.content_type:
+        headers["Content-Type"] = metadata.content_type
     if metadata.etag:
         headers["ETag"] = metadata.etag
     if metadata.last_modified:

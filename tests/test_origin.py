@@ -12,7 +12,12 @@ async def test_origin_head_reads_size_and_validators(aiohttp_client):
     async def handler(request):
         return web.Response(
             status=200,
-            headers={"Content-Length": "100", "ETag": "abc", "Last-Modified": "Fri, 03 Jul 2026 00:00:00 GMT"},
+            headers={
+                "Content-Length": "100",
+                "Content-Type": "video/x-matroska",
+                "ETag": "abc",
+                "Last-Modified": "Fri, 03 Jul 2026 00:00:00 GMT",
+            },
         )
 
     app = web.Application()
@@ -23,8 +28,54 @@ async def test_origin_head_reads_size_and_validators(aiohttp_client):
         metadata = await client.head(str(server.make_url("/movie.mkv")))
 
     assert metadata.size == 100
+    assert metadata.content_type == "video/x-matroska"
     assert metadata.etag == "abc"
     assert metadata.last_modified == "Fri, 03 Jul 2026 00:00:00 GMT"
+
+
+async def test_origin_head_uses_content_range_total_for_partial_head(aiohttp_client):
+    async def handler(request):
+        return web.Response(
+            status=206,
+            headers={
+                "Content-Length": str(32 * 1024 * 1024),
+                "Content-Range": "bytes 0-33554431/83545978233",
+            },
+        )
+
+    app = web.Application()
+    app.router.add_head("/movie.mkv", handler)
+    server = await aiohttp_client(app)
+
+    async with OriginClient() as client:
+        metadata = await client.head(str(server.make_url("/movie.mkv")))
+
+    assert metadata.size == 83545978233
+
+
+@pytest.mark.parametrize(
+    "content_range",
+    [
+        "bytes 10-5/100",
+        "bytes 0-100/100",
+        "bytes 0-0/0",
+        "items 0-1/100",
+    ],
+)
+async def test_origin_head_rejects_invalid_partial_content_range(aiohttp_client, content_range):
+    async def handler(request):
+        return web.Response(
+            status=206,
+            headers={"Content-Length": "1", "Content-Range": content_range},
+        )
+
+    app = web.Application()
+    app.router.add_head("/movie.mkv", handler)
+    server = await aiohttp_client(app)
+
+    async with OriginClient() as client:
+        with pytest.raises(OriginError, match="origin HEAD failed: invalid Content-Range"):
+            await client.head(str(server.make_url("/movie.mkv")))
 
 
 async def test_stream_range_requests_exact_bytes(aiohttp_client):

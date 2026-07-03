@@ -5,11 +5,17 @@
   "listen_port": 18180,
   "cache_dir": "/home/nax/emby/cache/range-proxy",
   "prewarm_api_key": null,
+  "path_mappings": [
+    {
+      "from": "/strm/",
+      "to": "/home/nax/emby/strm"
+    }
+  ],
   "rollout": {
     "enabled": false,
     "item_allowlist": [],
     "media_source_allowlist": [],
-    "path_prefix_allowlist": []
+    "path_prefix_allowlist": ["http://127.0.0.1:18096/"]
   },
   "cache": {
     "max_bytes": 549755813888,

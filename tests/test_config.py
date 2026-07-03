@@ -31,6 +31,7 @@ def test_load_config_with_defaults(tmp_path):
     assert config.prewarm_api_key == "secret-prewarm-key"
     assert config.cache.max_bytes == 512 * 1024**3
     assert config.prewarm.enabled is False
+    assert config.path_mappings == ()
     assert config.rollout.enabled is True
     assert config.rollout.item_allowed("151357") is True
     assert config.rollout.item_allowed("999999") is False
@@ -49,6 +50,42 @@ def test_empty_allowlists_mean_allowed_when_rollout_enabled():
     config.rollout.enabled = True
 
     assert config.rollout.in_scope(item_id="1", media_source_id="ms1") is True
+
+
+def test_load_config_reads_path_mappings(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "path_mappings": [{"from": "/strm/", "to": "/home/nax/emby/strm"}],
+            }
+        )
+    )
+
+    config = load_config(path)
+
+    assert len(config.path_mappings) == 1
+    assert config.path_mappings[0].source_prefix == "/strm/"
+    assert config.path_mappings[0].target_prefix == "/home/nax/emby/strm"
+
+
+def test_load_config_normalizes_path_mapping_source_prefix(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "path_mappings": [{"from": "/strm", "to": "/home/nax/emby/strm"}],
+            }
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.path_mappings[0].source_prefix == "/strm/"
 
 
 @pytest.mark.parametrize(

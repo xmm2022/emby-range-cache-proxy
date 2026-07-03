@@ -10,6 +10,7 @@ from .cache import HeadTailCache, adaptive_head_tail, cache_key
 from .config import Config
 from .models import ByteRange, MediaSource, SourceMetadata
 from .origin import OriginClient, OriginError
+from .sources import resolve_media_source
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,11 @@ class PrewarmWorker:
                         continue
                     seen.add(dedupe_key)
 
+                    source = resolve_media_source(
+                        source,
+                        self.config.path_mappings,
+                        url_prefix_allowlist=self.config.rollout.path_prefix_allowlist,
+                    )
                     if not self.config.rollout.in_scope(
                         item_id=source.item_id,
                         media_source_id=source.media_source_id,

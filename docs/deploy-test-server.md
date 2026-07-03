@@ -32,6 +32,28 @@ jq -r '.listen_host' /etc/emby-range-cache-proxy/config.json
 
 Expected: `127.0.0.1`.
 
+- If Emby stores media as `.strm` files, confirm container paths are mapped to host paths. On the current test server, Emby mounts `/home/nax/emby/strm` as `/strm`, so the proxy config should include:
+
+```json
+"path_mappings": [
+  {
+    "from": "/strm/",
+    "to": "/home/nax/emby/strm"
+  }
+]
+```
+
+- The resolved URL inside the `.strm` file must also be allowlisted. On the current test server those URLs are served locally by `127.0.0.1:18096`, so keep rollout narrow and include:
+
+```json
+"rollout": {
+  "enabled": true,
+  "item_allowlist": ["10535"],
+  "media_source_allowlist": ["mediasource_10535"],
+  "path_prefix_allowlist": ["http://127.0.0.1:18096/"]
+}
+```
+
 - Confirm logs are token-safe before enabling traffic. Proxy decision logs must not include raw query strings, `api_key`, `X-Emby-Token`, `PlaySessionId`, `DeviceId`, origin URLs, or internal prewarm keys. The service disables the default aiohttp access log.
 - Keep the config readable only by root and the service group because it may contain `prewarm_api_key`. The service runs as `emby-cache`, so group read is required:
 

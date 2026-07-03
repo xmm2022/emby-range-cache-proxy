@@ -40,10 +40,11 @@ class OriginClient:
             async with self._session.head(url, allow_redirects=True) as response:
                 if response.status >= 400:
                     raise OriginError(f"origin HEAD failed: status={response.status}")
-                length = _parse_content_length(response.headers.get("Content-Length"))
+                length = _parse_head_size(response)
                 return SourceMetadata(
                     url=str(response.url),
                     size=length,
+                    content_type=response.headers.get("Content-Type"),
                     etag=response.headers.get("ETag"),
                     last_modified=response.headers.get("Last-Modified"),
                 )
@@ -106,6 +107,27 @@ def _parse_content_length(value: str | None) -> int:
     if length < 0:
         raise OriginError("origin provided invalid Content-Length")
     return length
+
+
+def _parse_head_size(response: ClientResponse) -> int:
+    if response.status == 206:
+        total = _parse_content_range_total(response.headers.get("Content-Range"))
+        if total is None:
+            raise OriginError("origin HEAD failed: invalid Content-Range")
+        return total
+    return _parse_content_length(response.headers.get("Content-Length"))
+
+
+def _parse_content_range_total(value: str | None) -> int | None:
+    if value is None:
+        return None
+    match = _CONTENT_RANGE_RE.fullmatch(value)
+    if match is None:
+        return None
+    start, end, total = (int(group) for group in match.groups())
+    if total <= 0 or start > end or end >= total:
+        return None
+    return total
 
 
 _CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")

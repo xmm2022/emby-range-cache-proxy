@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -55,6 +55,15 @@ class PrewarmConfig:
             raise ValueError("prewarm.interval_seconds must be >= 60")
 
 
+@dataclass(frozen=True)
+class PathMapping:
+    source_prefix: str
+    target_prefix: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_prefix", _normalize_path_mapping_source_prefix(self.source_prefix))
+
+
 @dataclass
 class Config:
     emby_base_url: str
@@ -63,6 +72,7 @@ class Config:
     listen_host: str = "127.0.0.1"
     listen_port: int = 18180
     prewarm_api_key: str | None = None
+    path_mappings: tuple[PathMapping, ...] = ()
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     prewarm: PrewarmConfig = field(default_factory=PrewarmConfig)
@@ -106,6 +116,36 @@ def _prewarm(data: dict[str, Any]) -> PrewarmConfig:
     )
 
 
+def _normalize_path_mapping_source_prefix(value: str) -> str:
+    prefix = str(value).strip()
+    if not prefix.startswith("/"):
+        raise ValueError("path_mappings source prefix must be absolute")
+    parts = PurePosixPath(prefix).parts
+    if len(parts) <= 1 or any(part in {".", ".."} for part in parts):
+        raise ValueError("path_mappings source prefix must be a non-root directory")
+    normalized = "/" + "/".join(parts[1:])
+    if not normalized.endswith("/"):
+        normalized += "/"
+    return normalized
+
+
+def _path_mappings(values: Any) -> tuple[PathMapping, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, (str, bytes)) or not isinstance(values, list):
+        raise ValueError("path_mappings must be a list")
+    mappings: list[PathMapping] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, dict):
+            raise ValueError(f"path_mappings[{index}] must be an object")
+        source_prefix = value.get("from", value.get("source_prefix"))
+        target_prefix = value.get("to", value.get("target_prefix"))
+        if not source_prefix or not target_prefix:
+            raise ValueError(f"path_mappings[{index}] must include from and to")
+        mappings.append(PathMapping(str(source_prefix), str(target_prefix)))
+    return tuple(mappings)
+
+
 def load_config(path: str | Path) -> Config:
     raw = json.loads(Path(path).read_text())
     return Config(
@@ -115,6 +155,7 @@ def load_config(path: str | Path) -> Config:
         listen_host=str(raw.get("listen_host", "127.0.0.1")),
         listen_port=int(raw.get("listen_port", 18180)),
         prewarm_api_key=raw.get("prewarm_api_key"),
+        path_mappings=_path_mappings(raw.get("path_mappings")),
         rollout=_rollout(raw.get("rollout", {})),
         cache=_cache(raw.get("cache", {})),
         prewarm=_prewarm(raw.get("prewarm", {})),

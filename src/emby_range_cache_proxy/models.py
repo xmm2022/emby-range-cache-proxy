@@ -40,5 +40,6 @@ class MediaSource:
 class SourceMetadata:
     url: str
     size: int
+    content_type: str | None = None
     etag: str | None = None
     last_modified: str | None = None
