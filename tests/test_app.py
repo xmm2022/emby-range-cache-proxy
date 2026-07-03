@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import time
 
 from aiohttp import ClientTimeout
 from aiohttp import web
 
 import emby_range_cache_proxy.app as app_module
+from emby_range_cache_proxy import prefetch as prefetch_module
 from emby_range_cache_proxy.auth import AuthUnavailable, AuthorizationError
 from emby_range_cache_proxy.app import create_app
 from emby_range_cache_proxy.cache import CacheReadError
@@ -13,13 +15,18 @@ from emby_range_cache_proxy.config import (
     Config,
     MiddleCacheConfig,
     PathMapping,
+    PrefetchConfig,
     PrewarmConfig,
     RolloutConfig,
     SessionConfig,
 )
 from emby_range_cache_proxy.middle_cache import MiddleRangeCache
 from emby_range_cache_proxy.models import ByteRange, RequestContext, SourceMetadata
-from emby_range_cache_proxy.state import SessionStateStore, hash_identifier
+from emby_range_cache_proxy.state import (
+    PlaybackSessionUpdate,
+    SessionStateStore,
+    hash_identifier,
+)
 
 
 FULL_HEAD_BODY = b"0123456789" + b"H" * 90
@@ -91,6 +98,63 @@ async def test_prewarm_lifecycle_does_not_start_without_internal_key(aiohttp_cli
     assert "prewarm_task" not in app
 
     await client.close()
+
+
+async def test_session_planner_lifecycle_marks_idle_and_enqueues_prefetch(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    app = create_app(
+        Config(
+            emby_base_url="http://emby",
+            fallback_base_url="http://emby",
+            cache_dir=str(tmp_path),
+            session=SessionConfig(
+                enabled=True,
+                idle_seconds=1,
+                observer_interval_seconds=1,
+            ),
+            middle_cache=MiddleCacheConfig(enabled=True, segment_bytes=64),
+            prefetch=PrefetchConfig(
+                enabled=True,
+                window_bytes=128,
+                resume_overlap_bytes=0,
+                max_session_bytes=256,
+                max_queue_depth=10,
+            ),
+        )
+    )
+    store: SessionStateStore = app["phase2_store"]
+    store.record_playback(
+        PlaybackSessionUpdate(
+            session_hash="s" * 64,
+            device_hash=None,
+            item_id="1",
+            media_source_id="ms1",
+            cache_key="a" * 64,
+            origin_signature="o" * 64,
+            media_size=1000,
+            byte_range=ByteRange(300, 350),
+            observed_at=time.time() - 2.0,
+        )
+    )
+
+    client = await aiohttp_client(app)
+    try:
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while store.queue_depth() != 2:
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+        session = store.get_session("s" * 64)
+
+        assert "session_planner_task" in app
+        assert store.queue_depth() == 2
+        assert session is not None
+        assert session.status == "idle"
+        assert session.queued_until == 447
+    finally:
+        await client.close()
 
 
 async def test_out_of_scope_falls_back_to_emby(aiohttp_client, tmp_path):

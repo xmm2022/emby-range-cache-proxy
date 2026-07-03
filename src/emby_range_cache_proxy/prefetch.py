@@ -6,12 +6,12 @@ from typing import Awaitable, Callable
 
 from aiohttp import ClientError
 
-from .cache import cache_key
+from .cache import adaptive_head_tail, cache_key
 from .config import Config, MiddleCacheConfig, PrefetchConfig
 from .middle_cache import MiddleRangeCache
 from .models import ByteRange, MediaSource
 from .origin import OriginClient, OriginError
-from .state import PrefetchTaskRecord, SessionStateStore
+from .state import PlaybackSessionRecord, PrefetchTaskRecord, SessionStateStore
 
 
 @dataclass
@@ -250,3 +250,53 @@ def plan_middle_ranges(
             ranges.append(ByteRange(max(current, middle_start), end))
         current = end + 1
     return ranges
+
+
+def enqueue_prefetch_for_session(
+    store: SessionStateStore,
+    session: PlaybackSessionRecord,
+    *,
+    prefetch: PrefetchConfig,
+    middle_cache: MiddleCacheConfig,
+    now: float,
+    priority: int,
+) -> int:
+    head_size, tail_size = adaptive_head_tail(session.media_size)
+    ranges = plan_middle_ranges(
+        media_size=session.media_size,
+        head_size=head_size,
+        tail_size=tail_size,
+        max_observed_offset=session.max_observed_offset,
+        queued_until=session.queued_until,
+        prefetch=prefetch,
+        middle_cache=middle_cache,
+    )
+
+    inserted = 0
+    highest_end: int | None = None
+    for byte_range in ranges:
+        if store.find_middle_block(session.cache_key, byte_range) is not None:
+            highest_end = byte_range.end
+            continue
+        task = store.enqueue_prefetch_task(
+            session.item_id,
+            session.media_source_id,
+            session.cache_key,
+            byte_range.start,
+            byte_range.end,
+            priority=priority,
+            now=now,
+            max_queue_depth=prefetch.max_queue_depth,
+        )
+        if task is None:
+            continue
+        inserted += 1
+        highest_end = byte_range.end
+
+    if highest_end is not None:
+        store.update_session_queued_until(
+            session.session_hash,
+            highest_end,
+            now=now,
+        )
+    return inserted

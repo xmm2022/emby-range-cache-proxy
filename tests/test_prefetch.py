@@ -5,6 +5,7 @@ import pytest
 from aiohttp import web
 
 from emby_range_cache_proxy import middle_cache as middle_cache_module
+from emby_range_cache_proxy import prefetch as prefetch_module
 from emby_range_cache_proxy.cache import cache_key
 from emby_range_cache_proxy.config import (
     Config,
@@ -17,9 +18,10 @@ from emby_range_cache_proxy.models import ByteRange, MediaSource, SourceMetadata
 from emby_range_cache_proxy.prefetch import (
     BandwidthLimiter,
     PrefetchWorker,
+    enqueue_prefetch_for_session,
     plan_middle_ranges,
 )
-from emby_range_cache_proxy.state import SessionStateStore
+from emby_range_cache_proxy.state import PlaybackSessionRecord, SessionStateStore
 
 
 async def test_bandwidth_limiter_waits_when_chunk_exceeds_rate():
@@ -470,6 +472,61 @@ async def test_prefetch_worker_skips_when_disabled(tmp_path):
     assert result.failed == 0
     assert result.skipped == 0
     assert store.queue_depth() == 1
+
+
+def test_enqueue_prefetch_for_session_inserts_deduplicated_tasks(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    store = SessionStateStore(tmp_path / "state.db")
+    session = PlaybackSessionRecord(
+        session_hash="s" * 64,
+        device_hash=None,
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_signature="o" * 64,
+        media_size=1000,
+        last_range_start=300,
+        last_range_end=350,
+        max_observed_offset=350,
+        first_seen_at=1.0,
+        last_seen_at=10.0,
+        last_emby_observed_at=None,
+        status="idle",
+        queued_until=None,
+    )
+
+    inserted = enqueue_prefetch_for_session(
+        store,
+        session,
+        prefetch=PrefetchConfig(
+            window_bytes=128,
+            resume_overlap_bytes=0,
+            max_session_bytes=256,
+            max_queue_depth=10,
+        ),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+        now=20.0,
+        priority=10,
+    )
+    repeated = enqueue_prefetch_for_session(
+        store,
+        session,
+        prefetch=PrefetchConfig(
+            window_bytes=128,
+            resume_overlap_bytes=0,
+            max_session_bytes=256,
+            max_queue_depth=10,
+        ),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+        now=20.0,
+        priority=10,
+    )
+
+    assert inserted == 2
+    assert repeated == 0
+    assert store.queue_depth() == 2
 
 
 def test_plan_middle_ranges_aligns_skips_head_tail_and_caps_window():

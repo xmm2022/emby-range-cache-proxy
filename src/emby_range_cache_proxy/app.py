@@ -16,10 +16,12 @@ from .config import Config
 from .middle_cache import MiddleRangeCache
 from .models import ByteRange, MediaSource, RequestContext, SourceMetadata
 from .origin import OriginClient, OriginError
+from .prefetch import enqueue_prefetch_for_session
 from .prewarm import PrewarmWorker
 from .ranges import content_range_header, plan_playback_range
 from .requests import parse_original_request
 from .session import SessionRecorder
+from .session_observer import EmbySessionObserver
 from .sources import resolve_media_source
 from .state import SessionStateStore
 
@@ -60,6 +62,7 @@ def create_app(config: Config) -> web.Application:
         if config.session.enabled:
             app["session_recorder"] = SessionRecorder(phase2_store)
             app.cleanup_ctx.append(session_recorder_lifecycle)
+            app.cleanup_ctx.append(session_planner_lifecycle)
     if config.prewarm.enabled and config.prewarm_api_key:
         app.cleanup_ctx.append(prewarm_lifecycle)
     app.router.add_get("/healthz", healthz)
@@ -74,6 +77,68 @@ async def session_recorder_lifecycle(app: web.Application) -> AsyncIterator[None
         yield
     finally:
         await recorder.stop()
+
+
+async def session_planner_lifecycle(app: web.Application) -> AsyncIterator[None]:
+    config: Config = app["config"]
+    store: SessionStateStore = app["phase2_store"]
+    observer = EmbySessionObserver(config, store)
+    task = asyncio.create_task(_session_planner_loop(config, store, observer))
+    app["session_planner_task"] = task
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def _session_planner_loop(
+    config: Config,
+    store: SessionStateStore,
+    observer: EmbySessionObserver,
+) -> None:
+    while True:
+        now = time.time()
+        stopped = []
+        if config.session.observer_enabled:
+            observer_result = await observer.run_once(now=now)
+            stopped = list(observer_result.stopped_sessions)
+
+        idle = await asyncio.to_thread(
+            store.mark_idle_sessions,
+            now=now,
+            idle_seconds=config.session.idle_seconds,
+        )
+        await asyncio.to_thread(
+            store.expire_old_sessions,
+            now=now,
+            expire_seconds=config.session.expire_seconds,
+        )
+
+        if config.prefetch.enabled and config.middle_cache.enabled:
+            for session in idle:
+                await asyncio.to_thread(
+                    enqueue_prefetch_for_session,
+                    store,
+                    session,
+                    prefetch=config.prefetch,
+                    middle_cache=config.middle_cache,
+                    now=now,
+                    priority=10,
+                )
+            for session in stopped:
+                await asyncio.to_thread(
+                    enqueue_prefetch_for_session,
+                    store,
+                    session,
+                    prefetch=config.prefetch,
+                    middle_cache=config.middle_cache,
+                    now=now,
+                    priority=20,
+                )
+
+        await asyncio.sleep(config.session.observer_interval_seconds)
 
 
 async def prewarm_lifecycle(app: web.Application) -> AsyncIterator[None]:
