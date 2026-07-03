@@ -91,59 +91,33 @@ class SessionStateStore:
 
     def record_playback(self, update: PlaybackSessionUpdate) -> None:
         with self._connect() as conn:
-            current = conn.execute(
-                """
-                SELECT max_observed_offset, first_seen_at
-                FROM playback_sessions
-                WHERE session_hash = ?
-                """,
-                (update.session_hash,),
-            ).fetchone()
-            if current is None:
-                conn.execute(
-                    """
-                    INSERT INTO playback_sessions (
-                        session_hash, device_hash, item_id, media_source_id,
-                        cache_key, origin_signature, media_size, last_range_start,
-                        last_range_end, max_observed_offset, first_seen_at,
-                        last_seen_at, last_emby_observed_at, status, queued_until
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'active', NULL)
-                    """,
-                    (
-                        update.session_hash,
-                        update.device_hash,
-                        update.item_id,
-                        update.media_source_id,
-                        update.cache_key,
-                        update.origin_signature,
-                        update.media_size,
-                        update.byte_range.start,
-                        update.byte_range.end,
-                        update.byte_range.end,
-                        update.observed_at,
-                        update.observed_at,
-                    ),
-                )
-                return
-
             conn.execute(
                 """
-                UPDATE playback_sessions
-                SET device_hash = ?,
-                    item_id = ?,
-                    media_source_id = ?,
-                    cache_key = ?,
-                    origin_signature = ?,
-                    media_size = ?,
-                    last_range_start = ?,
-                    last_range_end = ?,
-                    max_observed_offset = ?,
-                    last_seen_at = ?,
+                INSERT INTO playback_sessions (
+                    session_hash, device_hash, item_id, media_source_id,
+                    cache_key, origin_signature, media_size, last_range_start,
+                    last_range_end, max_observed_offset, first_seen_at,
+                    last_seen_at, last_emby_observed_at, status, queued_until
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'active', NULL)
+                ON CONFLICT(session_hash) DO UPDATE SET
+                    device_hash = excluded.device_hash,
+                    item_id = excluded.item_id,
+                    media_source_id = excluded.media_source_id,
+                    cache_key = excluded.cache_key,
+                    origin_signature = excluded.origin_signature,
+                    media_size = excluded.media_size,
+                    last_range_start = excluded.last_range_start,
+                    last_range_end = excluded.last_range_end,
+                    max_observed_offset = MAX(
+                        playback_sessions.max_observed_offset,
+                        excluded.max_observed_offset
+                    ),
+                    last_seen_at = excluded.last_seen_at,
                     status = 'active'
-                WHERE session_hash = ?
                 """,
                 (
+                    update.session_hash,
                     update.device_hash,
                     update.item_id,
                     update.media_source_id,
@@ -152,9 +126,9 @@ class SessionStateStore:
                     update.media_size,
                     update.byte_range.start,
                     update.byte_range.end,
-                    max(current["max_observed_offset"], update.byte_range.end),
+                    update.byte_range.end,
                     update.observed_at,
-                    update.session_hash,
+                    update.observed_at,
                 ),
             )
 
@@ -195,12 +169,21 @@ class SessionStateStore:
                 (cutoff,),
             ).fetchall()
             session_hashes = [row["session_hash"] for row in rows]
-            if session_hashes:
-                conn.executemany(
-                    "UPDATE playback_sessions SET status = 'idle' WHERE session_hash = ?",
-                    [(session_hash,) for session_hash in session_hashes],
+            transitioned_hashes = []
+            for session_hash in session_hashes:
+                cursor = conn.execute(
+                    """
+                    UPDATE playback_sessions
+                    SET status = 'idle'
+                    WHERE session_hash = ?
+                      AND status = 'active'
+                      AND last_seen_at <= ?
+                    """,
+                    (session_hash, cutoff),
                 )
-                rows = self._select_sessions(conn, session_hashes)
+                if cursor.rowcount:
+                    transitioned_hashes.append(session_hash)
+            rows = self._select_sessions(conn, transitioned_hashes)
         return [_playback_session_from_row(row) for row in rows]
 
     def expire_old_sessions(self, *, now: float, expire_seconds: int) -> int:
@@ -247,16 +230,22 @@ class SessionStateStore:
                 (cutoff,),
             ).fetchall()
             session_hashes = [row["session_hash"] for row in rows]
-            if session_hashes:
-                conn.executemany(
+            transitioned_hashes = []
+            for session_hash in session_hashes:
+                cursor = conn.execute(
                     """
                     UPDATE playback_sessions
                     SET status = 'stopped'
                     WHERE session_hash = ?
+                      AND last_emby_observed_at IS NOT NULL
+                      AND status IN ('active', 'idle')
+                      AND last_emby_observed_at <= ?
                     """,
-                    [(session_hash,) for session_hash in session_hashes],
+                    (session_hash, cutoff),
                 )
-                rows = self._select_sessions(conn, session_hashes)
+                if cursor.rowcount:
+                    transitioned_hashes.append(session_hash)
+            rows = self._select_sessions(conn, transitioned_hashes)
         return [_playback_session_from_row(row) for row in rows]
 
     def update_session_queued_until(
@@ -285,6 +274,7 @@ class SessionStateStore:
         max_queue_depth: int,
     ) -> PrefetchTaskRecord | None:
         with self._connect() as conn:
+            _begin_immediate(conn)
             queued = conn.execute(
                 "SELECT COUNT(*) AS count FROM prefetch_tasks WHERE status = 'queued'"
             ).fetchone()["count"]
@@ -335,18 +325,21 @@ class SessionStateStore:
                 (limit,),
             ).fetchall()
             task_ids = [row["id"] for row in rows]
-            if task_ids:
-                conn.executemany(
+            transitioned_ids = []
+            for task_id in task_ids:
+                cursor = conn.execute(
                     """
                     UPDATE prefetch_tasks
                     SET status = 'running',
                         attempts = attempts + 1,
                         updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND status = 'queued'
                     """,
-                    [(now, task_id) for task_id in task_ids],
+                    (now, task_id),
                 )
-                rows = self._select_prefetch_tasks(conn, task_ids)
+                if cursor.rowcount:
+                    transitioned_ids.append(task_id)
+            rows = self._select_prefetch_tasks(conn, transitioned_ids)
         return [_prefetch_task_from_row(row) for row in rows]
 
     def complete_prefetch_task(self, task_id: int, *, now: float) -> None:
@@ -537,6 +530,8 @@ class SessionStateStore:
     def _select_sessions(
         self, conn: sqlite3.Connection, session_hashes: list[str]
     ) -> list[sqlite3.Row]:
+        if not session_hashes:
+            return []
         placeholders = ", ".join("?" for _ in session_hashes)
         rows = conn.execute(
             f"""
@@ -551,6 +546,8 @@ class SessionStateStore:
     def _select_prefetch_tasks(
         self, conn: sqlite3.Connection, task_ids: list[int]
     ) -> list[sqlite3.Row]:
+        if not task_ids:
+            return []
         placeholders = ", ".join("?" for _ in task_ids)
         rows = conn.execute(
             f"""
@@ -561,6 +558,10 @@ class SessionStateStore:
         ).fetchall()
         by_id = {row["id"]: row for row in rows}
         return [by_id[task_id] for task_id in task_ids]
+
+
+def _begin_immediate(conn: sqlite3.Connection) -> None:
+    conn.execute("BEGIN IMMEDIATE")
 
 
 def _playback_session_from_row(row: sqlite3.Row) -> PlaybackSessionRecord:

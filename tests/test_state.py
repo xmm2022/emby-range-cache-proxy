@@ -13,6 +13,61 @@ from emby_range_cache_proxy.state import (
 )
 
 
+class _InterleavingCursor:
+    def __init__(self, cursor, on_fetchall):
+        self._cursor = cursor
+        self._on_fetchall = on_fetchall
+        self._triggered = False
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        self._trigger(rows)
+        return rows
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        self._trigger([row] if row is not None else [])
+        return row
+
+    def _trigger(self, rows):
+        if rows and not self._triggered:
+            self._triggered = True
+            self._on_fetchall(rows)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _InterleavingConnection:
+    def __init__(self, path, sql_fragment, on_fetchall):
+        self._conn = sqlite3.connect(path)
+        self._conn.row_factory = sqlite3.Row
+        self._sql_fragment = sql_fragment
+        self._on_fetchall = on_fetchall
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            self._conn.rollback()
+        self._conn.close()
+
+    def execute(self, sql, parameters=()):
+        cursor = self._conn.execute(sql, parameters)
+        if self._sql_fragment in " ".join(sql.split()):
+            return _InterleavingCursor(cursor, self._on_fetchall)
+        return cursor
+
+    def executemany(self, sql, parameters):
+        return self._conn.executemany(sql, parameters)
+
+    def executescript(self, sql):
+        return self._conn.executescript(sql)
+
+
 def test_hash_identifier_is_stable_and_does_not_expose_value():
     value = "play-session-secret"
 
@@ -90,6 +145,54 @@ def test_mark_idle_sessions_and_expire_old_sessions(tmp_path):
     assert expired == 1
 
 
+def test_mark_idle_sessions_does_not_override_newer_active_session(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.sqlite3"
+    store = SessionStateStore(path)
+    store.record_playback(
+        PlaybackSessionUpdate(
+            session_hash="s" * 64,
+            device_hash=None,
+            item_id="1",
+            media_source_id="ms1",
+            cache_key="a" * 64,
+            origin_signature="origin-sig",
+            media_size=1000,
+            byte_range=ByteRange(0, 99),
+            observed_at=10.0,
+        )
+    )
+
+    def refresh_session(_rows):
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                """
+                UPDATE playback_sessions
+                SET status = 'active', last_seen_at = ?
+                WHERE session_hash = ?
+                """,
+                (100.0, "s" * 64),
+            )
+
+    monkeypatch.setattr(
+        store,
+        "_connect",
+        lambda: _InterleavingConnection(
+            path,
+            "WHERE status = 'active' AND last_seen_at <= ?",
+            refresh_session,
+        ),
+    )
+
+    idle = store.mark_idle_sessions(now=200.0, idle_seconds=180)
+    session = store.get_session("s" * 64)
+
+    assert idle == []
+    assert session.status == "active"
+    assert session.last_seen_at == 100.0
+
+
 def test_observer_absence_marks_session_stopped_after_grace(tmp_path):
     store = SessionStateStore(tmp_path / "state.sqlite3")
     store.record_playback(
@@ -111,6 +214,57 @@ def test_observer_absence_marks_session_stopped_after_grace(tmp_path):
 
     assert [session.session_hash for session in stopped] == ["s" * 64]
     assert store.get_session("s" * 64).status == "stopped"
+
+
+def test_mark_missing_observed_sessions_stopped_does_not_override_recent_observation(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.sqlite3"
+    store = SessionStateStore(path)
+    store.record_playback(
+        PlaybackSessionUpdate(
+            session_hash="s" * 64,
+            device_hash=None,
+            item_id="1",
+            media_source_id="ms1",
+            cache_key="a" * 64,
+            origin_signature="origin-sig",
+            media_size=1000,
+            byte_range=ByteRange(0, 99),
+            observed_at=10.0,
+        )
+    )
+    store.record_observed_sessions({"s" * 64}, observed_at=20.0)
+
+    def refresh_observation(_rows):
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                """
+                UPDATE playback_sessions
+                SET status = 'active', last_emby_observed_at = ?
+                WHERE session_hash = ?
+                """,
+                (90.0, "s" * 64),
+            )
+
+    monkeypatch.setattr(
+        store,
+        "_connect",
+        lambda: _InterleavingConnection(
+            path,
+            "AND status IN ('active', 'idle') AND last_emby_observed_at <= ?",
+            refresh_observation,
+        ),
+    )
+
+    stopped = store.mark_missing_observed_sessions_stopped(
+        now=100.0, stop_grace_seconds=60
+    )
+    session = store.get_session("s" * 64)
+
+    assert stopped == []
+    assert session.status == "active"
+    assert session.last_emby_observed_at == 90.0
 
 
 def test_prefetch_tasks_are_deduplicated_and_claimed(tmp_path):
@@ -146,6 +300,84 @@ def test_prefetch_tasks_are_deduplicated_and_claimed(tmp_path):
     assert store.queue_depth() == 0
 
 
+def test_claim_prefetch_tasks_does_not_return_task_if_status_changed_before_update(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.sqlite3"
+    store = SessionStateStore(path)
+    task = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=1024,
+        end=2047,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+
+    def mark_running(rows):
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                """
+                UPDATE prefetch_tasks
+                SET status = 'running', attempts = 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (2.5, rows[0]["id"]),
+            )
+
+    monkeypatch.setattr(
+        store,
+        "_connect",
+        lambda: _InterleavingConnection(
+            path,
+            "WHERE status = 'queued' ORDER BY priority DESC",
+            mark_running,
+        ),
+    )
+
+    claimed = store.claim_prefetch_tasks(limit=1, now=3.0)
+
+    assert claimed == []
+    with sqlite3.connect(path) as conn:
+        status, attempts = conn.execute(
+            "SELECT status, attempts FROM prefetch_tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+    assert status == "running"
+    assert attempts == 1
+
+
+def test_enqueue_prefetch_task_respects_max_queue_depth(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+
+    first = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=1024,
+        end=2047,
+        priority=10,
+        now=1.0,
+        max_queue_depth=1,
+    )
+    second = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=2048,
+        end=3071,
+        priority=10,
+        now=2.0,
+        max_queue_depth=1,
+    )
+
+    assert first is not None
+    assert second is None
+    assert store.queue_depth() == 1
+
+
 def test_complete_prefetch_task_marks_task_done(tmp_path):
     db_path = tmp_path / "state.sqlite3"
     store = SessionStateStore(db_path)
@@ -169,6 +401,28 @@ def test_complete_prefetch_task_marks_task_done(tmp_path):
             (claimed[0].id,),
         ).fetchone()[0]
     assert status == "done"
+
+
+def test_record_playback_keeps_max_observed_offset_when_later_update_has_smaller_range(
+    tmp_path,
+):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    update = PlaybackSessionUpdate(
+        session_hash="s" * 64,
+        device_hash=None,
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_signature="origin-sig",
+        media_size=1000,
+        byte_range=ByteRange(400, 500),
+        observed_at=10.0,
+    )
+
+    store.record_playback(update)
+    store.record_playback(update.with_range(ByteRange(100, 199), observed_at=20.0))
+
+    assert store.get_session("s" * 64).max_observed_offset == 500
 
 
 def test_middle_block_metadata_lifecycle(tmp_path):
