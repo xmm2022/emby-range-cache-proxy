@@ -33,6 +33,7 @@ class MiddleRangeCache:
         self, key: str, byte_range: ByteRange, data: bytes, *, now: float
     ) -> None:
         key = self._validate_key(key)
+        self._validate_byte_range(byte_range)
         if len(data) != byte_range.length:
             raise ValueError("data length must match byte_range length")
         self.evict_expired(now=now)
@@ -53,18 +54,23 @@ class MiddleRangeCache:
             sidecar.unlink(missing_ok=True)
             raise
 
-        self.store.upsert_middle_block(
-            MiddleBlockRecord(
-                cache_key=key,
-                start=byte_range.start,
-                end=byte_range.end,
-                path=self._relative_path(key, byte_range.start, byte_range.end),
-                size=len(data),
-                created_at=now,
-                last_access_at=now,
-                expires_at=now + self.ttl_seconds,
+        try:
+            self.store.upsert_middle_block(
+                MiddleBlockRecord(
+                    cache_key=key,
+                    start=byte_range.start,
+                    end=byte_range.end,
+                    path=self._relative_path(key, byte_range.start, byte_range.end),
+                    size=len(data),
+                    created_at=now,
+                    last_access_at=now,
+                    expires_at=now + self.ttl_seconds,
+                )
             )
-        )
+        except Exception:
+            path.unlink(missing_ok=True)
+            sidecar.unlink(missing_ok=True)
+            raise
 
     def iter_block(
         self,
@@ -75,6 +81,7 @@ class MiddleRangeCache:
         now: float,
     ) -> Iterator[bytes] | None:
         key = self._validate_key(key)
+        self._validate_byte_range(requested)
         if chunk_bytes <= 0:
             raise ValueError("chunk_bytes must be positive")
 
@@ -82,11 +89,10 @@ class MiddleRangeCache:
         if record is None:
             return None
         if not self._record_covers(record, requested) or not self._valid_record(record):
-            self.remove_block(record)
+            self._delete_metadata(record)
             return None
 
-        path = self.root / record.path
-        sidecar = path.with_suffix(".range")
+        path, sidecar = self._record_paths(record)
         if not self._valid_files(record, path, sidecar):
             self.remove_block(record)
             return None
@@ -129,7 +135,7 @@ class MiddleRangeCache:
     def evict_expired(self, *, now: float) -> int:
         count = 0
         for record in self.store.expired_middle_blocks(now=now):
-            if record.expires_at >= now:
+            if record.expires_at > now:
                 continue
             self.remove_block(record)
             count += 1
@@ -145,15 +151,20 @@ class MiddleRangeCache:
         return count
 
     def remove_block(self, record: MiddleBlockRecord) -> None:
-        path = self.root / record.path
-        path.unlink(missing_ok=True)
-        path.with_suffix(".range").unlink(missing_ok=True)
-        self.store.delete_middle_block_record(record.cache_key, record.start, record.end)
+        if self._valid_record(record):
+            path, sidecar = self._record_paths(record)
+            path.unlink(missing_ok=True)
+            sidecar.unlink(missing_ok=True)
+        self._delete_metadata(record)
 
     def _validate_key(self, key: str) -> str:
         if not KEY_PATTERN.fullmatch(key):
             raise ValueError("cache key must be 64 lowercase hex characters")
         return key
+
+    def _validate_byte_range(self, byte_range: ByteRange) -> None:
+        if byte_range.start < 0 or byte_range.end < byte_range.start:
+            raise ValueError("byte range must have non-negative start and end >= start")
 
     def _paths(self, key: str, start: int, end: int) -> tuple[Path, Path]:
         path = self.root / self._relative_path(key, start, end)
@@ -166,10 +177,20 @@ class MiddleRangeCache:
         return record.start <= requested.start and record.end >= requested.end
 
     def _valid_record(self, record: MiddleBlockRecord) -> bool:
+        if not KEY_PATTERN.fullmatch(record.cache_key):
+            return False
+        if record.start < 0 or record.end < record.start:
+            return False
         if record.size != record.end - record.start + 1:
             return False
         expected = self._relative_path(record.cache_key, record.start, record.end)
         return record.path == expected
+
+    def _record_paths(self, record: MiddleBlockRecord) -> tuple[Path, Path]:
+        return self._paths(record.cache_key, record.start, record.end)
+
+    def _delete_metadata(self, record: MiddleBlockRecord) -> None:
+        self.store.delete_middle_block_record(record.cache_key, record.start, record.end)
 
     def _valid_files(
         self, record: MiddleBlockRecord, path: Path, sidecar: Path
