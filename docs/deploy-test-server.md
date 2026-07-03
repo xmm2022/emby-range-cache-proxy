@@ -18,7 +18,7 @@ test -f /etc/caddy/Caddyfile.bak-no-ip-whitelist-20260703-050143
 systemctl status emby-range-cache-151357.service emby-range-cache-164958.service emby-range-cache-151355.service emby-range-cache-10535.service emby-range-cache-159769.service emby-range-cache-151358.service
 ```
 
-- Confirm the proxy config enables rollout allowlists before Caddy routes traffic to it. At least one of `item_allowlist`, `media_source_allowlist`, or `path_prefix_allowlist` should be narrow for the first test.
+- Confirm the proxy config enables rollout allowlists before Caddy routes traffic to it. For the first test, `item_allowlist` or `media_source_allowlist` must be narrow. Do not use `path_prefix_allowlist` as the only first-stage grey-release boundary because path checks happen after Emby authorization.
 
 ```bash
 jq '.rollout' /etc/emby-range-cache-proxy/config.json
@@ -33,11 +33,11 @@ jq -r '.listen_host' /etc/emby-range-cache-proxy/config.json
 Expected: `127.0.0.1`.
 
 - Confirm logs are token-safe before enabling traffic. Proxy decision logs must not include raw query strings, `api_key`, `X-Emby-Token`, `PlaySessionId`, `DeviceId`, origin URLs, or internal prewarm keys. The service disables the default aiohttp access log.
-- Keep the config readable only by root and the service user because it may contain `prewarm_api_key`:
+- Keep the config readable only by root and the service group because it may contain `prewarm_api_key`. The service runs as `emby-cache`, so group read is required:
 
 ```bash
-chmod 0600 /etc/emby-range-cache-proxy/config.json
 chown root:emby-cache /etc/emby-range-cache-proxy/config.json
+chmod 0640 /etc/emby-range-cache-proxy/config.json
 ```
 
 - Confirm the cache directory owner matches the service account:
@@ -66,10 +66,13 @@ install -d -o root -g emby-cache -m 0750 /etc/emby-range-cache-proxy
 install -d -o emby-cache -g emby-cache -m 0750 /home/nax/emby/cache/range-proxy
 ```
 
-For an interactive smoke test, run:
+For an interactive smoke test, run the proxy in the background and stop it on exit:
 
 ```bash
-/opt/emby-range-cache-proxy/.venv/bin/emby-range-cache-proxy --config /etc/emby-range-cache-proxy/config.json
+set -eu
+/opt/emby-range-cache-proxy/.venv/bin/emby-range-cache-proxy --config /etc/emby-range-cache-proxy/config.json &
+pid=$!
+trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 curl -fsS http://127.0.0.1:18180/healthz
 ```
 
@@ -105,9 +108,13 @@ caddy adapt --config /tmp/Caddyfile.range-cache-candidate --pretty >/tmp/caddy-r
 caddy validate --config /tmp/Caddyfile.range-cache-candidate
 ```
 
-Only after the candidate validates should the same minimal route be applied to `/etc/caddy/Caddyfile`. Validate again before reload:
+Before editing the live Caddyfile, create a deployment-specific rollback backup. Only after the candidate validates should the same minimal route be applied to `/etc/caddy/Caddyfile`. Validate again before reload:
 
 ```bash
+backup="/etc/caddy/Caddyfile.bak-range-proxy-$(date +%Y%m%d-%H%M%S)"
+cp /etc/caddy/Caddyfile "$backup"
+printf '%s\n' "$backup" >/tmp/emby-range-cache-proxy-caddy-backup
+printf 'backup=%s\n' "$backup"
 caddy adapt --config /etc/caddy/Caddyfile --pretty >/tmp/caddy-after-range-cache.json
 caddy validate --config /etc/caddy/Caddyfile
 systemctl reload caddy
@@ -119,13 +126,14 @@ Caddy fallback is limited to cache-proxy connection failure or upstream unavaila
 
 Use one rollout-allowlisted item and one non-allowlisted item. Keep real user tokens out of docs and shell history where possible.
 
-Set local shell variables for the test session:
+Set local shell variables for the test session. Read the token without storing it in shell history, and prefer `X-Emby-Token` over query `api_key` in manual curl commands. Command-line arguments and environment variables can still be visible to local administrators while the command runs.
 
 ```bash
 BASE='https://a.inemby.pp.ua'
 ITEM_ID='<allowlisted-item-id>'
 MEDIA_SOURCE_ID='<allowlisted-media-source-id>'
-TOKEN='<valid-user-token>'
+read -rsp 'TOKEN: ' TOKEN
+printf '\n'
 ```
 
 Valid token, head miss then cache build:
@@ -133,20 +141,22 @@ Valid token, head miss then cache build:
 ```bash
 curl -sS -D /tmp/head-miss.headers -o /tmp/head-miss.bin \
   -H 'Range: bytes=0-1048575' \
-  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID&api_key=$TOKEN"
+  -H "X-Emby-Token: $TOKEN" \
+  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID"
 ```
 
-Expected: `206 Partial Content`; proxy logs show a cacheable head request. Cache files should appear under `/home/nax/emby/cache/range-proxy`.
+Expected: `206 Partial Content`; cache files should appear under `/home/nax/emby/cache/range-proxy`.
 
 Valid token, same head range hit:
 
 ```bash
 curl -sS -D /tmp/head-hit.headers -o /tmp/head-hit.bin \
   -H 'Range: bytes=0-1048575' \
-  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID&api_key=$TOKEN"
+  -H "X-Emby-Token: $TOKEN" \
+  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID"
 ```
 
-Expected: `206 Partial Content`; response body matches the first head request; logs indicate the request is served from the existing head cache entry.
+Expected: `206 Partial Content`; response body matches the first head request. Use file count, file size, and unchanged cache file mtimes as the cache evidence because V1 does not emit hit/miss logs.
 
 Valid token, tail range:
 
@@ -155,7 +165,8 @@ SIZE='<media-size-bytes>'
 START=$((SIZE - 1048576))
 curl -sS -D /tmp/tail.headers -o /tmp/tail.bin \
   -H "Range: bytes=$START-" \
-  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID&api_key=$TOKEN"
+  -H "X-Emby-Token: $TOKEN" \
+  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID"
 ```
 
 Expected: `206 Partial Content`; tail cache entry is built or reused.
@@ -168,7 +179,8 @@ END=$((MID + 1048575))
 before=$(find /home/nax/emby/cache/range-proxy -type f | wc -l)
 curl -sS -D /tmp/middle.headers -o /tmp/middle.bin \
   -H "Range: bytes=$MID-$END" \
-  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID&api_key=$TOKEN"
+  -H "X-Emby-Token: $TOKEN" \
+  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID"
 after=$(find /home/nax/emby/cache/range-proxy -type f | wc -l)
 printf 'before=%s after=%s\n' "$before" "$after"
 ```
@@ -180,7 +192,8 @@ Invalid token:
 ```bash
 curl -sS -D /tmp/invalid-token.headers -o /tmp/invalid-token.bin \
   -H 'Range: bytes=0-1048575' \
-  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID&api_key=invalid-test-token"
+  -H 'X-Emby-Token: invalid-test-token' \
+  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID"
 ```
 
 Expected: `403`; proxy must not read origin, cache, or fallback for explicit authorization failure.
@@ -196,11 +209,13 @@ Expected: Caddy reaches the proxy, proxy cannot contact Emby auth, and the proxy
 Cache-proxy stopped Caddy fallback:
 
 ```bash
+set -eu
 systemctl stop emby-range-cache-proxy.service
+trap 'systemctl start emby-range-cache-proxy.service' EXIT
 curl -sS -D /tmp/proxy-stopped.headers -o /tmp/proxy-stopped.bin \
   -H 'Range: bytes=0-1048575' \
-  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID&api_key=$TOKEN"
-systemctl start emby-range-cache-proxy.service
+  -H "X-Emby-Token: $TOKEN" \
+  "$BASE/emby/videos/$ITEM_ID/original.mkv?MediaSourceId=$MEDIA_SOURCE_ID"
 ```
 
 Expected: Caddy falls back to `127.0.0.1:8096` because `127.0.0.1:18180` is unavailable. This proves only the connection-failure fallback path.
@@ -222,18 +237,21 @@ Checks:
 - New or recent rollout-allowlisted media creates head/tail cache entries only.
 - No arbitrary middle cache entry is created by the prewarm worker.
 - Non-allowlisted media is skipped.
-- A playback request using only the internal `prewarm_api_key` as `api_key` is rejected unless that key is also a real user playback token, which it should not be.
+- A playback request using the internal `prewarm_api_key` as `api_key` is rejected by the proxy before Emby authorization.
 - User playback authorization still calls Emby with the user's own token on each playback request.
 
 ## Rollback
 
-Restore the known Caddy backup, validate, reload, and stop the unified proxy:
+Prefer restoring the deployment-specific backup created immediately before the grey-release edit. Use the older known backup only when intentionally returning to that exact earlier test state. Validate, reload, and disable the unified proxy:
 
 ```bash
-cp /etc/caddy/Caddyfile.bak-no-ip-whitelist-20260703-050143 /etc/caddy/Caddyfile
+backup=$(cat /tmp/emby-range-cache-proxy-caddy-backup)
+cp "$backup" /etc/caddy/Caddyfile
+# Fallback only when intentionally returning to that exact earlier state:
+# cp /etc/caddy/Caddyfile.bak-no-ip-whitelist-20260703-050143 /etc/caddy/Caddyfile
 caddy validate --config /etc/caddy/Caddyfile
 systemctl reload caddy
-systemctl stop emby-range-cache-proxy.service
+systemctl disable --now emby-range-cache-proxy.service
 ```
 
 After rollback:

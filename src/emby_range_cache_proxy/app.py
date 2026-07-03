@@ -78,6 +78,9 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     if not _pre_authorization_rollout_scope(config, item_id=ctx.item_id, media_source_id=ctx.media_source_id):
         _log_decision("fallback", "not_eligible", request, ctx=ctx)
         return await stream_fallback(request, config)
+    if config.prewarm_api_key and ctx.token == config.prewarm_api_key:
+        _log_decision("deny", "internal_key_used_for_playback", request, ctx=ctx)
+        raise web.HTTPForbidden(text="forbidden\n") from None
 
     try:
         async with EmbyAuthClient(config.emby_base_url) as auth:

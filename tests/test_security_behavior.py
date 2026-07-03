@@ -77,6 +77,69 @@ async def test_auth_403_does_not_touch_origin_cache_or_fallback(aiohttp_client, 
     assert fallback_hits == 0
 
 
+async def test_internal_prewarm_key_is_rejected_for_playback_without_auth_lookup(aiohttp_client, monkeypatch, tmp_path):
+    fallback_hits = 0
+    playback_info_hits = 0
+
+    class ForbiddenOriginClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("origin must not be touched when internal key is used for playback")
+
+    class ForbiddenCache:
+        def read_block(self, *args, **kwargs):
+            raise AssertionError("cache read must not run when internal key is used for playback")
+
+        def stage_block(self, *args, **kwargs):
+            raise AssertionError("cache write must not run when internal key is used for playback")
+
+        def evict_if_needed(self):
+            raise AssertionError("cache eviction must not run when internal key is used for playback")
+
+    async def playback_info(request):
+        nonlocal playback_info_hits
+        playback_info_hits += 1
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {"Id": "ms1", "Path": "http://origin/movie.mkv", "Protocol": "Http", "Size": 100}
+                ]
+            }
+        )
+
+    async def fallback(request):
+        nonlocal fallback_hits
+        fallback_hits += 1
+        return web.Response(status=500, body=b"fallback must not be touched")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+    monkeypatch.setattr(app_module, "OriginClient", ForbiddenOriginClient)
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal-secret",
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+        )
+    )
+    app["cache"] = ForbiddenCache()
+    client = await aiohttp_client(app)
+
+    response = await client.get(
+        "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=internal-secret",
+        headers={"Range": "bytes=0-3"},
+    )
+
+    assert response.status == 403
+    assert await response.text() == "forbidden\n"
+    assert playback_info_hits == 0
+    assert fallback_hits == 0
+
+
 async def test_decision_logs_redact_sensitive_query_and_header_values(aiohttp_client, caplog, tmp_path):
     async def fallback(request):
         return web.Response(body=b"fallback")
