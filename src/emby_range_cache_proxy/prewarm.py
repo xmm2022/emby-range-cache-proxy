@@ -34,6 +34,9 @@ class PrewarmWorker:
             seen: set[tuple[str, str]] = set()
 
             for item in items:
+                if not isinstance(item, dict):
+                    skipped += 1
+                    continue
                 item_id = str(item.get("Id") or "")
                 if not item_id:
                     skipped += 1
