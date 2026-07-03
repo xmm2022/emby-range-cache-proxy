@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 from emby_range_cache_proxy.models import ByteRange
@@ -128,6 +129,31 @@ def test_prefetch_tasks_are_deduplicated_and_claimed(tmp_path):
     assert claimed[0].start == 1024
     assert claimed[0].end == 2047
     assert store.queue_depth() == 0
+
+
+def test_complete_prefetch_task_marks_task_done(tmp_path):
+    db_path = tmp_path / "state.sqlite3"
+    store = SessionStateStore(db_path)
+    store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=1024,
+        end=2047,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=2.0)
+
+    store.complete_prefetch_task(claimed[0].id, now=3.0)
+
+    with sqlite3.connect(db_path) as conn:
+        status = conn.execute(
+            "SELECT status FROM prefetch_tasks WHERE id = ?",
+            (claimed[0].id,),
+        ).fetchone()[0]
+    assert status == "done"
 
 
 def test_middle_block_metadata_lifecycle(tmp_path):

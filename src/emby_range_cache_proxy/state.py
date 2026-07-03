@@ -350,7 +350,7 @@ class SessionStateStore:
             conn.execute(
                 """
                 UPDATE prefetch_tasks
-                SET status = 'completed',
+                SET status = 'done',
                     updated_at = ?,
                     last_error_class = NULL
                 WHERE id = ?
