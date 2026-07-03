@@ -11,7 +11,7 @@ from aiohttp import ClientError, ClientSession, web
 from .auth import AuthorizationError, EmbyAuthClient
 from .cache import HeadTailCache, adaptive_head_tail, cache_key
 from .config import Config
-from .models import ByteRange, MediaSource, SourceMetadata
+from .models import ByteRange, MediaSource, RequestContext, SourceMetadata
 from .origin import OriginClient, OriginError
 from .prewarm import PrewarmWorker
 from .ranges import content_range_header, parse_range_header
@@ -72,25 +72,34 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     config: Config = request.app["config"]
     cache: HeadTailCache = request.app["cache"]
     ctx = parse_original_request(request.method, request.raw_path, request.headers)
-    if ctx is None or not _pre_authorization_rollout_scope(config, item_id=ctx.item_id, media_source_id=ctx.media_source_id):
+    if ctx is None:
+        _log_decision("fallback", "not_eligible", request)
+        return await stream_fallback(request, config)
+    if not _pre_authorization_rollout_scope(config, item_id=ctx.item_id, media_source_id=ctx.media_source_id):
+        _log_decision("fallback", "not_eligible", request, ctx=ctx)
         return await stream_fallback(request, config)
 
     try:
         async with EmbyAuthClient(config.emby_base_url) as auth:
             source = await auth.authorize(ctx)
     except AuthorizationError:
+        _log_decision("deny", "authorization_failed", request, ctx=ctx)
         raise web.HTTPForbidden(text="forbidden\n") from None
-    except (ClientError, TimeoutError, OSError):
+    except (ClientError, TimeoutError, OSError) as error:
+        _log_decision("fallback", "auth_unavailable", request, ctx=ctx, error=error, level=logging.WARNING)
         return await stream_fallback(request, config)
 
     if not _is_http_source(source):
+        _log_decision("fallback", "non_http_source", request, ctx=ctx)
         return await stream_fallback(request, config)
     if not config.rollout.in_scope(item_id=ctx.item_id, media_source_id=ctx.media_source_id, path=source.path):
+        _log_decision("fallback", "path_rollout_miss", request, ctx=ctx)
         return await stream_fallback(request, config)
 
     try:
         return await serve_authorized_range(request, config, cache, source)
-    except (OriginError, ValueError, ClientError, TimeoutError, OSError):
+    except (OriginError, ValueError, ClientError, TimeoutError, OSError) as error:
+        _log_decision("fallback", "proxy_error", request, ctx=ctx, error=error, level=logging.WARNING)
         return await stream_fallback(request, config)
 
 
@@ -179,6 +188,53 @@ async def _write_eof_safely(response: web.StreamResponse) -> None:
 def _is_http_source(source: MediaSource) -> bool:
     scheme = urlsplit(source.path).scheme.lower()
     return scheme in {"http", "https"}
+
+
+def _log_decision(
+    action: str,
+    reason: str,
+    request: web.Request,
+    *,
+    ctx: RequestContext | None = None,
+    error: BaseException | None = None,
+    level: int = logging.INFO,
+) -> None:
+    if ctx is None:
+        if error is None:
+            LOGGER.log(level, "%s reason=%s path=%s", action, reason, request.path)
+        else:
+            LOGGER.log(
+                level,
+                "%s reason=%s path=%s error_type=%s",
+                action,
+                reason,
+                request.path,
+                type(error).__name__,
+            )
+        return
+
+    if error is None:
+        LOGGER.log(
+            level,
+            "%s reason=%s item_id=%s media_source_id=%s path=%s",
+            action,
+            reason,
+            ctx.item_id,
+            ctx.media_source_id,
+            request.path,
+        )
+        return
+
+    LOGGER.log(
+        level,
+        "%s reason=%s item_id=%s media_source_id=%s path=%s error_type=%s",
+        action,
+        reason,
+        ctx.item_id,
+        ctx.media_source_id,
+        request.path,
+        type(error).__name__,
+    )
 
 
 def _pre_authorization_rollout_scope(config: Config, *, item_id: str, media_source_id: str) -> bool:
