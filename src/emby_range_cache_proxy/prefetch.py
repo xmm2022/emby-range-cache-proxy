@@ -138,13 +138,15 @@ class PrefetchWorker:
                         await self.limiter.consume(len(chunk))
                         data.extend(chunk)
 
-            await asyncio.to_thread(
+            stored = await asyncio.to_thread(
                 self._store_completed_task,
                 task,
                 byte_range,
                 bytes(data),
                 now,
             )
+            if not stored:
+                return PrefetchRunResult(skipped=1)
             return PrefetchRunResult(completed=1)
         except asyncio.CancelledError:
             await asyncio.to_thread(
@@ -185,16 +187,23 @@ class PrefetchWorker:
         byte_range: ByteRange,
         data: bytes,
         now: float,
-    ) -> None:
-        self.middle_cache.store_block(
+    ) -> bool:
+        stored = self.middle_cache.store_block_if_current(
             task.cache_key,
             byte_range,
             data,
             now=now,
+            precommit=lambda: self.store.refresh_prefetch_task_attempt(
+                task.id,
+                now=now,
+                expected_attempts=task.attempts,
+            ),
         )
+        if not stored:
+            return False
         self.middle_cache.evict_expired(now=now)
         self.middle_cache.evict_lru_if_needed()
-        self.store.complete_prefetch_task(
+        return self.store.complete_prefetch_task(
             task.id,
             now=now,
             expected_attempts=task.attempts,

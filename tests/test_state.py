@@ -649,6 +649,80 @@ def test_existing_prefetch_task_table_does_not_backfill_existing_null_retry_poli
     assert retried == []
 
 
+def test_existing_next_attempt_column_backfills_only_retryable_null_errors(tmp_path):
+    db_path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE prefetch_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id TEXT NOT NULL,
+                media_source_id TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                start INTEGER NOT NULL,
+                end INTEGER NOT NULL,
+                priority INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_error_class TEXT,
+                next_attempt_at REAL,
+                UNIQUE(cache_key, start, end)
+            );
+            """
+        )
+        rows = [
+            ("a" * 64, 0, 2, 50, "failed", 5.0, "OriginError"),
+            ("b" * 64, 3, 5, 40, "skipped", 6.0, "SourceUnavailable"),
+            ("c" * 64, 6, 8, 30, "failed", 7.0, "PermanentError"),
+            ("d" * 64, 9, 11, 20, "failed", 8.0, "PrefetchSourceMismatch"),
+            ("e" * 64, 12, 14, 10, "skipped", 9.0, "RangeTooLarge"),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO prefetch_tasks (
+                item_id, media_source_id, cache_key, start, end, priority,
+                status, attempts, created_at, updated_at, last_error_class,
+                next_attempt_at
+            )
+            VALUES ('1', 'ms1', ?, ?, ?, ?, ?, 1, 1.0, ?, ?, NULL)
+            """,
+            rows,
+        )
+
+    store = SessionStateStore(db_path)
+    duplicate = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=0,
+        end=2,
+        priority=50,
+        now=10.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=10, now=10.0)
+
+    assert duplicate is None
+    assert [task.cache_key for task in claimed] == ["a" * 64, "b" * 64]
+    with sqlite3.connect(db_path) as conn:
+        permanent_rows = conn.execute(
+            """
+            SELECT cache_key, next_attempt_at
+            FROM prefetch_tasks
+            WHERE cache_key IN (?, ?, ?)
+            ORDER BY cache_key ASC
+            """,
+            ("c" * 64, "d" * 64, "e" * 64),
+        ).fetchall()
+    assert permanent_rows == [
+        ("c" * 64, None),
+        ("d" * 64, None),
+        ("e" * 64, None),
+    ]
+
+
 def test_old_attempt_finalizers_do_not_override_new_completed_attempt(tmp_path):
     store = SessionStateStore(tmp_path / "state.sqlite3")
     task = store.enqueue_prefetch_task(

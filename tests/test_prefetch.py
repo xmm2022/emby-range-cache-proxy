@@ -275,6 +275,53 @@ async def test_prefetch_worker_skips_range_larger_than_middle_cache(
     assert request_methods == []
 
 
+async def test_prefetch_worker_old_attempt_does_not_publish_middle_cache(tmp_path):
+    store = SessionStateStore(tmp_path / "state.db")
+    middle = MiddleRangeCache(
+        tmp_path / "mid", store, max_bytes=1024, ttl_seconds=60
+    )
+    task = store.enqueue_prefetch_task(
+        "1",
+        "ms1",
+        "a" * 64,
+        0,
+        2,
+        priority=1,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    first = store.claim_prefetch_tasks(limit=1, now=2.0)[0]
+    second = store.claim_prefetch_tasks(
+        limit=1,
+        now=12.0,
+        running_stale_seconds=10,
+    )[0]
+    worker = PrefetchWorker(
+        Config(
+            emby_base_url="http://emby",
+            fallback_base_url="http://fallback",
+            cache_dir=str(tmp_path),
+        ),
+        store,
+        middle,
+    )
+
+    worker._store_completed_task(second, ByteRange(0, 2), b"new", 13.0)
+    before = store.find_middle_block("a" * 64, ByteRange(0, 2))
+    stale_result = worker._store_completed_task(
+        first, ByteRange(0, 2), b"old", 14.0
+    )
+    chunks = middle.iter_block("a" * 64, ByteRange(0, 2), chunk_bytes=3, now=15.0)
+    after = store.find_middle_block("a" * 64, ByteRange(0, 2))
+
+    assert task is not None
+    assert stale_result is False
+    assert chunks is not None
+    assert b"".join(chunks) == b"new"
+    assert before.created_at == 13.0
+    assert after.created_at == 13.0
+
+
 async def test_prefetch_worker_source_missing_skips_with_retry(tmp_path):
     store = SessionStateStore(tmp_path / "state.db")
     middle = MiddleRangeCache(

@@ -4,7 +4,7 @@ import os
 import re
 import uuid
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from .cache import CacheReadError, KEY_PATTERN
 from .models import ByteRange
@@ -32,6 +32,30 @@ class MiddleRangeCache:
     def store_block(
         self, key: str, byte_range: ByteRange, data: bytes, *, now: float
     ) -> None:
+        self._store_block(key, byte_range, data, now=now)
+
+    def store_block_if_current(
+        self,
+        key: str,
+        byte_range: ByteRange,
+        data: bytes,
+        *,
+        now: float,
+        precommit: Callable[[], bool],
+    ) -> bool:
+        return self._store_block(
+            key, byte_range, data, now=now, precommit=precommit
+        )
+
+    def _store_block(
+        self,
+        key: str,
+        byte_range: ByteRange,
+        data: bytes,
+        *,
+        now: float,
+        precommit: Callable[[], bool] | None = None,
+    ) -> bool:
         key = self._validate_key(key)
         self._validate_byte_range(byte_range)
         if len(data) != byte_range.length:
@@ -45,6 +69,10 @@ class MiddleRangeCache:
         try:
             tmp.write_bytes(data)
             sidecar_tmp.write_text(f"{byte_range.start}-{byte_range.end}\n")
+            if precommit is not None and not precommit():
+                tmp.unlink(missing_ok=True)
+                sidecar_tmp.unlink(missing_ok=True)
+                return False
             os.replace(tmp, path)
             os.replace(sidecar_tmp, sidecar)
         except OSError:
@@ -52,6 +80,10 @@ class MiddleRangeCache:
             sidecar_tmp.unlink(missing_ok=True)
             path.unlink(missing_ok=True)
             sidecar.unlink(missing_ok=True)
+            raise
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            sidecar_tmp.unlink(missing_ok=True)
             raise
 
         try:
@@ -71,6 +103,7 @@ class MiddleRangeCache:
             path.unlink(missing_ok=True)
             sidecar.unlink(missing_ok=True)
             raise
+        return True
 
     def iter_block(
         self,

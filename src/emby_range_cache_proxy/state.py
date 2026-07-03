@@ -10,6 +10,9 @@ from .models import ByteRange
 
 SESSION_STATUSES = {"active", "idle", "stopped", "expired"}
 TASK_STATUSES = {"queued", "running", "done", "failed", "skipped"}
+PERMANENT_PREFETCH_ERROR_CLASSES = frozenset(
+    {"PermanentError", "PrefetchSourceMismatch", "RangeTooLarge"}
+)
 
 
 def hash_identifier(value: str | None) -> str | None:
@@ -376,10 +379,10 @@ class SessionStateStore:
 
     def complete_prefetch_task(
         self, task_id: int, *, now: float, expected_attempts: int | None = None
-    ) -> None:
+    ) -> bool:
         expected_sql, expected_params = _expected_attempts_clause(expected_attempts)
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 f"""
                 UPDATE prefetch_tasks
                 SET status = 'done',
@@ -391,6 +394,7 @@ class SessionStateStore:
                 """,
                 (now, task_id, *expected_params),
             )
+            return cursor.rowcount == 1
 
     def fail_prefetch_task(
         self,
@@ -400,13 +404,13 @@ class SessionStateStore:
         now: float,
         retry_after_seconds: int | None = None,
         expected_attempts: int | None = None,
-    ) -> None:
+    ) -> bool:
         next_attempt_at = (
             None if retry_after_seconds is None else now + retry_after_seconds
         )
         expected_sql, expected_params = _expected_attempts_clause(expected_attempts)
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 f"""
                 UPDATE prefetch_tasks
                 SET status = 'failed',
@@ -418,6 +422,7 @@ class SessionStateStore:
                 """,
                 (now, error_class, next_attempt_at, task_id, *expected_params),
             )
+            return cursor.rowcount == 1
 
     def skip_prefetch_task(
         self,
@@ -427,13 +432,13 @@ class SessionStateStore:
         now: float,
         retry_after_seconds: int | None = None,
         expected_attempts: int | None = None,
-    ) -> None:
+    ) -> bool:
         next_attempt_at = (
             None if retry_after_seconds is None else now + retry_after_seconds
         )
         expected_sql, expected_params = _expected_attempts_clause(expected_attempts)
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 f"""
                 UPDATE prefetch_tasks
                 SET status = 'skipped',
@@ -445,6 +450,7 @@ class SessionStateStore:
                 """,
                 (now, error_class, next_attempt_at, task_id, *expected_params),
             )
+            return cursor.rowcount == 1
 
     def requeue_prefetch_task(
         self,
@@ -453,10 +459,10 @@ class SessionStateStore:
         now: float,
         error_class: str | None = None,
         expected_attempts: int | None = None,
-    ) -> None:
+    ) -> bool:
         expected_sql, expected_params = _expected_attempts_clause(expected_attempts)
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 f"""
                 UPDATE prefetch_tasks
                 SET status = 'queued',
@@ -468,6 +474,23 @@ class SessionStateStore:
                 """,
                 (now, error_class, task_id, *expected_params),
             )
+            return cursor.rowcount == 1
+
+    def refresh_prefetch_task_attempt(
+        self, task_id: int, *, now: float, expected_attempts: int
+    ) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE prefetch_tasks
+                SET updated_at = ?
+                WHERE id = ?
+                  AND status = 'running'
+                  AND attempts = ?
+                """,
+                (now, task_id, expected_attempts),
+            )
+            return cursor.rowcount == 1
 
     def queue_depth(self) -> int:
         with self._connect() as conn:
@@ -621,18 +644,8 @@ class SessionStateStore:
                 );
                 """
             )
-            added_next_attempt_at = _ensure_column(
-                conn, "prefetch_tasks", "next_attempt_at", "REAL"
-            )
-            if added_next_attempt_at:
-                conn.execute(
-                    """
-                    UPDATE prefetch_tasks
-                    SET next_attempt_at = updated_at
-                    WHERE status IN ('failed', 'skipped')
-                      AND next_attempt_at IS NULL
-                    """
-                )
+            _ensure_column(conn, "prefetch_tasks", "next_attempt_at", "REAL")
+            _backfill_retryable_prefetch_tasks(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -694,6 +707,24 @@ def _expected_attempts_clause(
     if expected_attempts is None:
         return "", ()
     return "AND status = 'running' AND attempts = ?", (expected_attempts,)
+
+
+def _backfill_retryable_prefetch_tasks(conn: sqlite3.Connection) -> None:
+    permanent_errors = tuple(sorted(PERMANENT_PREFETCH_ERROR_CLASSES))
+    placeholders = ", ".join("?" for _ in permanent_errors)
+    conn.execute(
+        f"""
+        UPDATE prefetch_tasks
+        SET next_attempt_at = updated_at
+        WHERE status IN ('failed', 'skipped')
+          AND next_attempt_at IS NULL
+          AND (
+                last_error_class IS NULL
+             OR last_error_class NOT IN ({placeholders})
+          )
+        """,
+        permanent_errors,
+    )
 
 
 def _playback_session_from_row(row: sqlite3.Row) -> PlaybackSessionRecord:

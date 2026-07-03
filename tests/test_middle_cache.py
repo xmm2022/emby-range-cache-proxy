@@ -23,6 +23,29 @@ def test_middle_cache_store_and_iter_block(tmp_path):
     assert block.expires_at == 80.0
 
 
+def test_middle_cache_guarded_store_does_not_publish_when_precommit_fails(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    cache = MiddleRangeCache(
+        tmp_path / "cache", store, max_bytes=1024 * 1024, ttl_seconds=60
+    )
+    cache.store_block(_key(), ByteRange(0, 2), b"new", now=10.0)
+
+    published = cache.store_block_if_current(
+        _key(),
+        ByteRange(0, 2),
+        b"old",
+        now=9.0,
+        precommit=lambda: False,
+    )
+    chunks = cache.iter_block(_key(), ByteRange(0, 2), chunk_bytes=3, now=11.0)
+    record = store.find_middle_block(_key(), ByteRange(0, 2))
+
+    assert published is False
+    assert chunks is not None
+    assert b"".join(chunks) == b"new"
+    assert record.created_at == 10.0
+
+
 def test_middle_cache_miss_for_partial_coverage(tmp_path):
     store = SessionStateStore(tmp_path / "state.sqlite3")
     cache = MiddleRangeCache(tmp_path / "cache", store, max_bytes=1024 * 1024, ttl_seconds=60)
