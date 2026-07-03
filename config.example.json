@@ -28,5 +28,33 @@
     "interval_seconds": 900,
     "max_items_per_scan": 100,
     "concurrency": 1
+  },
+  "session": {
+    "enabled": false,
+    "state_db": null,
+    "observer_enabled": false,
+    "observer_interval_seconds": 30,
+    "idle_seconds": 180,
+    "stop_grace_seconds": 60,
+    "expire_seconds": 86400
+  },
+  "middle_cache": {
+    "enabled": false,
+    "max_bytes": 137438953472,
+    "ttl_seconds": 604800,
+    "segment_bytes": 67108864,
+    "min_free_bytes": 53687091200
+  },
+  "prefetch": {
+    "enabled": false,
+    "window_bytes": 2147483648,
+    "resume_overlap_bytes": 134217728,
+    "max_session_bytes": 4294967296,
+    "max_queue_depth": 200,
+    "concurrency": 1,
+    "per_origin_concurrency": 1,
+    "bandwidth_bytes_per_second": 31457280,
+    "pause_when_rollout_session_active": true,
+    "error_backoff_seconds": 300
   }
 }

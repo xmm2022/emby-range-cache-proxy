@@ -57,6 +57,73 @@ class PrewarmConfig:
             raise ValueError("prewarm.interval_seconds must be >= 60")
 
 
+@dataclass
+class SessionConfig:
+    enabled: bool = False
+    state_db: str | None = None
+    observer_enabled: bool = False
+    observer_interval_seconds: int = 30
+    idle_seconds: int = 180
+    stop_grace_seconds: int = 60
+    expire_seconds: int = 86400
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "observer_interval_seconds",
+            "idle_seconds",
+            "stop_grace_seconds",
+            "expire_seconds",
+        ):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"session.{field_name} must be positive")
+
+
+@dataclass
+class MiddleCacheConfig:
+    enabled: bool = False
+    max_bytes: int = 128 * 1024**3
+    ttl_seconds: int = 7 * 24 * 60 * 60
+    segment_bytes: int = 64 * 1024**2
+    min_free_bytes: int = 50 * 1024**3
+
+    def __post_init__(self) -> None:
+        for field_name in ("max_bytes", "ttl_seconds", "segment_bytes"):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"middle_cache.{field_name} must be positive")
+        if self.min_free_bytes < 0:
+            raise ValueError("middle_cache.min_free_bytes must be non-negative")
+
+
+@dataclass
+class PrefetchConfig:
+    enabled: bool = False
+    window_bytes: int = 2 * 1024**3
+    resume_overlap_bytes: int = 128 * 1024**2
+    max_session_bytes: int = 4 * 1024**3
+    max_queue_depth: int = 200
+    concurrency: int = 1
+    per_origin_concurrency: int = 1
+    bandwidth_bytes_per_second: int = 30 * 1024**2
+    pause_when_rollout_session_active: bool = True
+    error_backoff_seconds: int = 300
+
+    def __post_init__(self) -> None:
+        positive_fields = (
+            "window_bytes",
+            "max_session_bytes",
+            "max_queue_depth",
+            "concurrency",
+            "per_origin_concurrency",
+            "bandwidth_bytes_per_second",
+            "error_backoff_seconds",
+        )
+        for field_name in positive_fields:
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"prefetch.{field_name} must be positive")
+        if self.resume_overlap_bytes < 0:
+            raise ValueError("prefetch.resume_overlap_bytes must be non-negative")
+
+
 @dataclass(frozen=True)
 class PathMapping:
     source_prefix: str
@@ -78,6 +145,9 @@ class Config:
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     prewarm: PrewarmConfig = field(default_factory=PrewarmConfig)
+    session: SessionConfig = field(default_factory=SessionConfig)
+    middle_cache: MiddleCacheConfig = field(default_factory=MiddleCacheConfig)
+    prefetch: PrefetchConfig = field(default_factory=PrefetchConfig)
 
 
 def _string_list(values: Any, field_name: str) -> list[str]:
@@ -118,6 +188,44 @@ def _prewarm(data: dict[str, Any]) -> PrewarmConfig:
         interval_seconds=int(data.get("interval_seconds", 900)),
         max_items_per_scan=int(data.get("max_items_per_scan", 100)),
         concurrency=int(data.get("concurrency", 1)),
+    )
+
+
+def _session(data: dict[str, Any]) -> SessionConfig:
+    state_db = data.get("state_db")
+    return SessionConfig(
+        enabled=bool(data.get("enabled", False)),
+        state_db=None if state_db is None else str(state_db),
+        observer_enabled=bool(data.get("observer_enabled", False)),
+        observer_interval_seconds=int(data.get("observer_interval_seconds", 30)),
+        idle_seconds=int(data.get("idle_seconds", 180)),
+        stop_grace_seconds=int(data.get("stop_grace_seconds", 60)),
+        expire_seconds=int(data.get("expire_seconds", 86400)),
+    )
+
+
+def _middle_cache(data: dict[str, Any]) -> MiddleCacheConfig:
+    return MiddleCacheConfig(
+        enabled=bool(data.get("enabled", False)),
+        max_bytes=int(data.get("max_bytes", 128 * 1024**3)),
+        ttl_seconds=int(data.get("ttl_seconds", 7 * 24 * 60 * 60)),
+        segment_bytes=int(data.get("segment_bytes", 64 * 1024**2)),
+        min_free_bytes=int(data.get("min_free_bytes", 50 * 1024**3)),
+    )
+
+
+def _prefetch(data: dict[str, Any]) -> PrefetchConfig:
+    return PrefetchConfig(
+        enabled=bool(data.get("enabled", False)),
+        window_bytes=int(data.get("window_bytes", 2 * 1024**3)),
+        resume_overlap_bytes=int(data.get("resume_overlap_bytes", 128 * 1024**2)),
+        max_session_bytes=int(data.get("max_session_bytes", 4 * 1024**3)),
+        max_queue_depth=int(data.get("max_queue_depth", 200)),
+        concurrency=int(data.get("concurrency", 1)),
+        per_origin_concurrency=int(data.get("per_origin_concurrency", 1)),
+        bandwidth_bytes_per_second=int(data.get("bandwidth_bytes_per_second", 30 * 1024**2)),
+        pause_when_rollout_session_active=bool(data.get("pause_when_rollout_session_active", True)),
+        error_backoff_seconds=int(data.get("error_backoff_seconds", 300)),
     )
 
 
@@ -164,4 +272,7 @@ def load_config(path: str | Path) -> Config:
         rollout=_rollout(raw.get("rollout", {})),
         cache=_cache(raw.get("cache", {})),
         prewarm=_prewarm(raw.get("prewarm", {})),
+        session=_session(raw.get("session", {})),
+        middle_cache=_middle_cache(raw.get("middle_cache", {})),
+        prefetch=_prefetch(raw.get("prefetch", {})),
     )

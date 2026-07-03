@@ -2,7 +2,14 @@ import json
 
 import pytest
 
-from emby_range_cache_proxy.config import Config, PrewarmConfig, load_config
+from emby_range_cache_proxy.config import (
+    Config,
+    MiddleCacheConfig,
+    PrefetchConfig,
+    PrewarmConfig,
+    SessionConfig,
+    load_config,
+)
 
 
 def test_load_config_with_defaults(tmp_path):
@@ -168,3 +175,132 @@ def test_load_config_reads_open_head_response_bytes(tmp_path):
     config = load_config(path)
 
     assert config.cache.open_head_response_bytes == 32 * 1024**2
+
+
+def test_phase2_config_defaults_are_disabled(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+            }
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.session.enabled is False
+    assert config.session.state_db is None
+    assert config.session.observer_enabled is False
+    assert config.session.observer_interval_seconds == 30
+    assert config.session.idle_seconds == 180
+    assert config.session.stop_grace_seconds == 60
+    assert config.session.expire_seconds == 86400
+    assert config.middle_cache.enabled is False
+    assert config.middle_cache.max_bytes == 128 * 1024**3
+    assert config.middle_cache.ttl_seconds == 7 * 24 * 60 * 60
+    assert config.middle_cache.segment_bytes == 64 * 1024**2
+    assert config.middle_cache.min_free_bytes == 50 * 1024**3
+    assert config.prefetch.enabled is False
+    assert config.prefetch.window_bytes == 2 * 1024**3
+    assert config.prefetch.resume_overlap_bytes == 128 * 1024**2
+    assert config.prefetch.max_session_bytes == 4 * 1024**3
+    assert config.prefetch.max_queue_depth == 200
+    assert config.prefetch.concurrency == 1
+    assert config.prefetch.per_origin_concurrency == 1
+    assert config.prefetch.bandwidth_bytes_per_second == 30 * 1024**2
+    assert config.prefetch.pause_when_rollout_session_active is True
+    assert config.prefetch.error_backoff_seconds == 300
+
+
+def test_phase2_config_reads_explicit_values(tmp_path):
+    path = tmp_path / "config.json"
+    db_path = tmp_path / "phase2.sqlite3"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "session": {
+                    "enabled": True,
+                    "state_db": str(db_path),
+                    "observer_enabled": True,
+                    "observer_interval_seconds": 45,
+                    "idle_seconds": 240,
+                    "stop_grace_seconds": 90,
+                    "expire_seconds": 7200,
+                },
+                "middle_cache": {
+                    "enabled": True,
+                    "max_bytes": 123,
+                    "ttl_seconds": 456,
+                    "segment_bytes": 789,
+                    "min_free_bytes": 321,
+                },
+                "prefetch": {
+                    "enabled": True,
+                    "window_bytes": 111,
+                    "resume_overlap_bytes": 222,
+                    "max_session_bytes": 333,
+                    "max_queue_depth": 44,
+                    "concurrency": 2,
+                    "per_origin_concurrency": 1,
+                    "bandwidth_bytes_per_second": 555,
+                    "pause_when_rollout_session_active": False,
+                    "error_backoff_seconds": 66,
+                },
+            }
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.session.enabled is True
+    assert config.session.state_db == str(db_path)
+    assert config.session.observer_enabled is True
+    assert config.session.observer_interval_seconds == 45
+    assert config.session.idle_seconds == 240
+    assert config.session.stop_grace_seconds == 90
+    assert config.session.expire_seconds == 7200
+    assert config.middle_cache.enabled is True
+    assert config.middle_cache.max_bytes == 123
+    assert config.middle_cache.ttl_seconds == 456
+    assert config.middle_cache.segment_bytes == 789
+    assert config.middle_cache.min_free_bytes == 321
+    assert config.prefetch.enabled is True
+    assert config.prefetch.window_bytes == 111
+    assert config.prefetch.resume_overlap_bytes == 222
+    assert config.prefetch.max_session_bytes == 333
+    assert config.prefetch.max_queue_depth == 44
+    assert config.prefetch.concurrency == 2
+    assert config.prefetch.per_origin_concurrency == 1
+    assert config.prefetch.bandwidth_bytes_per_second == 555
+    assert config.prefetch.pause_when_rollout_session_active is False
+    assert config.prefetch.error_backoff_seconds == 66
+
+
+@pytest.mark.parametrize(
+    ("factory", "kwargs", "match"),
+    [
+        (SessionConfig, {"observer_interval_seconds": 0}, "observer_interval_seconds"),
+        (SessionConfig, {"idle_seconds": 0}, "idle_seconds"),
+        (SessionConfig, {"stop_grace_seconds": 0}, "stop_grace_seconds"),
+        (SessionConfig, {"expire_seconds": 0}, "expire_seconds"),
+        (MiddleCacheConfig, {"max_bytes": 0}, "middle_cache.max_bytes"),
+        (MiddleCacheConfig, {"ttl_seconds": 0}, "middle_cache.ttl_seconds"),
+        (MiddleCacheConfig, {"segment_bytes": 0}, "middle_cache.segment_bytes"),
+        (MiddleCacheConfig, {"min_free_bytes": -1}, "middle_cache.min_free_bytes"),
+        (PrefetchConfig, {"window_bytes": 0}, "prefetch.window_bytes"),
+        (PrefetchConfig, {"resume_overlap_bytes": -1}, "prefetch.resume_overlap_bytes"),
+        (PrefetchConfig, {"max_session_bytes": 0}, "prefetch.max_session_bytes"),
+        (PrefetchConfig, {"max_queue_depth": 0}, "prefetch.max_queue_depth"),
+        (PrefetchConfig, {"concurrency": 0}, "prefetch.concurrency"),
+        (PrefetchConfig, {"per_origin_concurrency": 0}, "prefetch.per_origin_concurrency"),
+        (PrefetchConfig, {"bandwidth_bytes_per_second": 0}, "prefetch.bandwidth_bytes_per_second"),
+        (PrefetchConfig, {"error_backoff_seconds": 0}, "prefetch.error_backoff_seconds"),
+    ],
+)
+def test_phase2_config_rejects_invalid_values(factory, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        factory(**kwargs)
