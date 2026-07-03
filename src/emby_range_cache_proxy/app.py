@@ -14,7 +14,7 @@ from .config import Config
 from .models import ByteRange, MediaSource, RequestContext, SourceMetadata
 from .origin import OriginClient, OriginError
 from .prewarm import PrewarmWorker
-from .ranges import content_range_header, parse_range_header
+from .ranges import content_range_header, plan_playback_range
 from .requests import parse_original_request
 from .sources import resolve_media_source
 
@@ -123,9 +123,16 @@ async def serve_authorized_range(
 ) -> web.StreamResponse:
     async with OriginClient(chunk_bytes=config.cache.chunk_bytes) as origin:
         metadata = await origin.head(source.path)
-        byte_range = parse_range_header(request.headers.get("Range"), size=metadata.size)
+        head_size, tail_size = adaptive_head_tail(metadata.size)
+        byte_range = plan_playback_range(
+            request.headers.get("Range"),
+            size=metadata.size,
+            head_bytes=head_size,
+            tail_bytes=tail_size,
+            default_open_range_bytes=config.cache.default_open_range_bytes,
+        )
         key = cache_key(source, metadata)
-        cache_block = _cache_block_for_request(byte_range, metadata)
+        cache_block = _cache_block_for_request(byte_range, metadata, head_size=head_size, tail_size=tail_size)
         status = 206 if request.headers.get("Range") else 200
         headers = _range_response_headers(byte_range, metadata, include_content_range=status == 206)
 
@@ -331,8 +338,15 @@ def _pre_authorization_rollout_scope(config: Config, *, item_id: str, media_sour
     )
 
 
-def _cache_block_for_request(byte_range: ByteRange, metadata: SourceMetadata) -> tuple[str, ByteRange] | None:
-    head_size, tail_size = adaptive_head_tail(metadata.size)
+def _cache_block_for_request(
+    byte_range: ByteRange,
+    metadata: SourceMetadata,
+    *,
+    head_size: int | None = None,
+    tail_size: int | None = None,
+) -> tuple[str, ByteRange] | None:
+    if head_size is None or tail_size is None:
+        head_size, tail_size = adaptive_head_tail(metadata.size)
     head_range = ByteRange(0, min(head_size, metadata.size) - 1)
     tail_range = ByteRange(max(0, metadata.size - tail_size), metadata.size - 1)
     if _range_contains(head_range, byte_range):

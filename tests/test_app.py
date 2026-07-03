@@ -235,6 +235,76 @@ async def test_head_request_builds_full_adaptive_head_block_for_later_subrange(
     assert origin_get_calls == 1
 
 
+async def test_open_ended_head_range_is_limited_and_served_from_head_cache(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
+    origin_get_calls = 0
+    body = b"0123456789abcdef" + b"T" * 84
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": len(body),
+                        "Container": "mkv",
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        nonlocal origin_get_calls
+        origin_get_calls += 1
+        assert request.headers["Range"] == "bytes=0-15"
+        return web.Response(status=206, body=body[0:16], headers={"Content-Range": "bytes 0-15/100"})
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": str(len(body)), "Content-Type": "video/x-matroska"})
+
+    async def fallback(request):
+        return web.Response(body=b"fallback")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    origin_app = web.Application()
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
+    origin_server = await aiohttp_client(origin_app)
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=0-"})
+
+    assert response.status == 206
+    assert response.headers["Content-Range"] == "bytes 0-15/100"
+    assert response.headers["Content-Length"] == "16"
+    assert await response.read() == b"0123456789abcdef"
+
+    response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=8-"})
+
+    assert response.status == 206
+    assert response.headers["Content-Range"] == "bytes 8-15/100"
+    assert response.headers["Content-Length"] == "8"
+    assert await response.read() == b"89abcdef"
+    assert origin_get_calls == 1
+
+
 async def test_strm_media_source_is_resolved_and_cached(aiohttp_client, monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
     origin_get_calls = 0

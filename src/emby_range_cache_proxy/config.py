@@ -41,6 +41,7 @@ class CacheConfig:
     max_bytes: int = 512 * 1024**3
     build_wait_seconds: float = 0.25
     chunk_bytes: int = 1024 * 1024
+    default_open_range_bytes: int = 16 * 1024**2
 
 
 @dataclass
@@ -104,6 +105,7 @@ def _cache(data: dict[str, Any]) -> CacheConfig:
         max_bytes=int(data.get("max_bytes", 512 * 1024**3)),
         build_wait_seconds=float(data.get("build_wait_seconds", 0.25)),
         chunk_bytes=int(data.get("chunk_bytes", 1024 * 1024)),
+        default_open_range_bytes=int(data.get("default_open_range_bytes", 16 * 1024**2)),
     )
 
 

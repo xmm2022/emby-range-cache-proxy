@@ -20,7 +20,8 @@
   "cache": {
     "max_bytes": 549755813888,
     "build_wait_seconds": 0.25,
-    "chunk_bytes": 1048576
+    "chunk_bytes": 1048576,
+    "default_open_range_bytes": 16777216
   },
   "prewarm": {
     "enabled": false,
