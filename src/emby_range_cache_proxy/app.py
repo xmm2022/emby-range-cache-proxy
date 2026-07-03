@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from urllib.parse import urlsplit
 
 from aiohttp import ClientError, ClientSession, web
@@ -87,20 +88,31 @@ async def serve_authorized_range(
                 return web.Response(status=status, body=cached, headers=headers)
 
         response = web.StreamResponse(status=status, headers=headers)
-        await response.prepare(request)
+        async with origin.open_range(source.path, byte_range, size=metadata.size) as upstream:
+            await response.prepare(request)
+            writer = cache.stage_block(key, block_name, byte_range) if block_name is not None else None
+            try:
+                async for chunk in upstream.content.iter_chunked(config.cache.chunk_bytes):
+                    if chunk:
+                        await response.write(chunk)
+                        if writer is not None:
+                            writer.write(chunk)
+            except (OriginError, ClientError, TimeoutError, OSError):
+                if writer is not None:
+                    writer.abort()
+                response.force_close()
+                await _write_eof_safely(response)
+                return response
 
-        chunks_for_cache: list[bytes] | None = [] if block_name is not None else None
-        async for chunk in origin.stream_range(source.path, byte_range):
-            await response.write(chunk)
-            if chunks_for_cache is not None:
-                chunks_for_cache.append(chunk)
-        await response.write_eof()
+            if writer is not None:
+                try:
+                    writer.commit()
+                    cache.evict_if_needed()
+                except ValueError:
+                    writer.abort()
+                    response.force_close()
 
-        if block_name is not None and chunks_for_cache is not None:
-            data = b"".join(chunks_for_cache)
-            cache.store_block(key, block_name, byte_range, data)
-            cache.evict_if_needed()
-
+        await _write_eof_safely(response)
         return response
 
 
@@ -128,6 +140,11 @@ async def stream_fallback(request: web.Request, config: Config) -> web.StreamRes
                         await response.write(chunk)
             await response.write_eof()
             return response
+
+
+async def _write_eof_safely(response: web.StreamResponse) -> None:
+    with suppress(ConnectionError, RuntimeError, OSError):
+        await response.write_eof()
 
 
 def _is_http_source(source: MediaSource) -> bool:

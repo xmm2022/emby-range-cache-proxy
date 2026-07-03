@@ -46,6 +46,52 @@ async def test_stream_range_requests_exact_bytes(aiohttp_client):
     assert b"".join(chunks) == b"2345"
 
 
+async def test_open_range_requires_206_and_matching_content_range(aiohttp_client):
+    async def handler(request):
+        assert request.headers["Range"] == "bytes=2-5"
+        return web.Response(status=206, body=b"2345", headers={"Content-Range": "bytes 2-5/10"})
+
+    app = web.Application()
+    app.router.add_get("/movie.mkv", handler)
+    server = await aiohttp_client(app)
+
+    async with OriginClient(chunk_bytes=2) as client:
+        async with client.open_range(str(server.make_url("/movie.mkv")), ByteRange(2, 5), size=10) as response:
+            chunks = [chunk async for chunk in response.content.iter_chunked(2)]
+
+    assert b"".join(chunks) == b"2345"
+
+
+async def test_open_range_rejects_origin_200_before_streaming(aiohttp_client):
+    async def handler(request):
+        assert request.headers["Range"] == "bytes=2-5"
+        return web.Response(status=200, body=b"0123456789")
+
+    app = web.Application()
+    app.router.add_get("/movie.mkv", handler)
+    server = await aiohttp_client(app)
+
+    async with OriginClient() as client:
+        with pytest.raises(OriginError, match="origin range GET failed: status=200"):
+            async with client.open_range(str(server.make_url("/movie.mkv")), ByteRange(2, 5), size=10):
+                raise AssertionError("invalid origin response must not be yielded")
+
+
+async def test_open_range_rejects_mismatched_content_range(aiohttp_client):
+    async def handler(request):
+        assert request.headers["Range"] == "bytes=2-5"
+        return web.Response(status=206, body=b"2345", headers={"Content-Range": "bytes 2-5/11"})
+
+    app = web.Application()
+    app.router.add_get("/movie.mkv", handler)
+    server = await aiohttp_client(app)
+
+    async with OriginClient() as client:
+        with pytest.raises(OriginError, match="origin range GET failed: invalid Content-Range"):
+            async with client.open_range(str(server.make_url("/movie.mkv")), ByteRange(2, 5), size=10):
+                raise AssertionError("mismatched content range must not be yielded")
+
+
 class FakeOriginResponse:
     status = 200
     url = "https://origin.example/movie.mkv"

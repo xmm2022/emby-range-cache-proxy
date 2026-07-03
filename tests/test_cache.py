@@ -113,6 +113,35 @@ def test_store_block_rejects_short_data_for_declared_range(tmp_path):
     assert not (tmp_path / key).exists()
 
 
+def test_stage_block_commits_complete_data(tmp_path):
+    cache = HeadTailCache(tmp_path, max_bytes=1024 * 1024)
+    key = _key("a")
+
+    writer = cache.stage_block(key, "head", ByteRange(0, 9))
+    writer.write(b"01234")
+    writer.write(b"56789")
+    writer.commit()
+
+    assert cache.read_block(key, "head", ByteRange(2, 5)) == b"2345"
+
+
+def test_stage_block_rejects_short_data_and_removes_temp(tmp_path):
+    cache = HeadTailCache(tmp_path, max_bytes=1024 * 1024)
+    key = _key("a")
+
+    writer = cache.stage_block(key, "head", ByteRange(0, 9))
+    writer.write(b"short")
+    try:
+        writer.commit()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected short staged data to be rejected")
+
+    assert cache.read_block(key, "head", ByteRange(0, 4)) is None
+    assert list(tmp_path.glob("*/*.tmp")) == []
+
+
 def test_evict_lru(tmp_path):
     cache = HeadTailCache(tmp_path, max_bytes=12)
     oldest = _key("a")

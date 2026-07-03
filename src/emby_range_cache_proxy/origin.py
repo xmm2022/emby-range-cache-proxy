@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
-from aiohttp import ClientError, ClientSession, ClientTimeout
+from aiohttp import ClientError, ClientResponse, ClientSession, ClientTimeout
 
 from .models import ByteRange, SourceMetadata
 
@@ -70,6 +72,29 @@ class OriginClient:
         except ClientError:
             raise OriginError("origin range GET failed: client error") from None
 
+    @asynccontextmanager
+    async def open_range(self, url: str, byte_range: ByteRange, *, size: int) -> AsyncIterator[ClientResponse]:
+        if self._session is None:
+            raise RuntimeError("OriginClient must be used as an async context manager")
+        headers = {"Range": f"bytes={byte_range.start}-{byte_range.end}"}
+        response: ClientResponse | None = None
+        try:
+            response = await self._session.get(url, headers=headers, allow_redirects=True)
+            if response.status != 206:
+                raise OriginError(f"origin range GET failed: status={response.status}")
+            if not _content_range_matches(response.headers.get("Content-Range"), byte_range, size=size):
+                raise OriginError("origin range GET failed: invalid Content-Range")
+            yield response
+        except OriginError:
+            raise
+        except (asyncio.TimeoutError, TimeoutError):
+            raise OriginError("origin range GET failed: timeout") from None
+        except ClientError:
+            raise OriginError("origin range GET failed: client error") from None
+        finally:
+            if response is not None:
+                response.release()
+
 
 def _parse_content_length(value: str | None) -> int:
     if value is None:
@@ -81,3 +106,16 @@ def _parse_content_length(value: str | None) -> int:
     if length < 0:
         raise OriginError("origin provided invalid Content-Length")
     return length
+
+
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
+
+
+def _content_range_matches(value: str | None, byte_range: ByteRange, *, size: int) -> bool:
+    if value is None:
+        return False
+    match = _CONTENT_RANGE_RE.fullmatch(value)
+    if match is None:
+        return False
+    start, end, total = (int(group) for group in match.groups())
+    return start == byte_range.start and end == byte_range.end and total == size

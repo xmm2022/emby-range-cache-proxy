@@ -66,14 +66,20 @@ async def test_authorized_head_range_is_served_and_cached(aiohttp_client, tmp_pa
         assert request.headers["Range"] == "bytes=0-9"
         return web.Response(status=206, body=b"0123456789", headers={"Content-Range": "bytes 0-9/100"})
 
+    async def fallback(request):
+        return web.Response(body=b"fallback")
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": "100"})
+
     emby_app = web.Application()
     emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
-    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", lambda request: web.Response(body=b"fallback"))
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
     emby_server = await aiohttp_client(emby_app)
 
     origin_app = web.Application()
     origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
-    origin_app.router.add_head("/movie.mkv", lambda request: web.Response(headers={"Content-Length": "100"}))
+    origin_app.router.add_head("/movie.mkv", origin_head)
     origin_server = await aiohttp_client(origin_app)
 
     app = create_app(
@@ -96,6 +102,122 @@ async def test_authorized_head_range_is_served_and_cached(aiohttp_client, tmp_pa
     assert response.status == 206
     assert await response.read() == b"0123456789"
     assert origin_get_calls == 1
+
+
+async def test_authorized_head_range_returns_headers_without_origin_get(aiohttp_client, tmp_path):
+    origin_get_calls = 0
+    origin_head_calls = 0
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": 100,
+                        "Container": "mkv",
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        nonlocal origin_get_calls
+        origin_get_calls += 1
+        return web.Response(status=500, body=b"origin GET must not be called for HEAD")
+
+    async def origin_head(request):
+        nonlocal origin_head_calls
+        origin_head_calls += 1
+        return web.Response(headers={"Content-Length": "100", "ETag": "etag"})
+
+    async def fallback(request):
+        return web.Response(body=b"fallback")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    origin_app = web.Application()
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
+    origin_server = await aiohttp_client(origin_app)
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.head("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=0-9"})
+
+    assert response.status == 206
+    assert response.headers["Content-Range"] == "bytes 0-9/100"
+    assert response.headers["Content-Length"] == "10"
+    assert response.headers["ETag"] == "etag"
+    assert await response.read() == b""
+    assert origin_head_calls == 1
+    assert origin_get_calls == 0
+
+
+async def test_origin_ignoring_range_falls_back_before_proxy_response(aiohttp_client, tmp_path):
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": 100,
+                        "Container": "mkv",
+                    }
+                ]
+            }
+        )
+
+    async def fallback(request):
+        return web.Response(status=206, body=b"emby", headers={"Content-Range": "bytes 0-3/4"})
+
+    async def origin(request):
+        assert request.headers["Range"] == "bytes=0-3"
+        return web.Response(status=200, body=b"0123456789")
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": "100"})
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    origin_app = web.Application()
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
+    origin_server = await aiohttp_client(origin_app)
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=0-3"})
+
+    assert response.status == 206
+    assert response.headers["Content-Range"] == "bytes 0-3/4"
+    assert await response.read() == b"emby"
 
 
 async def test_matching_path_prefix_is_evaluated_after_authorization(aiohttp_client, tmp_path):
@@ -121,14 +243,20 @@ async def test_matching_path_prefix_is_evaluated_after_authorization(aiohttp_cli
     async def origin(request):
         return web.Response(status=206, body=b"0123456789", headers={"Content-Range": "bytes 0-9/100"})
 
+    async def fallback(request):
+        return web.Response(body=b"fallback")
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": "100"})
+
     emby_app = web.Application()
     emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
-    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", lambda request: web.Response(body=b"fallback"))
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
     emby_server = await aiohttp_client(emby_app)
 
     origin_app = web.Application()
     origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
-    origin_app.router.add_head("/movie.mkv", lambda request: web.Response(headers={"Content-Length": "100"}))
+    origin_app.router.add_head("/movie.mkv", origin_head)
     origin_server = await aiohttp_client(origin_app)
 
     app = create_app(
@@ -175,18 +303,20 @@ async def test_non_matching_path_prefix_falls_back_after_authorization(aiohttp_c
     async def fallback(request):
         return web.Response(status=206, body=b"fallback", headers={"Content-Range": "bytes 0-7/8"})
 
+    async def origin(request):
+        return web.Response(status=500, body=b"origin must not be read")
+
+    async def origin_head(request):
+        return web.Response(headers={"Content-Length": "100"})
+
     emby_app = web.Application()
     emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
     emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
     emby_server = await aiohttp_client(emby_app)
 
     origin_app = web.Application()
-    origin_app.router.add_get(
-        "/movie.mkv",
-        lambda request: web.Response(status=500, body=b"origin must not be read"),
-        allow_head=False,
-    )
-    origin_app.router.add_head("/movie.mkv", lambda request: web.Response(headers={"Content-Length": "100"}))
+    origin_app.router.add_get("/movie.mkv", origin, allow_head=False)
+    origin_app.router.add_head("/movie.mkv", origin_head)
     origin_server = await aiohttp_client(origin_app)
 
     app = create_app(

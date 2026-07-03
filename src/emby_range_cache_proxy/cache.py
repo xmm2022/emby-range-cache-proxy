@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 
 from .models import ByteRange, MediaSource, SourceMetadata
@@ -63,6 +64,9 @@ class HeadTailCache:
         os.replace(meta_tmp, meta)
         self._touch(path)
 
+    def stage_block(self, key: str, block_name: str, byte_range: ByteRange) -> "CacheBlockWriter":
+        return CacheBlockWriter(self, key, block_name, byte_range)
+
     def read_block(self, key: str, block_name: str, requested: ByteRange) -> bytes | None:
         path = self.block_path(key, block_name)
         meta = self.meta_path(key, block_name)
@@ -119,3 +123,52 @@ class HeadTailCache:
     def _remove_entry(self, path: Path, meta: Path) -> None:
         path.unlink(missing_ok=True)
         meta.unlink(missing_ok=True)
+
+
+class CacheBlockWriter:
+    def __init__(self, cache: HeadTailCache, key: str, block_name: str, byte_range: ByteRange) -> None:
+        self.cache = cache
+        self.key = key
+        self.block_name = cache._validate_block_name(block_name)
+        self.byte_range = byte_range
+        self.directory = cache._cache_dir(key)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.path = cache.block_path(key, block_name)
+        self.meta = cache.meta_path(key, block_name)
+        self.tmp = self.path.with_name(f"{self.path.name}.{uuid.uuid4().hex}.tmp")
+        self._handle = self.tmp.open("wb")
+        self.bytes_written = 0
+        self._closed = False
+
+    def write(self, data: bytes) -> None:
+        if self._closed:
+            raise ValueError("cache block writer is closed")
+        self._handle.write(data)
+        self.bytes_written += len(data)
+
+    def commit(self) -> None:
+        if self._closed:
+            raise ValueError("cache block writer is closed")
+        self._handle.close()
+        self._closed = True
+        if self.bytes_written != self.byte_range.length:
+            self.tmp.unlink(missing_ok=True)
+            raise ValueError("staged data length must match byte_range length")
+        meta_tmp = self.meta.with_name(f"{self.meta.name}.{uuid.uuid4().hex}.tmp")
+        meta_tmp.write_text(f"{self.byte_range.start}-{self.byte_range.end}\n")
+        os.replace(self.tmp, self.path)
+        os.replace(meta_tmp, self.meta)
+        self.cache._touch(self.path)
+
+    def abort(self) -> None:
+        if not self._closed:
+            self._handle.close()
+            self._closed = True
+        self.tmp.unlink(missing_ok=True)
+
+    def __enter__(self) -> "CacheBlockWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None or not self._closed:
+            self.abort()
