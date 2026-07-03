@@ -16,7 +16,7 @@ from .config import Config
 from .middle_cache import MiddleRangeCache
 from .models import ByteRange, MediaSource, RequestContext, SourceMetadata
 from .origin import OriginClient, OriginError
-from .prefetch import enqueue_prefetch_for_session
+from .prefetch import PrefetchWorker, enqueue_prefetch_for_session
 from .prewarm import PrewarmWorker
 from .ranges import content_range_header, plan_playback_range
 from .requests import parse_original_request
@@ -63,6 +63,8 @@ def create_app(config: Config) -> web.Application:
             app["session_recorder"] = SessionRecorder(phase2_store)
             app.cleanup_ctx.append(session_recorder_lifecycle)
             app.cleanup_ctx.append(session_planner_lifecycle)
+        if config.prefetch.enabled and config.middle_cache.enabled:
+            app.cleanup_ctx.append(prefetch_worker_lifecycle)
     if config.prewarm.enabled and config.prewarm_api_key:
         app.cleanup_ctx.append(prewarm_lifecycle)
     app.router.add_get("/healthz", healthz)
@@ -137,6 +139,29 @@ async def _session_planner_loop(
             LOGGER.warning("session planner scan failed: %s", type(error).__name__)
 
         await asyncio.sleep(config.session.observer_interval_seconds)
+
+
+async def prefetch_worker_lifecycle(app: web.Application) -> AsyncIterator[None]:
+    config: Config = app["config"]
+    worker = PrefetchWorker(config, app["phase2_store"], app["middle_cache"])
+    task = asyncio.create_task(_prefetch_worker_loop(config, worker))
+    app["prefetch_task"] = task
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def _prefetch_worker_loop(config: Config, worker: PrefetchWorker) -> None:
+    while True:
+        try:
+            await worker.run_once(now=time.time())
+        except Exception as error:
+            LOGGER.warning("prefetch worker failed: error_type=%s", type(error).__name__)
+        queue_depth = await asyncio.to_thread(worker.store.queue_depth)
+        await asyncio.sleep(config.prefetch.error_backoff_seconds if queue_depth == 0 else 1)
 
 
 async def prewarm_lifecycle(app: web.Application) -> AsyncIterator[None]:

@@ -101,6 +101,40 @@ async def test_prewarm_lifecycle_does_not_start_without_internal_key(aiohttp_cli
     await client.close()
 
 
+async def test_prefetch_lifecycle_starts_only_when_enabled(aiohttp_client, monkeypatch, tmp_path):
+    started = asyncio.Event()
+    calls = []
+
+    class FakePrefetchWorker:
+        def __init__(self, config, store, middle_cache):
+            calls.append(("init", config.prefetch.enabled))
+
+        async def run_once(self, *, now):
+            calls.append(("run_once", now > 0))
+            started.set()
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(app_module, "PrefetchWorker", FakePrefetchWorker)
+    app = create_app(
+        Config(
+            emby_base_url="http://emby",
+            fallback_base_url="http://emby",
+            cache_dir=str(tmp_path / "cache"),
+            session=SessionConfig(enabled=True),
+            middle_cache=MiddleCacheConfig(enabled=True),
+            prefetch=PrefetchConfig(enabled=True),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert calls[0] == ("init", True)
+    assert calls[1][0] == "run_once"
+
+    await client.close()
+
+
 async def test_session_planner_lifecycle_marks_idle_and_enqueues_prefetch(
     aiohttp_client, monkeypatch, tmp_path
 ):
