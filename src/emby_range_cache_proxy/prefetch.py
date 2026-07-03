@@ -91,6 +91,7 @@ class PrefetchWorker:
                 task.id,
                 error_class="RangeTooLarge",
                 now=now,
+                expected_attempts=task.attempts,
             )
             return PrefetchRunResult(skipped=1)
 
@@ -102,6 +103,7 @@ class PrefetchWorker:
                 error_class="SourceUnavailable",
                 now=now,
                 retry_after_seconds=self.config.prefetch.error_backoff_seconds,
+                expected_attempts=task.attempts,
             )
             return PrefetchRunResult(skipped=1)
 
@@ -150,6 +152,7 @@ class PrefetchWorker:
                 task.id,
                 now=now,
                 error_class="CancelledError",
+                expected_attempts=task.attempts,
             )
             raise
         except (
@@ -172,6 +175,7 @@ class PrefetchWorker:
                 error_class=error.__class__.__name__,
                 now=now,
                 retry_after_seconds=retry_after_seconds,
+                expected_attempts=task.attempts,
             )
             return PrefetchRunResult(failed=1)
 
@@ -190,7 +194,11 @@ class PrefetchWorker:
         )
         self.middle_cache.evict_expired(now=now)
         self.middle_cache.evict_lru_if_needed()
-        self.store.complete_prefetch_task(task.id, now=now)
+        self.store.complete_prefetch_task(
+            task.id,
+            now=now,
+            expected_attempts=task.attempts,
+        )
 
 
 def align_down(value: int, alignment: int) -> int:
