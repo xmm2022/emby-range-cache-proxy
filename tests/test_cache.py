@@ -24,6 +24,16 @@ def test_adaptive_sizes():
     assert adaptive_head_tail(80 * 1024**3) == (128 * 1024**2, 16 * 1024**2)
 
 
+def test_adaptive_sizes_at_exact_boundaries():
+    gib = 1024**3
+    mib = 1024**2
+
+    assert adaptive_head_tail(2 * gib) == (32 * mib, 8 * mib)
+    assert adaptive_head_tail(8 * gib) == (64 * mib, 8 * mib)
+    assert adaptive_head_tail(30 * gib) == (64 * mib, 8 * mib)
+    assert adaptive_head_tail(30 * gib + 1) == (128 * mib, 16 * mib)
+
+
 def test_cache_key_changes_when_size_changes():
     left = cache_key(_source(100), _metadata(100))
     right = cache_key(_source(101), _metadata(101))

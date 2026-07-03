@@ -16,7 +16,7 @@ def adaptive_head_tail(size: int) -> tuple[int, int]:
         return 16 * MIB, 4 * MIB
     if size < 8 * GIB:
         return 32 * MIB, 8 * MIB
-    if size < 30 * GIB:
+    if size <= 30 * GIB:
         return 64 * MIB, 8 * MIB
     return 128 * MIB, 16 * MIB
 
