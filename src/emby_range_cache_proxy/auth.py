@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
@@ -46,6 +47,8 @@ class EmbyAuthClient:
                     payload = await response.json()
                 except (ClientError, ValueError):
                     raise AuthorizationError("invalid PlaybackInfo response") from None
+        except (asyncio.TimeoutError, TimeoutError):
+            raise AuthorizationError("Emby authorization failed: timeout") from None
         except ClientError:
             raise AuthorizationError("Emby authorization failed: client error") from None
 
@@ -62,6 +65,8 @@ class EmbyAuthClient:
                 path = source.get("Path")
                 if not path:
                     raise AuthorizationError("media source path is empty")
+                if not isinstance(path, str):
+                    raise AuthorizationError("media source path is invalid")
                 return MediaSource(
                     item_id=ctx.item_id,
                     media_source_id=ctx.media_source_id,

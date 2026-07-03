@@ -1,3 +1,5 @@
+import asyncio
+
 from aiohttp import web
 import pytest
 
@@ -66,6 +68,25 @@ async def test_authorize_rejects_non_json_without_leaking_token(aiohttp_client):
     assert "api_key" not in message
 
 
+async def test_authorize_wraps_timeout_without_leaking_token(aiohttp_client):
+    async def playback_info(request):
+        await asyncio.sleep(0.05)
+        return web.json_response({"MediaSources": []})
+
+    app = web.Application()
+    app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    server = await aiohttp_client(app)
+
+    async with EmbyAuthClient(str(server.make_url("")), timeout_seconds=0.001) as client:
+        with pytest.raises(AuthorizationError, match="Emby authorization failed: timeout") as exc_info:
+            await client.authorize(_ctx())
+
+    message = str(exc_info.value)
+    assert "api_key" not in message
+    assert "user-token" not in message
+    assert str(server.make_url("")) not in message
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -128,6 +149,30 @@ async def test_authorize_rejects_missing_media_source_path(aiohttp_client):
 
     async with EmbyAuthClient(str(server.make_url(""))) as client:
         with pytest.raises(AuthorizationError, match="media source path is empty"):
+            await client.authorize(_ctx())
+
+
+async def test_authorize_rejects_non_string_media_source_path(aiohttp_client):
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "mediasource_151357",
+                        "Path": 123,
+                        "Protocol": "Http",
+                        "Size": 88513978283,
+                    }
+                ]
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    server = await aiohttp_client(app)
+
+    async with EmbyAuthClient(str(server.make_url(""))) as client:
+        with pytest.raises(AuthorizationError, match="media source path is invalid"):
             await client.authorize(_ctx())
 
 
