@@ -17,7 +17,7 @@ def parse_original_request(method: str, raw_path: str, headers: Mapping[str, str
     match = _ORIGINAL_RE.fullmatch(parsed.path)
     if not match:
         return None
-    query = parse_qs(parsed.query, keep_blank_values=False)
+    query = parse_qs(parsed.query, keep_blank_values=True)
     if _has_duplicate_safety_param(query):
         return None
     media_source_id = _first(query, "MediaSourceId")

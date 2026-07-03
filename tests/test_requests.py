@@ -77,6 +77,29 @@ def test_reject_duplicate_optional_safety_query_params():
         )
         is None
     )
+
+
+def test_reject_blank_duplicate_safety_query_params():
+    assert parse_original_request(
+        "GET",
+        "/emby/videos/1/original.mkv?MediaSourceId=m&MediaSourceId=&api_key=t",
+        {},
+    ) is None
+    assert parse_original_request(
+        "GET",
+        "/emby/videos/1/original.mkv?MediaSourceId=m&api_key=t&api_key=",
+        {},
+    ) is None
+    assert parse_original_request(
+        "GET",
+        "/emby/videos/1/original.mkv?MediaSourceId=m&api_key=t&PlaySessionId=p&PlaySessionId=",
+        {},
+    ) is None
+    assert parse_original_request(
+        "GET",
+        "/emby/videos/1/original.mkv?MediaSourceId=m&api_key=t&DeviceId=d&DeviceId=",
+        {},
+    ) is None
     assert (
         parse_original_request(
             "GET",
