@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from urllib.parse import urlsplit
@@ -11,8 +13,11 @@ from .cache import HeadTailCache, adaptive_head_tail, cache_key
 from .config import Config
 from .models import ByteRange, MediaSource, SourceMetadata
 from .origin import OriginClient, OriginError
+from .prewarm import PrewarmWorker
 from .ranges import content_range_header, parse_range_header
 from .requests import parse_original_request
+
+LOGGER = logging.getLogger(__name__)
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -30,9 +35,33 @@ def create_app(config: Config) -> web.Application:
     app = web.Application()
     app["config"] = config
     app["cache"] = HeadTailCache(config.cache_dir, max_bytes=config.cache.max_bytes)
+    if config.prewarm.enabled and config.prewarm_api_key:
+        app.cleanup_ctx.append(prewarm_lifecycle)
     app.router.add_get("/healthz", healthz)
     app.router.add_route("*", "/{tail:.*}", proxy_handler)
     return app
+
+
+async def prewarm_lifecycle(app: web.Application) -> AsyncIterator[None]:
+    config: Config = app["config"]
+    task = asyncio.create_task(_prewarm_loop(config))
+    app["prewarm_task"] = task
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def _prewarm_loop(config: Config) -> None:
+    worker = PrewarmWorker(config)
+    while True:
+        try:
+            await worker.run_once()
+        except Exception as error:
+            LOGGER.warning("prewarm scan failed: %s", type(error).__name__)
+        await asyncio.sleep(config.prewarm.interval_seconds)
 
 
 async def healthz(request: web.Request) -> web.Response:

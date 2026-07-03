@@ -1,9 +1,11 @@
+import asyncio
+
 from aiohttp import web
 
 import emby_range_cache_proxy.app as app_module
 from emby_range_cache_proxy.auth import AuthorizationError
 from emby_range_cache_proxy.app import create_app
-from emby_range_cache_proxy.config import Config, RolloutConfig
+from emby_range_cache_proxy.config import Config, PrewarmConfig, RolloutConfig
 
 
 async def test_healthz(aiohttp_client, tmp_path):
@@ -14,6 +16,64 @@ async def test_healthz(aiohttp_client, tmp_path):
 
     assert response.status == 200
     assert await response.text() == "ok\n"
+
+
+async def test_prewarm_lifecycle_starts_and_cancels_background_task(aiohttp_client, monkeypatch, tmp_path):
+    started = asyncio.Event()
+    calls = []
+
+    class FakePrewarmWorker:
+        def __init__(self, config):
+            calls.append(("init", config))
+
+        async def run_once(self):
+            calls.append(("run_once", None))
+            started.set()
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(app_module, "PrewarmWorker", FakePrewarmWorker)
+    app = create_app(
+        Config(
+            emby_base_url="http://emby",
+            fallback_base_url="http://emby",
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal",
+            prewarm=PrewarmConfig(enabled=True, interval_seconds=60),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task = app["prewarm_task"]
+
+    assert calls == [("init", app["config"]), ("run_once", None)]
+    assert not task.done()
+
+    await client.close()
+
+    assert task.cancelled()
+
+
+async def test_prewarm_lifecycle_does_not_start_without_internal_key(aiohttp_client, monkeypatch, tmp_path):
+    class FakePrewarmWorker:
+        def __init__(self, config):
+            raise AssertionError("prewarm worker must not start without internal key")
+
+    monkeypatch.setattr(app_module, "PrewarmWorker", FakePrewarmWorker)
+    app = create_app(
+        Config(
+            emby_base_url="http://emby",
+            fallback_base_url="http://emby",
+            cache_dir=str(tmp_path),
+            prewarm_api_key=None,
+            prewarm=PrewarmConfig(enabled=True, interval_seconds=60),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    assert "prewarm_task" not in app
+
+    await client.close()
 
 
 async def test_out_of_scope_falls_back_to_emby(aiohttp_client, tmp_path):

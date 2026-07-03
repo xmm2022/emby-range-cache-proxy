@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -54,3 +56,16 @@ def test_main_runs_app_from_config(monkeypatch):
         "host": "127.0.0.1",
         "port": 18180,
     }
+
+
+def test_module_execution_shows_argparse_help():
+    result = subprocess.run(
+        [sys.executable, "-m", "emby_range_cache_proxy.cli", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "usage:" in result.stdout
+    assert "--config" in result.stdout

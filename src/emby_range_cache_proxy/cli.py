@@ -19,3 +19,7 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config(args.config)
     web.run_app(create_app(config), host=config.listen_host, port=config.listen_port)
+
+
+if __name__ == "__main__":
+    main()

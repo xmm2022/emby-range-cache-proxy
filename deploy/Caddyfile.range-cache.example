@@ -1,20 +1,20 @@
 a.inemby.pp.ua {
-    @emby_original {
-        path_regexp emby_original ^/emby/videos/[0-9]+/original\.(mkv|mp4|ts|mov|avi)$
-        query MediaSourceId=*
-    }
+	@emby_original {
+		path_regexp emby_original ^/emby/videos/[0-9]+/original\.(mkv|mp4|ts|mov|avi)$
+		query MediaSourceId=*
+	}
 
-    handle @emby_original {
-        reverse_proxy 127.0.0.1:18180 127.0.0.1:8096 {
-            lb_policy first
-            lb_try_duration 2s
-            lb_try_interval 100ms
-            fail_duration 10s
-            flush_interval -1
-        }
-    }
+	handle @emby_original {
+		reverse_proxy 127.0.0.1:18180 127.0.0.1:8096 {
+			lb_policy first
+			lb_try_duration 2s
+			lb_try_interval 100ms
+			fail_duration 10s
+			flush_interval -1
+		}
+	}
 
-    handle {
-        reverse_proxy 127.0.0.1:8096
-    }
+	handle {
+		reverse_proxy 127.0.0.1:8096
+	}
 }
