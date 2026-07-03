@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from aiohttp import ClientError, ClientSession, web
 
@@ -71,13 +71,14 @@ async def healthz(request: web.Request) -> web.Response:
 async def proxy_handler(request: web.Request) -> web.StreamResponse:
     config: Config = request.app["config"]
     cache: HeadTailCache = request.app["cache"]
+    if config.prewarm_api_key and _request_contains_internal_key(request, config.prewarm_api_key):
+        _log_decision("deny", "internal_key_used_for_playback", request)
+        raise web.HTTPForbidden(text="forbidden\n") from None
+
     ctx = parse_original_request(request.method, request.raw_path, request.headers)
     if ctx is None:
         _log_decision("fallback", "not_eligible", request)
         return await stream_fallback(request, config)
-    if config.prewarm_api_key and ctx.token == config.prewarm_api_key:
-        _log_decision("deny", "internal_key_used_for_playback", request, ctx=ctx)
-        raise web.HTTPForbidden(text="forbidden\n") from None
     if not _pre_authorization_rollout_scope(config, item_id=ctx.item_id, media_source_id=ctx.media_source_id):
         _log_decision("fallback", "not_eligible", request, ctx=ctx)
         return await stream_fallback(request, config)
@@ -191,6 +192,17 @@ async def _write_eof_safely(response: web.StreamResponse) -> None:
 def _is_http_source(source: MediaSource) -> bool:
     scheme = urlsplit(source.path).scheme.lower()
     return scheme in {"http", "https"}
+
+
+def _request_contains_internal_key(request: web.Request, internal_key: str) -> bool:
+    parsed = urlsplit(request.raw_path)
+    for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if name.lower() in {"api_key", "token", "x-emby-token"} and value == internal_key:
+            return True
+    return any(
+        name.lower() == "x-emby-token" and value == internal_key
+        for name, value in request.headers.items()
+    )
 
 
 def _log_decision(

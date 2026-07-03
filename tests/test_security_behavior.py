@@ -188,6 +188,58 @@ async def test_internal_prewarm_key_is_rejected_before_rollout_fallback(aiohttp_
     assert fallback_hits == 0
 
 
+@pytest.mark.parametrize(
+    ("path", "headers"),
+    [
+        (
+            "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=internal-secret&api_key=user-token",
+            {"Range": "bytes=0-3"},
+        ),
+        (
+            "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=user-token",
+            {"Range": "bytes=0-3", "X-Emby-Token": "internal-secret"},
+        ),
+    ],
+)
+async def test_internal_prewarm_key_is_rejected_across_all_auth_carriers(
+    aiohttp_client, path, headers, tmp_path
+):
+    fallback_hits = 0
+    playback_info_hits = 0
+
+    async def playback_info(request):
+        nonlocal playback_info_hits
+        playback_info_hits += 1
+        return web.json_response({"MediaSources": []})
+
+    async def fallback(request):
+        nonlocal fallback_hits
+        fallback_hits += 1
+        return web.Response(status=200, body=b"fallback")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal-secret",
+            rollout=RolloutConfig(enabled=False),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.get(path, headers=headers)
+
+    assert response.status == 403
+    assert await response.text() == "forbidden\n"
+    assert playback_info_hits == 0
+    assert fallback_hits == 0
+
+
 async def test_decision_logs_redact_sensitive_query_and_header_values(aiohttp_client, caplog, tmp_path):
     async def fallback(request):
         return web.Response(body=b"fallback")
