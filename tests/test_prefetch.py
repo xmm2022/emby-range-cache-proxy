@@ -41,6 +41,39 @@ def test_plan_middle_ranges_deduplicates_using_queued_until():
     ]
 
 
+def test_plan_middle_ranges_queued_until_non_boundary_does_not_repeat_bytes():
+    ranges = plan_middle_ranges(
+        media_size=1000,
+        head_size=100,
+        tail_size=100,
+        max_observed_offset=350,
+        queued_until=550,
+        prefetch=PrefetchConfig(window_bytes=512, resume_overlap_bytes=50, max_session_bytes=512),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+    )
+
+    assert ranges
+    assert all(byte_range.start > 550 for byte_range in ranges)
+    assert ranges[0] == ByteRange(576, 639)
+
+
+def test_plan_middle_ranges_caps_by_max_session_bytes():
+    ranges = plan_middle_ranges(
+        media_size=1000,
+        head_size=100,
+        tail_size=100,
+        max_observed_offset=350,
+        queued_until=None,
+        prefetch=PrefetchConfig(window_bytes=512, resume_overlap_bytes=50, max_session_bytes=100),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+    )
+
+    assert ranges == [
+        ByteRange(256, 319),
+        ByteRange(320, 355),
+    ]
+
+
 def test_plan_middle_ranges_returns_partial_final_segment():
     ranges = plan_middle_ranges(
         media_size=1000,
