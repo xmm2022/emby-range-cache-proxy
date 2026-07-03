@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-SENSITIVE_QUERY_KEYS = {"api_key", "PlaySessionId", "DeviceId", "X-Emby-Token", "token"}
+SENSITIVE_QUERY_KEYS = {"api_key", "playsessionid", "deviceid", "x-emby-token", "token"}
 
 
 def stable_token_hash(token: str) -> str:
@@ -14,7 +14,7 @@ def redact_url(url: str) -> str:
     parsed = urlsplit(url)
     redacted_pairs: list[tuple[str, str]] = []
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if key in SENSITIVE_QUERY_KEYS:
+        if key.lower() in SENSITIVE_QUERY_KEYS:
             redacted_pairs.append((key, "[REDACTED]"))
         else:
             redacted_pairs.append((key, value))
