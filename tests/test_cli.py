@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +57,22 @@ def test_main_runs_app_from_config(monkeypatch):
         "port": 18180,
         "access_log": None,
     }
+
+
+def test_main_configures_info_logging(monkeypatch):
+    calls = {}
+    config = SimpleNamespace(listen_host="127.0.0.1", listen_port=18180)
+
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(cli, "create_app", lambda loaded_config: object())
+    monkeypatch.setattr(cli.web, "run_app", lambda built_app, **kwargs: None)
+    monkeypatch.setattr(cli.logging, "basicConfig", lambda **kwargs: calls.update(kwargs))
+    monkeypatch.setattr("sys.argv", ["emby-range-cache-proxy", "--config", "config.example.json"])
+
+    cli.main()
+
+    assert calls["level"] == logging.INFO
+    assert "%(levelname)s" in calls["format"]
 
 
 def test_module_execution_shows_argparse_help():

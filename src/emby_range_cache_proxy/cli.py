@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 
 from aiohttp import web
 
@@ -17,6 +18,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     config = load_config(args.config)
     web.run_app(create_app(config), host=config.listen_host, port=config.listen_port, access_log=None)
 

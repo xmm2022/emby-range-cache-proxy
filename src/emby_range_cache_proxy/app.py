@@ -109,7 +109,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         return await stream_fallback(request, config)
 
     try:
-        return await serve_authorized_range(request, config, cache, source)
+        return await serve_authorized_range(request, config, cache, source, ctx)
     except (OriginError, ValueError, ClientError, TimeoutError, OSError) as error:
         _log_decision("fallback", "proxy_error", request, ctx=ctx, error=error, level=logging.WARNING)
         return await stream_fallback(request, config)
@@ -120,6 +120,7 @@ async def serve_authorized_range(
     config: Config,
     cache: HeadTailCache,
     source: MediaSource,
+    ctx: RequestContext,
 ) -> web.StreamResponse:
     async with OriginClient(chunk_bytes=config.cache.chunk_bytes) as origin:
         metadata = await origin.head(source.path)
@@ -137,12 +138,22 @@ async def serve_authorized_range(
         headers = _range_response_headers(byte_range, metadata, include_content_range=status == 206)
 
         if request.method == "HEAD":
+            _log_proxy_result("head", request, ctx=ctx, byte_range=byte_range, metadata=metadata)
             return web.Response(status=status, headers=headers)
 
         if cache_block is not None:
             block_name, block_range = cache_block
             cached = cache.read_block(key, block_name, byte_range)
             if cached is not None:
+                _log_proxy_result(
+                    "cache_hit",
+                    request,
+                    ctx=ctx,
+                    byte_range=byte_range,
+                    metadata=metadata,
+                    block_name=block_name,
+                    block_range=block_range,
+                )
                 return web.Response(status=status, body=cached, headers=headers)
             build_lock = await _cache_build_lock(request.app, key, block_name)
             if build_lock.locked():
@@ -150,6 +161,15 @@ async def serve_authorized_range(
                     await asyncio.wait_for(_wait_for_cache_build(build_lock), config.cache.build_wait_seconds)
                 cached = cache.read_block(key, block_name, byte_range)
                 if cached is not None:
+                    _log_proxy_result(
+                        "cache_hit",
+                        request,
+                        ctx=ctx,
+                        byte_range=byte_range,
+                        metadata=metadata,
+                        block_name=block_name,
+                        block_range=block_range,
+                    )
                     return web.Response(status=status, body=cached, headers=headers)
                 if build_lock.locked():
                     block_name = None
@@ -160,12 +180,30 @@ async def serve_authorized_range(
                     cached = cache.read_block(key, block_name, byte_range)
                     if cached is not None:
                         build_lock.release()
+                        _log_proxy_result(
+                            "cache_hit",
+                            request,
+                            ctx=ctx,
+                            byte_range=byte_range,
+                            metadata=metadata,
+                            block_name=block_name,
+                            block_range=block_range,
+                        )
                         return web.Response(status=status, body=cached, headers=headers)
             else:
                 await build_lock.acquire()
                 cached = cache.read_block(key, block_name, byte_range)
                 if cached is not None:
                     build_lock.release()
+                    _log_proxy_result(
+                        "cache_hit",
+                        request,
+                        ctx=ctx,
+                        byte_range=byte_range,
+                        metadata=metadata,
+                        block_name=block_name,
+                        block_range=block_range,
+                    )
                     return web.Response(status=status, body=cached, headers=headers)
         else:
             block_name = None
@@ -210,10 +248,21 @@ async def serve_authorized_range(
                     try:
                         writer.commit()
                         cache.evict_if_needed()
+                        _log_proxy_result(
+                            "cache_build",
+                            request,
+                            ctx=ctx,
+                            byte_range=byte_range,
+                            metadata=metadata,
+                            block_name=block_name,
+                            block_range=block_range,
+                        )
                     except (ValueError, OSError):
                         writer.abort()
                         if not response_done:
                             response.force_close()
+                else:
+                    _log_proxy_result("origin_stream", request, ctx=ctx, byte_range=byte_range, metadata=metadata)
         finally:
             if build_lock is not None and build_lock.locked():
                 build_lock.release()
@@ -327,6 +376,36 @@ def _log_decision(
         ctx.media_source_id,
         request.path,
         type(error).__name__,
+    )
+
+
+def _log_proxy_result(
+    result: str,
+    request: web.Request,
+    *,
+    ctx: RequestContext,
+    byte_range: ByteRange,
+    metadata: SourceMetadata,
+    block_name: str | None = None,
+    block_range: ByteRange | None = None,
+) -> None:
+    request_range = request.headers.get("Range", "none")
+    block = block_name or "none"
+    block_value = "none" if block_range is None else f"{block_range.start}-{block_range.end}"
+    LOGGER.info(
+        "proxy result=%s item_id=%s media_source_id=%s method=%s path=%s "
+        "request_range=%s planned_range=%s-%s total_size=%s block=%s block_range=%s",
+        result,
+        ctx.item_id,
+        ctx.media_source_id,
+        request.method,
+        request.path,
+        request_range,
+        byte_range.start,
+        byte_range.end,
+        metadata.size,
+        block,
+        block_value,
     )
 
 
