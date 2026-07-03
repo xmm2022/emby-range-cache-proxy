@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from urllib.parse import parse_qsl, urlsplit
@@ -122,6 +123,7 @@ async def serve_authorized_range(
     source: MediaSource,
     ctx: RequestContext,
 ) -> web.StreamResponse:
+    started_at = time.monotonic()
     async with OriginClient(chunk_bytes=config.cache.chunk_bytes) as origin:
         metadata = await origin.head(source.path)
         head_size, tail_size = adaptive_head_tail(metadata.size)
@@ -138,39 +140,43 @@ async def serve_authorized_range(
         headers = _range_response_headers(byte_range, metadata, include_content_range=status == 206)
 
         if request.method == "HEAD":
-            _log_proxy_result("head", request, ctx=ctx, byte_range=byte_range, metadata=metadata)
+            _log_proxy_result("head", request, ctx=ctx, byte_range=byte_range, metadata=metadata, started_at=started_at)
             return web.Response(status=status, headers=headers)
 
         if cache_block is not None:
             block_name, block_range = cache_block
             cached = cache.read_block(key, block_name, byte_range)
             if cached is not None:
-                _log_proxy_result(
-                    "cache_hit",
+                return await _serve_cached_response(
                     request,
+                    status=status,
+                    headers=headers,
+                    cached=cached,
                     ctx=ctx,
                     byte_range=byte_range,
                     metadata=metadata,
+                    started_at=started_at,
                     block_name=block_name,
                     block_range=block_range,
                 )
-                return web.Response(status=status, body=cached, headers=headers)
             build_lock = await _cache_build_lock(request.app, key, block_name)
             if build_lock.locked():
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(_wait_for_cache_build(build_lock), config.cache.build_wait_seconds)
                 cached = cache.read_block(key, block_name, byte_range)
                 if cached is not None:
-                    _log_proxy_result(
-                        "cache_hit",
+                    return await _serve_cached_response(
                         request,
+                        status=status,
+                        headers=headers,
+                        cached=cached,
                         ctx=ctx,
                         byte_range=byte_range,
                         metadata=metadata,
+                        started_at=started_at,
                         block_name=block_name,
                         block_range=block_range,
                     )
-                    return web.Response(status=status, body=cached, headers=headers)
                 if build_lock.locked():
                     block_name = None
                     block_range = byte_range
@@ -180,31 +186,35 @@ async def serve_authorized_range(
                     cached = cache.read_block(key, block_name, byte_range)
                     if cached is not None:
                         build_lock.release()
-                        _log_proxy_result(
-                            "cache_hit",
+                        return await _serve_cached_response(
                             request,
+                            status=status,
+                            headers=headers,
+                            cached=cached,
                             ctx=ctx,
                             byte_range=byte_range,
                             metadata=metadata,
+                            started_at=started_at,
                             block_name=block_name,
                             block_range=block_range,
                         )
-                        return web.Response(status=status, body=cached, headers=headers)
             else:
                 await build_lock.acquire()
                 cached = cache.read_block(key, block_name, byte_range)
                 if cached is not None:
                     build_lock.release()
-                    _log_proxy_result(
-                        "cache_hit",
+                    return await _serve_cached_response(
                         request,
+                        status=status,
+                        headers=headers,
+                        cached=cached,
                         ctx=ctx,
                         byte_range=byte_range,
                         metadata=metadata,
+                        started_at=started_at,
                         block_name=block_name,
                         block_range=block_range,
                     )
-                    return web.Response(status=status, body=cached, headers=headers)
         else:
             block_name = None
             block_range = byte_range
@@ -218,12 +228,14 @@ async def serve_authorized_range(
                 upstream_offset = block_range.start
                 response_bytes_written = 0
                 response_done = False
+                origin_read_bytes = 0
                 try:
                     async for chunk in upstream.content.iter_chunked(config.cache.chunk_bytes):
                         if chunk:
                             chunk_start = upstream_offset
                             chunk_end = upstream_offset + len(chunk) - 1
                             upstream_offset += len(chunk)
+                            origin_read_bytes += len(chunk)
                             if writer is not None:
                                 writer.write(chunk)
                             if not response_done:
@@ -254,15 +266,29 @@ async def serve_authorized_range(
                             ctx=ctx,
                             byte_range=byte_range,
                             metadata=metadata,
+                            started_at=started_at,
                             block_name=block_name,
                             block_range=block_range,
+                            served_bytes=response_bytes_written,
+                            cache_read_bytes=0,
+                            origin_read_bytes=origin_read_bytes,
                         )
                     except (ValueError, OSError):
                         writer.abort()
                         if not response_done:
                             response.force_close()
                 else:
-                    _log_proxy_result("origin_stream", request, ctx=ctx, byte_range=byte_range, metadata=metadata)
+                    _log_proxy_result(
+                        "origin_stream",
+                        request,
+                        ctx=ctx,
+                        byte_range=byte_range,
+                        metadata=metadata,
+                        started_at=started_at,
+                        served_bytes=response_bytes_written,
+                        cache_read_bytes=0,
+                        origin_read_bytes=origin_read_bytes,
+                    )
         finally:
             if build_lock is not None and build_lock.locked():
                 build_lock.release()
@@ -270,6 +296,42 @@ async def serve_authorized_range(
         if not response_done:
             await _write_eof_safely(response)
         return response
+
+
+async def _serve_cached_response(
+    request: web.Request,
+    *,
+    status: int,
+    headers: dict[str, str],
+    cached: bytes,
+    ctx: RequestContext,
+    byte_range: ByteRange,
+    metadata: SourceMetadata,
+    started_at: float,
+    block_name: str,
+    block_range: ByteRange,
+) -> web.StreamResponse:
+    response = web.StreamResponse(status=status, headers=headers)
+    await response.prepare(request)
+    served_bytes = 0
+    with suppress(ConnectionError, RuntimeError, OSError):
+        await response.write(cached)
+        served_bytes = len(cached)
+    await _write_eof_safely(response)
+    _log_proxy_result(
+        "cache_hit",
+        request,
+        ctx=ctx,
+        byte_range=byte_range,
+        metadata=metadata,
+        started_at=started_at,
+        block_name=block_name,
+        block_range=block_range,
+        served_bytes=served_bytes,
+        cache_read_bytes=len(cached),
+        origin_read_bytes=0,
+    )
+    return response
 
 
 async def stream_fallback(request: web.Request, config: Config) -> web.StreamResponse:
@@ -386,15 +448,21 @@ def _log_proxy_result(
     ctx: RequestContext,
     byte_range: ByteRange,
     metadata: SourceMetadata,
+    started_at: float,
     block_name: str | None = None,
     block_range: ByteRange | None = None,
+    served_bytes: int = 0,
+    cache_read_bytes: int = 0,
+    origin_read_bytes: int = 0,
 ) -> None:
     request_range = request.headers.get("Range", "none")
     block = block_name or "none"
     block_value = "none" if block_range is None else f"{block_range.start}-{block_range.end}"
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
     LOGGER.info(
         "proxy result=%s item_id=%s media_source_id=%s method=%s path=%s "
-        "request_range=%s planned_range=%s-%s total_size=%s block=%s block_range=%s",
+        "request_range=%s planned_range=%s-%s total_size=%s block=%s block_range=%s "
+        "served_bytes=%s cache_read_bytes=%s origin_read_bytes=%s elapsed_ms=%s",
         result,
         ctx.item_id,
         ctx.media_source_id,
@@ -406,6 +474,10 @@ def _log_proxy_result(
         metadata.size,
         block,
         block_value,
+        served_bytes,
+        cache_read_bytes,
+        origin_read_bytes,
+        elapsed_ms,
     )
 
 

@@ -379,6 +379,22 @@ async def test_cache_build_and_hit_are_logged_without_token(
     assert any("proxy result=cache_build" in message and "block=head" in message for message in messages)
     assert any("proxy result=cache_hit" in message and "block=head" in message for message in messages)
     assert any("request_range=bytes=0-3" in message and "planned_range=0-3" in message for message in messages)
+    assert any(
+        "proxy result=cache_build" in message
+        and "served_bytes=4" in message
+        and "cache_read_bytes=0" in message
+        and "origin_read_bytes=16" in message
+        and "elapsed_ms=" in message
+        for message in messages
+    )
+    assert any(
+        "proxy result=cache_hit" in message
+        and "served_bytes=4" in message
+        and "cache_read_bytes=4" in message
+        and "origin_read_bytes=0" in message
+        and "elapsed_ms=" in message
+        for message in messages
+    )
     assert not any("secret-token" in message for message in messages)
     assert origin_get_calls == 1
 
