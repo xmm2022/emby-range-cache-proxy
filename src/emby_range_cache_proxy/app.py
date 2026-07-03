@@ -5,6 +5,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
@@ -12,12 +13,15 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from .auth import AuthUnavailable, AuthorizationError, EmbyAuthClient
 from .cache import CacheReadError, HeadTailCache, adaptive_head_tail, cache_key
 from .config import Config
+from .middle_cache import MiddleRangeCache
 from .models import ByteRange, MediaSource, RequestContext, SourceMetadata
 from .origin import OriginClient, OriginError
 from .prewarm import PrewarmWorker
 from .ranges import content_range_header, plan_playback_range
 from .requests import parse_original_request
+from .session import SessionRecorder
 from .sources import resolve_media_source
+from .state import SessionStateStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,11 +43,37 @@ def create_app(config: Config) -> web.Application:
     app["cache"] = HeadTailCache(config.cache_dir, max_bytes=config.cache.max_bytes)
     app["cache_build_locks"] = {}
     app["cache_build_locks_guard"] = asyncio.Lock()
+    if config.session.enabled or config.middle_cache.enabled or config.prefetch.enabled:
+        state_path = (
+            Path(config.session.state_db)
+            if config.session.state_db
+            else Path(config.cache_dir) / "state" / "phase2.sqlite3"
+        )
+        phase2_store = SessionStateStore(state_path)
+        app["phase2_store"] = phase2_store
+        app["middle_cache"] = MiddleRangeCache(
+            config.cache_dir,
+            phase2_store,
+            max_bytes=config.middle_cache.max_bytes,
+            ttl_seconds=config.middle_cache.ttl_seconds,
+        )
+        if config.session.enabled:
+            app["session_recorder"] = SessionRecorder(phase2_store)
+            app.cleanup_ctx.append(session_recorder_lifecycle)
     if config.prewarm.enabled and config.prewarm_api_key:
         app.cleanup_ctx.append(prewarm_lifecycle)
     app.router.add_get("/healthz", healthz)
     app.router.add_route("*", "/{tail:.*}", proxy_handler)
     return app
+
+
+async def session_recorder_lifecycle(app: web.Application) -> AsyncIterator[None]:
+    recorder: SessionRecorder = app["session_recorder"]
+    recorder.start()
+    try:
+        yield
+    finally:
+        await recorder.stop()
 
 
 async def prewarm_lifecycle(app: web.Application) -> AsyncIterator[None]:
@@ -136,6 +166,9 @@ async def serve_authorized_range(
             open_head_response_bytes=config.cache.open_head_response_bytes,
         )
         key = cache_key(source, metadata)
+        recorder: SessionRecorder | None = request.app.get("session_recorder")
+        if recorder is not None:
+            recorder.record_nowait(ctx, key, metadata, byte_range, observed_at=time.time())
         cache_block = _cache_block_for_request(byte_range, metadata, head_size=head_size, tail_size=tail_size)
         status = 206 if request.headers.get("Range") else 200
         headers = _range_response_headers(byte_range, metadata, include_content_range=status == 206)
@@ -220,6 +253,31 @@ async def serve_authorized_range(
             block_name = None
             block_range = byte_range
             build_lock = None
+
+        middle_cache: MiddleRangeCache | None = request.app.get("middle_cache")
+        if config.middle_cache.enabled and middle_cache is not None:
+            cached_chunks = middle_cache.iter_block(
+                key,
+                byte_range,
+                chunk_bytes=config.cache.chunk_bytes,
+                now=time.time(),
+            )
+            if cached_chunks is not None:
+                if build_lock is not None and build_lock.locked():
+                    build_lock.release()
+                    build_lock = None
+                return await _serve_cached_response(
+                    request,
+                    status=status,
+                    headers=headers,
+                    cached_chunks=cached_chunks,
+                    ctx=ctx,
+                    byte_range=byte_range,
+                    metadata=metadata,
+                    started_at=started_at,
+                    block_name="middle",
+                    block_range=byte_range,
+                )
 
         response = web.StreamResponse(status=status, headers=headers)
         try:
