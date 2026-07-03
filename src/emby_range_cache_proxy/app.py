@@ -99,44 +99,42 @@ async def _session_planner_loop(
     observer: EmbySessionObserver,
 ) -> None:
     while True:
-        now = time.time()
-        stopped = []
-        if config.session.observer_enabled:
-            observer_result = await observer.run_once(now=now)
-            stopped = list(observer_result.stopped_sessions)
+        try:
+            now = time.time()
+            if config.session.observer_enabled:
+                await observer.run_once(now=now)
 
-        idle = await asyncio.to_thread(
-            store.mark_idle_sessions,
-            now=now,
-            idle_seconds=config.session.idle_seconds,
-        )
-        await asyncio.to_thread(
-            store.expire_old_sessions,
-            now=now,
-            expire_seconds=config.session.expire_seconds,
-        )
+            await asyncio.to_thread(
+                store.mark_idle_sessions,
+                now=now,
+                idle_seconds=config.session.idle_seconds,
+            )
+            await asyncio.to_thread(
+                store.expire_old_sessions,
+                now=now,
+                expire_seconds=config.session.expire_seconds,
+            )
 
-        if config.prefetch.enabled and config.middle_cache.enabled:
-            for session in idle:
-                await asyncio.to_thread(
-                    enqueue_prefetch_for_session,
-                    store,
-                    session,
-                    prefetch=config.prefetch,
-                    middle_cache=config.middle_cache,
-                    now=now,
-                    priority=10,
-                )
-            for session in stopped:
-                await asyncio.to_thread(
-                    enqueue_prefetch_for_session,
-                    store,
-                    session,
-                    prefetch=config.prefetch,
-                    middle_cache=config.middle_cache,
-                    now=now,
-                    priority=20,
-                )
+            if config.prefetch.enabled and config.middle_cache.enabled:
+                candidates = await asyncio.to_thread(store.prefetch_candidate_sessions)
+                candidates_by_hash = {
+                    session.session_hash: session for session in candidates
+                }
+                for session in candidates_by_hash.values():
+                    priority = 20 if session.status == "stopped" else 10
+                    await asyncio.to_thread(
+                        enqueue_prefetch_for_session,
+                        store,
+                        session,
+                        prefetch=config.prefetch,
+                        middle_cache=config.middle_cache,
+                        now=now,
+                        priority=priority,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.warning("session planner scan failed: %s", type(error).__name__)
 
         await asyncio.sleep(config.session.observer_interval_seconds)
 

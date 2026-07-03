@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from contextlib import suppress
 
 from aiohttp import ClientTimeout
 from aiohttp import web
@@ -155,6 +156,149 @@ async def test_session_planner_lifecycle_marks_idle_and_enqueues_prefetch(
         assert session.queued_until == 447
     finally:
         await client.close()
+
+
+async def test_session_planner_loop_logs_enqueue_error_and_continues(
+    caplog, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    original_enqueue = app_module.enqueue_prefetch_for_session
+    calls = 0
+
+    def flaky_enqueue(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("boom")
+        return original_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "enqueue_prefetch_for_session", flaky_enqueue)
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://emby",
+        cache_dir=str(tmp_path),
+        session=SessionConfig(
+            enabled=True,
+            idle_seconds=1,
+            observer_interval_seconds=1,
+        ),
+        middle_cache=MiddleCacheConfig(enabled=True, segment_bytes=64),
+        prefetch=PrefetchConfig(
+            enabled=True,
+            window_bytes=128,
+            resume_overlap_bytes=0,
+            max_session_bytes=256,
+            max_queue_depth=10,
+        ),
+    )
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    store.record_playback(
+        PlaybackSessionUpdate(
+            session_hash="s" * 64,
+            device_hash=None,
+            item_id="1",
+            media_source_id="ms1",
+            cache_key="a" * 64,
+            origin_signature="o" * 64,
+            media_size=1000,
+            byte_range=ByteRange(300, 350),
+            observed_at=time.time() - 2.0,
+        )
+    )
+    caplog.set_level(logging.WARNING, logger=app_module.LOGGER.name)
+    task = asyncio.create_task(app_module._session_planner_loop(config, store, object()))
+    try:
+        deadline = asyncio.get_running_loop().time() + 2.5
+        while (calls < 2 or store.queue_depth() != 2) and not task.done():
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+
+        assert calls >= 2
+        assert not task.done()
+        assert store.queue_depth() == 2
+        assert any("session planner scan failed" in record.message for record in caplog.records)
+    finally:
+        if task.done():
+            task.exception()
+        else:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+async def test_session_planner_loop_retries_existing_idle_session_after_queue_full(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://emby",
+        cache_dir=str(tmp_path),
+        session=SessionConfig(
+            enabled=True,
+            idle_seconds=1,
+            observer_interval_seconds=1,
+        ),
+        middle_cache=MiddleCacheConfig(enabled=True, segment_bytes=64),
+        prefetch=PrefetchConfig(
+            enabled=True,
+            window_bytes=128,
+            resume_overlap_bytes=0,
+            max_session_bytes=256,
+            max_queue_depth=1,
+        ),
+    )
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    store.record_playback(
+        PlaybackSessionUpdate(
+            session_hash="s" * 64,
+            device_hash=None,
+            item_id="1",
+            media_source_id="ms1",
+            cache_key="a" * 64,
+            origin_signature="o" * 64,
+            media_size=1000,
+            byte_range=ByteRange(300, 350),
+            observed_at=time.time() - 2.0,
+        )
+    )
+    store.enqueue_prefetch_task(
+        "other",
+        "ms1",
+        "b" * 64,
+        0,
+        63,
+        priority=10,
+        now=time.time(),
+        max_queue_depth=1,
+    )
+    task = asyncio.create_task(app_module._session_planner_loop(config, store, object()))
+    try:
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while store.get_session("s" * 64).status != "idle":
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+        store.claim_prefetch_tasks(limit=1, now=time.time())
+
+        deadline = asyncio.get_running_loop().time() + 2.5
+        while store.queue_depth() != 1:
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+        session = store.get_session("s" * 64)
+
+        assert store.queue_depth() == 1
+        assert session.status == "idle"
+        assert session.queued_until == 383
+    finally:
+        if task.done():
+            task.exception()
+        else:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 async def test_out_of_scope_falls_back_to_emby(aiohttp_client, tmp_path):

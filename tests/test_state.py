@@ -216,6 +216,41 @@ def test_observer_absence_marks_session_stopped_after_grace(tmp_path):
     assert store.get_session("s" * 64).status == "stopped"
 
 
+def test_prefetch_candidate_sessions_returns_idle_and_stopped_only(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    assert hasattr(store, "prefetch_candidate_sessions")
+    for session_hash, observed_at in (
+        ("a" * 64, 50.0),
+        ("b" * 64, 60.0),
+        ("c" * 64, 95.0),
+        ("d" * 64, 10.0),
+    ):
+        store.record_playback(
+            PlaybackSessionUpdate(
+                session_hash=session_hash,
+                device_hash=None,
+                item_id="1",
+                media_source_id="ms1",
+                cache_key=session_hash,
+                origin_signature="origin-sig",
+                media_size=1000,
+                byte_range=ByteRange(0, 99),
+                observed_at=observed_at,
+            )
+        )
+    store.mark_idle_sessions(now=100.0, idle_seconds=40)
+    store.record_observed_sessions({"b" * 64}, observed_at=20.0)
+    store.mark_missing_observed_sessions_stopped(now=100.0, stop_grace_seconds=60)
+    store.expire_old_sessions(now=100.0, expire_seconds=80)
+
+    candidates = store.prefetch_candidate_sessions()
+
+    assert [(session.session_hash, session.status) for session in candidates] == [
+        ("a" * 64, "idle"),
+        ("b" * 64, "stopped"),
+    ]
+
+
 def test_mark_missing_observed_sessions_stopped_does_not_override_recent_observation(
     tmp_path, monkeypatch
 ):
@@ -376,6 +411,100 @@ def test_enqueue_prefetch_task_respects_max_queue_depth(tmp_path):
     assert first is not None
     assert second is None
     assert store.queue_depth() == 1
+
+
+def test_prefetch_task_exists_counts_only_reusable_tasks(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    assert hasattr(store, "prefetch_task_exists")
+    queued = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=1024,
+        end=2047,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    running = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=2048,
+        end=3071,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    retryable = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=3072,
+        end=4095,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    permanent = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        start=4096,
+        end=5119,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    assert queued is not None
+    assert running is not None
+    assert retryable is not None
+    assert permanent is not None
+    claimed = store.claim_prefetch_tasks(limit=1, now=2.0)
+    assert claimed[0].id == queued.id
+    store.claim_prefetch_tasks(limit=1, now=2.0)
+    store.fail_prefetch_task(
+        retryable.id,
+        error_class="OriginError",
+        now=3.0,
+        retry_after_seconds=10,
+    )
+    store.fail_prefetch_task(
+        permanent.id,
+        error_class="PrefetchSourceMismatch",
+        now=3.0,
+        retry_after_seconds=None,
+    )
+
+    assert store.prefetch_task_exists("a" * 64, 1024, 2047)
+    assert store.prefetch_task_exists("a" * 64, 2048, 3071)
+    assert store.prefetch_task_exists("a" * 64, 3072, 4095)
+    assert not store.prefetch_task_exists("a" * 64, 4096, 5119)
+    assert not store.prefetch_task_exists("a" * 64, 5120, 6143)
+
+
+def test_update_session_queued_until_is_monotonic_and_keeps_last_seen_at(tmp_path):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    store.record_playback(
+        PlaybackSessionUpdate(
+            session_hash="s" * 64,
+            device_hash=None,
+            item_id="1",
+            media_source_id="ms1",
+            cache_key="a" * 64,
+            origin_signature="origin-sig",
+            media_size=1000,
+            byte_range=ByteRange(0, 99),
+            observed_at=10.0,
+        )
+    )
+
+    store.update_session_queued_until("s" * 64, 447, now=20.0)
+    store.update_session_queued_until("s" * 64, 383, now=30.0)
+    session = store.get_session("s" * 64)
+
+    assert session.last_seen_at == 10.0
+    assert session.queued_until == 447
 
 
 def test_complete_prefetch_task_marks_task_done(tmp_path):

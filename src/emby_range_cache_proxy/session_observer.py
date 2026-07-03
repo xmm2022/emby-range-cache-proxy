@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -53,8 +54,13 @@ class EmbySessionObserver:
         if not isinstance(payload, list):
             return ObserverResult(observed=0, stopped=0)
         observed = extract_observed_session_hashes(payload)
-        self.store.record_observed_sessions(observed, observed_at=now)
-        stopped_sessions = self.store.mark_missing_observed_sessions_stopped(
+        await asyncio.to_thread(
+            self.store.record_observed_sessions,
+            observed,
+            observed_at=now,
+        )
+        stopped_sessions = await asyncio.to_thread(
+            self.store.mark_missing_observed_sessions_stopped,
             now=now,
             stop_grace_seconds=self.config.session.stop_grace_seconds,
         )

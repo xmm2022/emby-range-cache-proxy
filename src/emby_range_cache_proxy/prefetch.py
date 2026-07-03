@@ -262,6 +262,21 @@ def enqueue_prefetch_for_session(
     priority: int,
 ) -> int:
     head_size, tail_size = adaptive_head_tail(session.media_size)
+    target_ranges = plan_middle_ranges(
+        media_size=session.media_size,
+        head_size=head_size,
+        tail_size=tail_size,
+        max_observed_offset=session.max_observed_offset,
+        queued_until=None,
+        prefetch=prefetch,
+        middle_cache=middle_cache,
+    )
+    if not target_ranges:
+        return 0
+    target_end = target_ranges[-1].end
+    if session.queued_until is not None and session.queued_until >= target_end:
+        return 0
+
     ranges = plan_middle_ranges(
         media_size=session.media_size,
         head_size=head_size,
@@ -275,6 +290,10 @@ def enqueue_prefetch_for_session(
     inserted = 0
     highest_end: int | None = None
     for byte_range in ranges:
+        if byte_range.start > target_end:
+            break
+        if byte_range.end > target_end:
+            byte_range = ByteRange(byte_range.start, target_end)
         if store.find_middle_block(session.cache_key, byte_range) is not None:
             highest_end = byte_range.end
             continue
@@ -289,7 +308,14 @@ def enqueue_prefetch_for_session(
             max_queue_depth=prefetch.max_queue_depth,
         )
         if task is None:
-            continue
+            if store.prefetch_task_exists(
+                session.cache_key,
+                byte_range.start,
+                byte_range.end,
+            ):
+                highest_end = byte_range.end
+                continue
+            break
         inserted += 1
         highest_end = byte_range.end
 

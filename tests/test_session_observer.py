@@ -1,7 +1,9 @@
 import asyncio
+import threading
 
 from aiohttp import web
 
+import emby_range_cache_proxy.session_observer as observer_module
 from emby_range_cache_proxy.config import Config, SessionConfig
 from emby_range_cache_proxy.models import ByteRange
 from emby_range_cache_proxy.session_observer import (
@@ -95,6 +97,47 @@ async def test_observer_without_internal_key_is_noop(tmp_path):
 
     assert result.observed == 0
     assert result.stopped == 0
+
+
+async def test_observer_offloads_store_updates(aiohttp_client, tmp_path):
+    async def sessions(request):
+        return web.json_response([{"PlaySessionId": "play1"}])
+
+    class FakeStore:
+        def __init__(self):
+            self.record_thread = None
+            self.stop_thread = None
+
+        def record_observed_sessions(self, session_hashes, *, observed_at):
+            self.record_thread = threading.current_thread()
+
+        def mark_missing_observed_sessions_stopped(self, *, now, stop_grace_seconds):
+            self.stop_thread = threading.current_thread()
+            return []
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Sessions", sessions)
+    emby = await aiohttp_client(emby_app)
+    store = FakeStore()
+    observer = observer_module.EmbySessionObserver(
+        Config(
+            emby_base_url=str(emby.make_url("")),
+            fallback_base_url=str(emby.make_url("")),
+            cache_dir=str(tmp_path / "cache"),
+            prewarm_api_key="internal",
+            session=SessionConfig(enabled=True, observer_enabled=True),
+        ),
+        store,
+    )
+    event_loop_thread = threading.current_thread()
+
+    result = await observer.run_once(now=10.0)
+
+    assert result.observed == 1
+    assert store.record_thread is not None
+    assert store.stop_thread is not None
+    assert store.record_thread is not event_loop_thread
+    assert store.stop_thread is not event_loop_thread
 
 
 async def test_observer_non_list_payload_is_noop_and_does_not_mark_stopped(

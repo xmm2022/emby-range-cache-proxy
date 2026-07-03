@@ -21,7 +21,12 @@ from emby_range_cache_proxy.prefetch import (
     enqueue_prefetch_for_session,
     plan_middle_ranges,
 )
-from emby_range_cache_proxy.state import PlaybackSessionRecord, SessionStateStore
+from emby_range_cache_proxy.state import (
+    MiddleBlockRecord,
+    PlaybackSessionRecord,
+    PlaybackSessionUpdate,
+    SessionStateStore,
+)
 
 
 async def test_bandwidth_limiter_waits_when_chunk_exceeds_rate():
@@ -35,6 +40,25 @@ async def test_bandwidth_limiter_waits_when_chunk_exceeds_rate():
     await limiter.consume(25)
 
     assert sleeps == [2.5]
+
+
+def _record_idle_session(store):
+    store.record_playback(
+        PlaybackSessionUpdate(
+            session_hash="s" * 64,
+            device_hash=None,
+            item_id="1",
+            media_source_id="ms1",
+            cache_key="a" * 64,
+            origin_signature="o" * 64,
+            media_size=1000,
+            byte_range=ByteRange(300, 350),
+            observed_at=10.0,
+        )
+    )
+    idle = store.mark_idle_sessions(now=20.0, idle_seconds=1)
+    assert len(idle) == 1
+    return idle[0]
 
 
 async def test_prefetch_worker_fetches_claimed_task_into_middle_cache(
@@ -527,6 +551,138 @@ def test_enqueue_prefetch_for_session_inserts_deduplicated_tasks(
     assert inserted == 2
     assert repeated == 0
     assert store.queue_depth() == 2
+
+
+def test_enqueue_prefetch_for_session_does_not_extend_without_playback_advance(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    store = SessionStateStore(tmp_path / "state.db")
+    session = _record_idle_session(store)
+    prefetch = PrefetchConfig(
+        window_bytes=128,
+        resume_overlap_bytes=0,
+        max_session_bytes=256,
+        max_queue_depth=10,
+    )
+    middle_cache = MiddleCacheConfig(segment_bytes=64)
+
+    inserted = enqueue_prefetch_for_session(
+        store,
+        session,
+        prefetch=prefetch,
+        middle_cache=middle_cache,
+        now=20.0,
+        priority=10,
+    )
+    repeated = enqueue_prefetch_for_session(
+        store,
+        store.get_session("s" * 64),
+        prefetch=prefetch,
+        middle_cache=middle_cache,
+        now=21.0,
+        priority=10,
+    )
+
+    assert inserted == 2
+    assert repeated == 0
+    assert store.queue_depth() == 2
+    assert store.get_session("s" * 64).queued_until == 447
+
+
+def test_enqueue_prefetch_for_session_resumes_after_queue_full_without_extending(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    store = SessionStateStore(tmp_path / "state.db")
+    session = _record_idle_session(store)
+    middle_cache = MiddleCacheConfig(segment_bytes=64)
+
+    inserted = enqueue_prefetch_for_session(
+        store,
+        session,
+        prefetch=PrefetchConfig(
+            window_bytes=128,
+            resume_overlap_bytes=0,
+            max_session_bytes=256,
+            max_queue_depth=1,
+        ),
+        middle_cache=middle_cache,
+        now=20.0,
+        priority=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=21.0)
+    resumed = enqueue_prefetch_for_session(
+        store,
+        store.get_session("s" * 64),
+        prefetch=PrefetchConfig(
+            window_bytes=128,
+            resume_overlap_bytes=0,
+            max_session_bytes=256,
+            max_queue_depth=10,
+        ),
+        middle_cache=middle_cache,
+        now=22.0,
+        priority=10,
+    )
+
+    assert inserted == 1
+    assert len(claimed) == 1
+    assert claimed[0].start == 320
+    assert claimed[0].end == 383
+    assert resumed == 1
+    assert store.queue_depth() == 1
+    queued = store.claim_prefetch_tasks(limit=1, now=23.0)
+    assert queued[0].start == 384
+    assert queued[0].end == 447
+    assert store.get_session("s" * 64).queued_until == 447
+
+
+def test_enqueue_prefetch_for_session_does_not_skip_failed_gap_before_middle_block(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    store = SessionStateStore(tmp_path / "state.db")
+    session = _record_idle_session(store)
+    store.enqueue_prefetch_task(
+        "other",
+        "ms1",
+        "b" * 64,
+        0,
+        63,
+        priority=10,
+        now=19.0,
+        max_queue_depth=1,
+    )
+    store.upsert_middle_block(
+        MiddleBlockRecord(
+            cache_key="a" * 64,
+            start=384,
+            end=447,
+            path="middle.bin",
+            size=64,
+            created_at=19.0,
+            last_access_at=19.0,
+            expires_at=100.0,
+        )
+    )
+
+    inserted = enqueue_prefetch_for_session(
+        store,
+        session,
+        prefetch=PrefetchConfig(
+            window_bytes=128,
+            resume_overlap_bytes=0,
+            max_session_bytes=256,
+            max_queue_depth=1,
+        ),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+        now=20.0,
+        priority=10,
+    )
+
+    assert inserted == 0
+    assert store.get_session("s" * 64).queued_until is None
 
 
 def test_plan_middle_ranges_aligns_skips_head_tail_and_caps_window():

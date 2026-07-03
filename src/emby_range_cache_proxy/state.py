@@ -253,6 +253,17 @@ class SessionStateStore:
             rows = self._select_sessions(conn, transitioned_hashes)
         return [_playback_session_from_row(row) for row in rows]
 
+    def prefetch_candidate_sessions(self) -> list[PlaybackSessionRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM playback_sessions
+                WHERE status IN ('idle', 'stopped')
+                ORDER BY last_seen_at ASC, session_hash ASC
+                """
+            ).fetchall()
+        return [_playback_session_from_row(row) for row in rows]
+
     def update_session_queued_until(
         self, session_hash: str, queued_until: int, *, now: float
     ) -> None:
@@ -260,10 +271,13 @@ class SessionStateStore:
             conn.execute(
                 """
                 UPDATE playback_sessions
-                SET queued_until = ?, last_seen_at = ?
-                WHERE session_hash = ?
+                SET queued_until = CASE
+                    WHEN queued_until IS NULL OR queued_until < ? THEN ?
+                    ELSE queued_until
+                END
+                WHERE session_hash = ? AND status != 'expired'
                 """,
-                (queued_until, now, session_hash),
+                (queued_until, queued_until, session_hash),
             )
 
     def enqueue_prefetch_task(
@@ -313,6 +327,28 @@ class SessionStateStore:
                 (cursor.lastrowid,),
             ).fetchone()
         return _prefetch_task_from_row(row)
+
+    def prefetch_task_exists(self, cache_key: str, start: int, end: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM prefetch_tasks
+                WHERE cache_key = ?
+                  AND start = ?
+                  AND end = ?
+                  AND (
+                        status IN ('queued', 'running')
+                     OR (
+                            status IN ('failed', 'skipped')
+                            AND next_attempt_at IS NOT NULL
+                        )
+                  )
+                LIMIT 1
+                """,
+                (cache_key, start, end),
+            ).fetchone()
+        return row is not None
 
     def claim_prefetch_tasks(
         self,
