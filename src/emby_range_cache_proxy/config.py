@@ -50,6 +50,10 @@ class PrewarmConfig:
     max_items_per_scan: int = 100
     concurrency: int = 1
 
+    def __post_init__(self) -> None:
+        if self.interval_seconds < 60:
+            raise ValueError("prewarm.interval_seconds must be >= 60")
+
 
 @dataclass
 class Config:

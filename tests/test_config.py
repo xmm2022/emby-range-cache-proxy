@@ -1,6 +1,8 @@
 import json
 
-from emby_range_cache_proxy.config import Config, load_config
+import pytest
+
+from emby_range_cache_proxy.config import Config, PrewarmConfig, load_config
 
 
 def test_load_config_with_defaults(tmp_path):
@@ -47,3 +49,43 @@ def test_empty_allowlists_mean_allowed_when_rollout_enabled():
     config.rollout.enabled = True
 
     assert config.rollout.in_scope(item_id="1", media_source_id="ms1") is True
+
+
+@pytest.mark.parametrize("interval_seconds", [0, -1, 59])
+def test_prewarm_config_rejects_short_interval(interval_seconds):
+    with pytest.raises(ValueError, match="prewarm\\.interval_seconds"):
+        PrewarmConfig(enabled=True, interval_seconds=interval_seconds)
+
+
+@pytest.mark.parametrize("interval_seconds", [0, -1, 59])
+def test_load_config_rejects_short_prewarm_interval(tmp_path, interval_seconds):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "prewarm": {"enabled": True, "interval_seconds": interval_seconds},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="prewarm\\.interval_seconds"):
+        load_config(path)
+
+
+def test_prewarm_interval_allows_sixty_seconds(tmp_path):
+    assert PrewarmConfig(enabled=True, interval_seconds=60).interval_seconds == 60
+
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "prewarm": {"enabled": True, "interval_seconds": 60},
+            }
+        )
+    )
+
+    assert load_config(path).prewarm.interval_seconds == 60
