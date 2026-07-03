@@ -24,6 +24,9 @@ def test_load_config_with_defaults(tmp_path):
     assert config.emby_base_url == "http://127.0.0.1:8096"
     assert config.listen_host == "127.0.0.1"
     assert config.listen_port == 18180
+    assert config.cache_dir == str(tmp_path / "cache")
+    assert config.fallback_base_url == "http://127.0.0.1:8096"
+    assert config.prewarm_api_key == "secret-prewarm-key"
     assert config.cache.max_bytes == 512 * 1024**3
     assert config.prewarm.enabled is False
     assert config.rollout.enabled is True
