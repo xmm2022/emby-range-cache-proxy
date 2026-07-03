@@ -36,6 +36,26 @@ V1 keeps the cache intentionally narrow:
 - No active arbitrary middle range cache during normal playback.
 - Prewarm builds the same head and tail blocks for rollout-scoped media.
 
+## Phase 2
+
+Phase 2 adds disabled-by-default playback session recording and idle/stop-driven middle-range prefetch.
+
+Safe defaults:
+
+- `session.enabled=false`
+- `middle_cache.enabled=false`
+- `prefetch.enabled=false`
+
+The internal API key is not used for user playback authorization. User playback requests continue to be authorized with the user's own Emby token through `PlaybackInfo`. The internal key is only for read-only session observation and background work when those features are explicitly enabled.
+
+Recommended rollout order:
+
+1. Deploy code with Phase 2 disabled.
+2. Enable `session.enabled=true` for logging and state observation.
+3. Enable `session.observer_enabled=true` after configuring the internal key.
+4. Enable `middle_cache.enabled=true` with `prefetch.enabled=false`.
+5. Enable `prefetch.enabled=true` for one or two allowlisted items.
+
 ## Local Development
 
 ```bash

@@ -374,3 +374,31 @@ def test_readme_mentions_no_active_arbitrary_middle_cache():
     text = open("README.md", encoding="utf-8").read()
 
     assert "does not actively cache arbitrary middle playback ranges" in text
+
+
+def test_phase2_log_helpers_do_not_expose_sensitive_values(caplog):
+    import emby_range_cache_proxy.prefetch as prefetch_module
+    from emby_range_cache_proxy.state import hash_identifier
+
+    logger = logging.getLogger("emby_range_cache_proxy.prefetch")
+    session_hash = hash_identifier("play-secret-session-hash")
+
+    with caplog.at_level(logging.INFO, logger="emby_range_cache_proxy.prefetch"):
+        logger.info(
+            "prefetch_queued item_id=%s media_source_id=%s session=%s "
+            "cache_key=%s range=%s-%s",
+            "1",
+            "ms1",
+            prefetch_module.short_hash(session_hash),
+            prefetch_module.short_hash("a" * 64),
+            10,
+            20,
+        )
+
+    text = caplog.text
+    assert "play-secret" not in text
+    assert "play-secret-session-hash" not in text
+    assert "api_key" not in text
+    assert "PlaySessionId" not in text
+    assert "DeviceId" not in text
+    assert "http://origin" not in text

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -13,6 +14,8 @@ from .models import ByteRange, MediaSource
 from .origin import OriginClient, OriginError
 from .state import PlaybackSessionRecord, PrefetchTaskRecord, SessionStateStore
 
+LOGGER = logging.getLogger(__name__)
+
 
 @dataclass
 class PrefetchRunResult:
@@ -23,6 +26,10 @@ class PrefetchRunResult:
 
 class PrefetchSourceMismatch(Exception):
     pass
+
+
+def short_hash(value: str | None) -> str:
+    return "none" if value is None else value[:12]
 
 
 class BandwidthLimiter:
@@ -84,6 +91,7 @@ class PrefetchWorker:
     async def _run_task(
         self, task: PrefetchTaskRecord, *, now: float
     ) -> PrefetchRunResult:
+        _log_prefetch_event("prefetch_started", task)
         byte_range = ByteRange(task.start, task.end)
         if byte_range.length > self.middle_cache.max_bytes:
             await asyncio.to_thread(
@@ -93,6 +101,7 @@ class PrefetchWorker:
                 now=now,
                 expected_attempts=task.attempts,
             )
+            _log_prefetch_event("prefetch_skipped", task, reason="RangeTooLarge")
             return PrefetchRunResult(skipped=1)
 
         url = self.source_lookup.get((task.item_id, task.media_source_id))
@@ -113,6 +122,9 @@ class PrefetchWorker:
                 now=now,
                 retry_after_seconds=self.config.prefetch.error_backoff_seconds,
                 expected_attempts=task.attempts,
+            )
+            _log_prefetch_event(
+                "prefetch_skipped", task, reason="SourceUnavailable"
             )
             return PrefetchRunResult(skipped=1)
 
@@ -155,7 +167,9 @@ class PrefetchWorker:
                 now,
             )
             if not stored:
+                _log_prefetch_event("prefetch_skipped", task, reason="PublishRace")
                 return PrefetchRunResult(skipped=1)
+            _log_prefetch_event("prefetch_complete", task)
             return PrefetchRunResult(completed=1)
         except asyncio.CancelledError:
             await asyncio.to_thread(
@@ -188,6 +202,9 @@ class PrefetchWorker:
                 retry_after_seconds=retry_after_seconds,
                 expected_attempts=task.attempts,
             )
+            _log_prefetch_event(
+                "prefetch_failed", task, error_class=error.__class__.__name__
+            )
             return PrefetchRunResult(failed=1)
 
     def _store_completed_task(
@@ -210,6 +227,27 @@ class PrefetchWorker:
         self.middle_cache.evict_expired(now=now)
         self.middle_cache.evict_lru_if_needed()
         return True
+
+
+def _log_prefetch_event(
+    event: str,
+    task: PrefetchTaskRecord,
+    *,
+    reason: str | None = None,
+    error_class: str | None = None,
+) -> None:
+    LOGGER.info(
+        "%s item_id=%s media_source_id=%s cache_key=%s range=%s-%s "
+        "reason=%s error_class=%s",
+        event,
+        task.item_id,
+        task.media_source_id,
+        short_hash(task.cache_key),
+        task.start,
+        task.end,
+        reason or "none",
+        error_class or "none",
+    )
 
 
 def align_down(value: int, alignment: int) -> int:
@@ -329,6 +367,17 @@ def enqueue_prefetch_for_session(
                 continue
             break
         inserted += 1
+        LOGGER.info(
+            "prefetch_queued item_id=%s media_source_id=%s session=%s "
+            "cache_key=%s range=%s-%s priority=%s",
+            session.item_id,
+            session.media_source_id,
+            short_hash(session.session_hash),
+            short_hash(session.cache_key),
+            byte_range.start,
+            byte_range.end,
+            priority,
+        )
         highest_end = byte_range.end
 
     if highest_end is not None:

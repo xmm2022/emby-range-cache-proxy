@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sqlite3
 
 import pytest
@@ -131,8 +132,9 @@ async def test_prefetch_worker_fetches_claimed_task_into_middle_cache(
 
 
 async def test_prefetch_worker_uses_stored_source_metadata(
-    aiohttp_client, tmp_path
+    aiohttp_client, caplog, tmp_path
 ):
+    caplog.set_level(logging.INFO, logger="emby_range_cache_proxy.prefetch")
     request_methods = []
 
     async def handler(request):
@@ -204,6 +206,16 @@ async def test_prefetch_worker_uses_stored_source_metadata(
     chunks = middle.iter_block(key, ByteRange(10, 19), chunk_bytes=4, now=3.0)
     assert chunks is not None
     assert b"".join(chunks) == b"abcdefghij"
+    messages = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "emby_range_cache_proxy.prefetch"
+    )
+    assert "prefetch_started" in messages
+    assert "prefetch_complete" in messages
+    assert key[:12] in messages
+    assert key not in messages
+    assert origin_url not in messages
 
 
 async def test_prefetch_worker_fails_cache_key_mismatch_without_writing_middle_cache(
@@ -636,8 +648,9 @@ async def test_prefetch_worker_skips_when_disabled(tmp_path):
 
 
 def test_enqueue_prefetch_for_session_inserts_deduplicated_tasks(
-    monkeypatch, tmp_path
+    caplog, monkeypatch, tmp_path
 ):
+    caplog.set_level(logging.INFO, logger="emby_range_cache_proxy.prefetch")
     monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
     store = SessionStateStore(tmp_path / "state.db")
     session = PlaybackSessionRecord(
@@ -688,6 +701,20 @@ def test_enqueue_prefetch_for_session_inserts_deduplicated_tasks(
     assert inserted == 2
     assert repeated == 0
     assert store.queue_depth() == 2
+    messages = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "emby_range_cache_proxy.prefetch"
+    )
+    assert "prefetch_queued" in messages
+    assert session.session_hash[:12] in messages
+    assert session.session_hash not in messages
+    assert session.cache_key[:12] in messages
+    assert session.cache_key not in messages
+    assert "api_key" not in messages
+    assert "PlaySessionId" not in messages
+    assert "DeviceId" not in messages
+    assert "http://origin" not in messages
 
 
 def test_enqueue_prefetch_for_session_does_not_extend_without_playback_advance(

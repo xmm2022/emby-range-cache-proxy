@@ -16,7 +16,7 @@ from .config import Config
 from .middle_cache import MiddleRangeCache
 from .models import ByteRange, MediaSource, RequestContext, SourceMetadata
 from .origin import OriginClient, OriginError
-from .prefetch import PrefetchWorker, enqueue_prefetch_for_session
+from .prefetch import PrefetchWorker, enqueue_prefetch_for_session, short_hash
 from .prewarm import PrewarmWorker
 from .ranges import content_range_header, plan_playback_range
 from .requests import parse_original_request
@@ -313,6 +313,7 @@ async def serve_authorized_range(
                 LOGGER.warning("middle cache read failed: %s", type(error).__name__)
                 cached_chunks = None
             if cached_chunks is not None:
+                _log_middle_cache_event("middle_cache_hit", ctx, key, byte_range)
                 return await _serve_cached_response(
                     request,
                     status=status,
@@ -326,6 +327,7 @@ async def serve_authorized_range(
                     block_range=byte_range,
                     record_session=record_session,
                 )
+            _log_middle_cache_event("middle_cache_miss", ctx, key, byte_range)
 
         if cache_block is not None:
             block_name, block_range = cache_block
@@ -747,6 +749,23 @@ def _log_proxy_result(
         _format_optional_ms(prepare_ms),
         _format_optional_ms(first_body_ms),
         elapsed_ms,
+    )
+
+
+def _log_middle_cache_event(
+    event: str,
+    ctx: RequestContext,
+    key: str,
+    byte_range: ByteRange,
+) -> None:
+    LOGGER.info(
+        "%s item_id=%s media_source_id=%s cache_key=%s range=%s-%s",
+        event,
+        ctx.item_id,
+        ctx.media_source_id,
+        short_hash(key),
+        byte_range.start,
+        byte_range.end,
     )
 
 

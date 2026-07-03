@@ -1021,9 +1021,12 @@ async def test_cached_response_does_not_record_session_when_cache_read_fails(mon
     assert recorded == []
 
 
-async def test_authorized_middle_cache_hit_does_not_touch_origin_get(aiohttp_client, monkeypatch, tmp_path):
+async def test_authorized_middle_cache_hit_does_not_touch_origin_get(
+    aiohttp_client, caplog, monkeypatch, tmp_path
+):
     monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
     monkeypatch.setattr(app_module.time, "time", lambda: 1.0)
+    caplog.set_level(logging.INFO, logger="emby_range_cache_proxy.app")
     origin_gets = 0
 
     async def playback_info(request):
@@ -1089,6 +1092,16 @@ async def test_authorized_middle_cache_hit_does_not_touch_origin_get(aiohttp_cli
     assert response.status == 206
     assert await response.read() == b"middle-cache-hit"
     assert origin_gets == 0
+    messages = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "emby_range_cache_proxy.app"
+    )
+    assert "middle_cache_hit" in messages
+    assert key[:12] in messages
+    assert key not in messages
+    assert "api_key" not in messages
+    assert origin_url not in messages
 
 
 async def test_middle_cache_error_falls_back_to_head_tail_without_leaking_build_lock(
