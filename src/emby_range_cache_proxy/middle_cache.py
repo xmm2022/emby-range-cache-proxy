@@ -103,15 +103,21 @@ class MiddleRangeCache:
                 now=now,
                 publish=publish,
             )
+            if committed:
+                tmp.unlink(missing_ok=True)
+                sidecar_tmp.unlink(missing_ok=True)
+                self._cleanup_backup_best_effort(path_backup)
+                self._cleanup_backup_best_effort(sidecar_backup)
+                return True
+
             if not committed and published:
                 self._restore_published(path, path_backup)
                 self._restore_published(sidecar, sidecar_backup)
             self._cleanup_backup(path_backup)
             self._cleanup_backup(sidecar_backup)
-            if not committed:
-                tmp.unlink(missing_ok=True)
-                sidecar_tmp.unlink(missing_ok=True)
-            return committed
+            tmp.unlink(missing_ok=True)
+            sidecar_tmp.unlink(missing_ok=True)
+            return False
         except Exception:
             if backups_prepared:
                 self._restore_published(path, path_backup)
@@ -301,6 +307,12 @@ class MiddleRangeCache:
     def _cleanup_backup(self, backup: Path | None) -> None:
         if backup is not None:
             backup.unlink(missing_ok=True)
+
+    def _cleanup_backup_best_effort(self, backup: Path | None) -> None:
+        try:
+            self._cleanup_backup(backup)
+        except OSError:
+            pass
 
     def _relative_path(self, key: str, start: int, end: int) -> str:
         return (Path(key) / "mid" / f"{start}-{end}.bin").as_posix()

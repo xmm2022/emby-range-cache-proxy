@@ -191,6 +191,62 @@ def test_middle_cache_prefetch_store_rolls_back_when_state_finalizer_fails(
     assert status == "running"
 
 
+def test_middle_cache_prefetch_store_ignores_backup_cleanup_failure_after_commit(
+    tmp_path, monkeypatch
+):
+    store = SessionStateStore(tmp_path / "state.sqlite3")
+    cache = MiddleRangeCache(
+        tmp_path / "cache", store, max_bytes=1024 * 1024, ttl_seconds=60
+    )
+    cache.store_block(_key(), ByteRange(0, 2), b"old", now=10.0)
+    task = store.enqueue_prefetch_task(
+        item_id="1",
+        media_source_id="ms1",
+        cache_key=_key(),
+        start=0,
+        end=2,
+        priority=10,
+        now=1.0,
+        max_queue_depth=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=1, now=2.0)[0]
+    cleanup_calls = 0
+
+    def fail_first_backup_cleanup(backup):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise OSError("backup cleanup failed")
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+
+    monkeypatch.setattr(cache, "_cleanup_backup", fail_first_backup_cleanup)
+
+    published = cache.store_prefetch_block(
+        claimed.id,
+        expected_attempts=claimed.attempts,
+        key=_key(),
+        byte_range=ByteRange(0, 2),
+        data=b"new",
+        now=20.0,
+    )
+    chunks = cache.iter_block(_key(), ByteRange(0, 2), chunk_bytes=3, now=21.0)
+    record = store.find_middle_block(_key(), ByteRange(0, 2))
+
+    assert task is not None
+    assert published is True
+    assert cleanup_calls >= 1
+    assert chunks is not None
+    assert b"".join(chunks) == b"new"
+    assert record.created_at == 20.0
+    with store._connect() as conn:
+        status = conn.execute(
+            "SELECT status FROM prefetch_tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()["status"]
+    assert status == "done"
+
+
 def test_middle_cache_miss_for_partial_coverage(tmp_path):
     store = SessionStateStore(tmp_path / "state.sqlite3")
     cache = MiddleRangeCache(tmp_path / "cache", store, max_bytes=1024 * 1024, ttl_seconds=60)
