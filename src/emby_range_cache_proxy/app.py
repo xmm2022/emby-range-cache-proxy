@@ -177,6 +177,15 @@ async def serve_authorized_range(
         def record_session() -> None:
             _record_session_progress(request, ctx, key, metadata, byte_range)
 
+        session_recorded = False
+
+        def record_completed_session() -> None:
+            nonlocal session_recorded
+            if session_recorded:
+                return
+            session_recorded = True
+            record_session()
+
         middle_cache: MiddleRangeCache | None = request.app.get("middle_cache")
         if config.middle_cache.enabled and middle_cache is not None:
             try:
@@ -317,6 +326,7 @@ async def serve_authorized_range(
                                     if response_bytes_written == byte_range.length:
                                         await _write_eof_safely(response)
                                         response_done = True
+                                        record_completed_session()
                 except (OriginError, ClientError, TimeoutError, OSError):
                     if writer is not None:
                         writer.abort()
@@ -344,8 +354,6 @@ async def serve_authorized_range(
                             prepare_ms=prepare_ms,
                             first_body_ms=first_body_ms,
                         )
-                        if response_done and response_bytes_written == byte_range.length:
-                            record_session()
                     except (ValueError, OSError):
                         writer.abort()
                         if not response_done:
@@ -364,8 +372,6 @@ async def serve_authorized_range(
                         prepare_ms=prepare_ms,
                         first_body_ms=first_body_ms,
                     )
-                    if response_done and response_bytes_written == byte_range.length:
-                        record_session()
         finally:
             if build_lock is not None and build_lock.locked():
                 build_lock.release()
