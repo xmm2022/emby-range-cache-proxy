@@ -191,41 +191,87 @@ def _prewarm(data: dict[str, Any]) -> PrewarmConfig:
     )
 
 
+def _phase2_bool(data: dict[str, Any], key: str, default: bool, field_name: str) -> bool:
+    if key not in data:
+        return default
+    value = data[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _phase2_int(data: dict[str, Any], key: str, default: int, field_name: str) -> int:
+    if key not in data:
+        return default
+    value = data[key]
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{field_name} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+
+
 def _session(data: dict[str, Any]) -> SessionConfig:
     state_db = data.get("state_db")
     return SessionConfig(
-        enabled=bool(data.get("enabled", False)),
+        enabled=_phase2_bool(data, "enabled", False, "session.enabled"),
         state_db=None if state_db is None else str(state_db),
-        observer_enabled=bool(data.get("observer_enabled", False)),
-        observer_interval_seconds=int(data.get("observer_interval_seconds", 30)),
-        idle_seconds=int(data.get("idle_seconds", 180)),
-        stop_grace_seconds=int(data.get("stop_grace_seconds", 60)),
-        expire_seconds=int(data.get("expire_seconds", 86400)),
+        observer_enabled=_phase2_bool(data, "observer_enabled", False, "session.observer_enabled"),
+        observer_interval_seconds=_phase2_int(
+            data,
+            "observer_interval_seconds",
+            30,
+            "session.observer_interval_seconds",
+        ),
+        idle_seconds=_phase2_int(data, "idle_seconds", 180, "session.idle_seconds"),
+        stop_grace_seconds=_phase2_int(data, "stop_grace_seconds", 60, "session.stop_grace_seconds"),
+        expire_seconds=_phase2_int(data, "expire_seconds", 86400, "session.expire_seconds"),
     )
 
 
 def _middle_cache(data: dict[str, Any]) -> MiddleCacheConfig:
     return MiddleCacheConfig(
-        enabled=bool(data.get("enabled", False)),
-        max_bytes=int(data.get("max_bytes", 128 * 1024**3)),
-        ttl_seconds=int(data.get("ttl_seconds", 7 * 24 * 60 * 60)),
-        segment_bytes=int(data.get("segment_bytes", 64 * 1024**2)),
-        min_free_bytes=int(data.get("min_free_bytes", 50 * 1024**3)),
+        enabled=_phase2_bool(data, "enabled", False, "middle_cache.enabled"),
+        max_bytes=_phase2_int(data, "max_bytes", 128 * 1024**3, "middle_cache.max_bytes"),
+        ttl_seconds=_phase2_int(data, "ttl_seconds", 7 * 24 * 60 * 60, "middle_cache.ttl_seconds"),
+        segment_bytes=_phase2_int(data, "segment_bytes", 64 * 1024**2, "middle_cache.segment_bytes"),
+        min_free_bytes=_phase2_int(data, "min_free_bytes", 50 * 1024**3, "middle_cache.min_free_bytes"),
     )
 
 
 def _prefetch(data: dict[str, Any]) -> PrefetchConfig:
     return PrefetchConfig(
-        enabled=bool(data.get("enabled", False)),
-        window_bytes=int(data.get("window_bytes", 2 * 1024**3)),
-        resume_overlap_bytes=int(data.get("resume_overlap_bytes", 128 * 1024**2)),
-        max_session_bytes=int(data.get("max_session_bytes", 4 * 1024**3)),
-        max_queue_depth=int(data.get("max_queue_depth", 200)),
-        concurrency=int(data.get("concurrency", 1)),
-        per_origin_concurrency=int(data.get("per_origin_concurrency", 1)),
-        bandwidth_bytes_per_second=int(data.get("bandwidth_bytes_per_second", 30 * 1024**2)),
-        pause_when_rollout_session_active=bool(data.get("pause_when_rollout_session_active", True)),
-        error_backoff_seconds=int(data.get("error_backoff_seconds", 300)),
+        enabled=_phase2_bool(data, "enabled", False, "prefetch.enabled"),
+        window_bytes=_phase2_int(data, "window_bytes", 2 * 1024**3, "prefetch.window_bytes"),
+        resume_overlap_bytes=_phase2_int(
+            data,
+            "resume_overlap_bytes",
+            128 * 1024**2,
+            "prefetch.resume_overlap_bytes",
+        ),
+        max_session_bytes=_phase2_int(data, "max_session_bytes", 4 * 1024**3, "prefetch.max_session_bytes"),
+        max_queue_depth=_phase2_int(data, "max_queue_depth", 200, "prefetch.max_queue_depth"),
+        concurrency=_phase2_int(data, "concurrency", 1, "prefetch.concurrency"),
+        per_origin_concurrency=_phase2_int(
+            data,
+            "per_origin_concurrency",
+            1,
+            "prefetch.per_origin_concurrency",
+        ),
+        bandwidth_bytes_per_second=_phase2_int(
+            data,
+            "bandwidth_bytes_per_second",
+            30 * 1024**2,
+            "prefetch.bandwidth_bytes_per_second",
+        ),
+        pause_when_rollout_session_active=_phase2_bool(
+            data,
+            "pause_when_rollout_session_active",
+            True,
+            "prefetch.pause_when_rollout_session_active",
+        ),
+        error_backoff_seconds=_phase2_int(data, "error_backoff_seconds", 300, "prefetch.error_backoff_seconds"),
     )
 
 

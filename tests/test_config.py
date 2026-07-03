@@ -304,3 +304,67 @@ def test_phase2_config_reads_explicit_values(tmp_path):
 def test_phase2_config_rejects_invalid_values(factory, kwargs, match):
     with pytest.raises(ValueError, match=match):
         factory(**kwargs)
+
+
+def test_phase2_config_rejects_string_session_enabled(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "session": {"enabled": "false"},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="session.enabled"):
+        load_config(path)
+
+
+def test_phase2_config_rejects_string_prefetch_pause_when_rollout_session_active(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "prefetch": {"pause_when_rollout_session_active": "false"},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="prefetch.pause_when_rollout_session_active"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("window_bytes", [None, "abc", 1.5])
+def test_phase2_config_rejects_invalid_prefetch_window_bytes(tmp_path, window_bytes):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "prefetch": {"window_bytes": window_bytes},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="prefetch.window_bytes"):
+        load_config(path)
+
+
+def test_phase2_config_parses_numeric_string_integer_fields(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "prefetch": {"window_bytes": "12345"},
+            }
+        )
+    )
+
+    assert load_config(path).prefetch.window_bytes == 12345
