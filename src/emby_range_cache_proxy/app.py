@@ -552,7 +552,16 @@ def _record_session_progress(
     recorder: SessionRecorder | None = request.app.get("session_recorder")
     if recorder is None:
         return
+    if _is_tail_metadata_range(metadata, byte_range):
+        return
     recorder.record_nowait(ctx, key, metadata, byte_range, observed_at=time.time())
+
+
+def _is_tail_metadata_range(metadata: SourceMetadata, byte_range: ByteRange) -> bool:
+    head_size, tail_size = adaptive_head_tail(metadata.size)
+    head_end = min(head_size, metadata.size) - 1
+    tail_start = max(head_end + 1, metadata.size - tail_size)
+    return byte_range.start >= tail_start
 
 
 async def _store_source_metadata(

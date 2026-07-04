@@ -1021,6 +1021,39 @@ async def test_cached_response_does_not_record_session_when_cache_read_fails(mon
     assert recorded == []
 
 
+def test_tail_metadata_range_does_not_record_playback_progress(monkeypatch):
+    monkeypatch.setattr(app_module, "adaptive_head_tail", lambda size: (16, 4))
+    recorded = []
+
+    class Recorder:
+        def record_nowait(self, ctx, key, metadata, byte_range, *, observed_at):
+            recorded.append(byte_range)
+            return True
+
+    class Request:
+        method = "GET"
+        app = {"session_recorder": Recorder()}
+
+    ctx = RequestContext(
+        method="GET",
+        raw_path="/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t",
+        item_id="1",
+        media_source_id="ms1",
+        token="t",
+        extension="mkv",
+    )
+    metadata = SourceMetadata(url="http://origin/movie.mkv", size=100)
+
+    app_module._record_session_progress(
+        Request(), ctx, "a" * 64, metadata, ByteRange(96, 99)
+    )
+    app_module._record_session_progress(
+        Request(), ctx, "a" * 64, metadata, ByteRange(16, 31)
+    )
+
+    assert recorded == [ByteRange(16, 31)]
+
+
 async def test_authorized_middle_cache_hit_does_not_touch_origin_get(
     aiohttp_client, caplog, monkeypatch, tmp_path
 ):
