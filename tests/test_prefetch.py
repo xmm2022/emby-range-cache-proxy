@@ -717,6 +717,148 @@ def test_enqueue_prefetch_for_session_inserts_deduplicated_tasks(
     assert "http://origin" not in messages
 
 
+def test_enqueue_prefetch_for_session_uses_last_range_not_high_water_mark(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    store = SessionStateStore(tmp_path / "state.db")
+    session = PlaybackSessionRecord(
+        session_hash="s" * 64,
+        device_hash=None,
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_signature="o" * 64,
+        media_size=2000,
+        last_range_start=100,
+        last_range_end=199,
+        max_observed_offset=899,
+        first_seen_at=1.0,
+        last_seen_at=10.0,
+        last_emby_observed_at=None,
+        status="idle",
+        queued_until=None,
+    )
+
+    inserted = enqueue_prefetch_for_session(
+        store,
+        session,
+        prefetch=PrefetchConfig(
+            window_bytes=128,
+            resume_overlap_bytes=0,
+            max_session_bytes=128,
+            max_queue_depth=10,
+        ),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+        now=20.0,
+        priority=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=10, now=21.0)
+
+    assert inserted == 2
+    assert [task.start for task in claimed] == [192, 256]
+    assert [task.end for task in claimed] == [255, 319]
+
+
+def test_enqueue_prefetch_for_session_replans_when_last_range_moves_before_frontier(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    store = SessionStateStore(tmp_path / "state.db")
+    session = PlaybackSessionRecord(
+        session_hash="s" * 64,
+        device_hash=None,
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_signature="o" * 64,
+        media_size=2000,
+        last_range_start=100,
+        last_range_end=199,
+        max_observed_offset=899,
+        first_seen_at=1.0,
+        last_seen_at=10.0,
+        last_emby_observed_at=None,
+        status="idle",
+        queued_until=1023,
+    )
+
+    inserted = enqueue_prefetch_for_session(
+        store,
+        session,
+        prefetch=PrefetchConfig(
+            window_bytes=128,
+            resume_overlap_bytes=0,
+            max_session_bytes=128,
+            max_queue_depth=10,
+        ),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+        now=20.0,
+        priority=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=10, now=21.0)
+
+    assert inserted == 2
+    assert [task.start for task in claimed] == [192, 256]
+    assert [task.end for task in claimed] == [255, 319]
+
+
+def test_enqueue_prefetch_for_session_avoids_partial_overlap_after_replanning(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    store = SessionStateStore(tmp_path / "state.db")
+    update = PlaybackSessionUpdate(
+        session_hash="s" * 64,
+        device_hash=None,
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_signature="o" * 64,
+        media_size=2000,
+        byte_range=ByteRange(800, 899),
+        observed_at=1.0,
+    )
+    prefetch = PrefetchConfig(
+        window_bytes=100,
+        resume_overlap_bytes=0,
+        max_session_bytes=100,
+        max_queue_depth=10,
+    )
+    middle_cache = MiddleCacheConfig(segment_bytes=64)
+
+    store.record_playback(update)
+    store.update_session_queued_until("s" * 64, 1023, now=2.0)
+    store.record_playback(update.with_range(ByteRange(300, 350), observed_at=3.0))
+    first_inserted = enqueue_prefetch_for_session(
+        store,
+        store.get_session("s" * 64),
+        prefetch=prefetch,
+        middle_cache=middle_cache,
+        now=4.0,
+        priority=10,
+    )
+    store.record_playback(update.with_range(ByteRange(380, 399), observed_at=5.0))
+    second_inserted = enqueue_prefetch_for_session(
+        store,
+        store.get_session("s" * 64),
+        prefetch=prefetch,
+        middle_cache=middle_cache,
+        now=6.0,
+        priority=10,
+    )
+    claimed = store.claim_prefetch_tasks(limit=10, now=7.0)
+
+    assert first_inserted == 2
+    assert second_inserted == 2
+    assert [(task.start, task.end) for task in claimed] == [
+        (320, 383),
+        (384, 419),
+        (420, 447),
+        (448, 483),
+    ]
+
+
 def test_enqueue_prefetch_for_session_does_not_extend_without_playback_advance(
     monkeypatch, tmp_path
 ):
@@ -854,7 +996,7 @@ def test_plan_middle_ranges_aligns_skips_head_tail_and_caps_window():
         media_size=1000,
         head_size=100,
         tail_size=100,
-        max_observed_offset=350,
+        anchor_offset=350,
         queued_until=None,
         prefetch=PrefetchConfig(window_bytes=256, resume_overlap_bytes=50, max_session_bytes=512),
         middle_cache=MiddleCacheConfig(segment_bytes=64),
@@ -873,7 +1015,7 @@ def test_plan_middle_ranges_deduplicates_using_queued_until():
         media_size=1000,
         head_size=100,
         tail_size=100,
-        max_observed_offset=350,
+        anchor_offset=350,
         queued_until=511,
         prefetch=PrefetchConfig(window_bytes=256, resume_overlap_bytes=50, max_session_bytes=512),
         middle_cache=MiddleCacheConfig(segment_bytes=64),
@@ -892,7 +1034,7 @@ def test_plan_middle_ranges_queued_until_non_boundary_does_not_repeat_bytes():
         media_size=1000,
         head_size=100,
         tail_size=100,
-        max_observed_offset=350,
+        anchor_offset=350,
         queued_until=550,
         prefetch=PrefetchConfig(window_bytes=512, resume_overlap_bytes=50, max_session_bytes=512),
         middle_cache=MiddleCacheConfig(segment_bytes=64),
@@ -908,7 +1050,7 @@ def test_plan_middle_ranges_queued_until_non_boundary_fills_partial_gap():
         media_size=1000,
         head_size=100,
         tail_size=100,
-        max_observed_offset=350,
+        anchor_offset=350,
         queued_until=419,
         prefetch=PrefetchConfig(window_bytes=100, resume_overlap_bytes=0, max_session_bytes=512),
         middle_cache=MiddleCacheConfig(segment_bytes=64),
@@ -924,7 +1066,7 @@ def test_plan_middle_ranges_queued_until_frontier_takes_priority_over_playback_o
         media_size=2000,
         head_size=100,
         tail_size=100,
-        max_observed_offset=1000,
+        anchor_offset=1000,
         queued_until=575,
         prefetch=PrefetchConfig(window_bytes=512, resume_overlap_bytes=0, max_session_bytes=512),
         middle_cache=MiddleCacheConfig(segment_bytes=64),
@@ -940,7 +1082,7 @@ def test_plan_middle_ranges_caps_by_max_session_bytes():
         media_size=1000,
         head_size=100,
         tail_size=100,
-        max_observed_offset=350,
+        anchor_offset=350,
         queued_until=None,
         prefetch=PrefetchConfig(window_bytes=512, resume_overlap_bytes=50, max_session_bytes=100),
         middle_cache=MiddleCacheConfig(segment_bytes=64),
@@ -957,7 +1099,7 @@ def test_plan_middle_ranges_returns_partial_final_segment():
         media_size=1000,
         head_size=0,
         tail_size=0,
-        max_observed_offset=128,
+        anchor_offset=128,
         queued_until=None,
         prefetch=PrefetchConfig(window_bytes=100, resume_overlap_bytes=0, max_session_bytes=512),
         middle_cache=MiddleCacheConfig(segment_bytes=64),
@@ -974,7 +1116,7 @@ def test_plan_middle_ranges_returns_empty_when_middle_space_smaller_than_segment
         media_size=200,
         head_size=128,
         tail_size=64,
-        max_observed_offset=100,
+        anchor_offset=100,
         queued_until=None,
         prefetch=PrefetchConfig(window_bytes=256, resume_overlap_bytes=0, max_session_bytes=512),
         middle_cache=MiddleCacheConfig(segment_bytes=64),
@@ -988,7 +1130,7 @@ def test_plan_middle_ranges_returns_empty_when_no_middle_space():
         media_size=192,
         head_size=128,
         tail_size=64,
-        max_observed_offset=100,
+        anchor_offset=100,
         queued_until=None,
         prefetch=PrefetchConfig(window_bytes=256, resume_overlap_bytes=0, max_session_bytes=512),
         middle_cache=MiddleCacheConfig(segment_bytes=64),

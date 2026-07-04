@@ -266,7 +266,7 @@ def plan_middle_ranges(
     media_size: int,
     head_size: int,
     tail_size: int,
-    max_observed_offset: int,
+    anchor_offset: int,
     queued_until: int | None,
     prefetch: PrefetchConfig,
     middle_cache: MiddleCacheConfig,
@@ -282,7 +282,7 @@ def plan_middle_ranges(
         return []
 
     if queued_until is None:
-        start = max(middle_start, max_observed_offset - prefetch.resume_overlap_bytes)
+        start = max(middle_start, anchor_offset - prefetch.resume_overlap_bytes)
         start = max(middle_start, align_down(start, segment))
     else:
         start = max(middle_start, queued_until + 1)
@@ -316,69 +316,86 @@ def enqueue_prefetch_for_session(
         media_size=session.media_size,
         head_size=head_size,
         tail_size=tail_size,
-        max_observed_offset=session.max_observed_offset,
+        anchor_offset=session.last_range_end,
         queued_until=None,
         prefetch=prefetch,
         middle_cache=middle_cache,
     )
     if not target_ranges:
         return 0
+    target_start = target_ranges[0].start
     target_end = target_ranges[-1].end
-    if session.queued_until is not None and session.queued_until >= target_end:
-        return 0
+    queued_until = (
+        session.queued_until
+        if session.queued_until is not None
+        and target_start <= session.queued_until < target_end
+        else None
+    )
 
     ranges = plan_middle_ranges(
         media_size=session.media_size,
         head_size=head_size,
         tail_size=tail_size,
-        max_observed_offset=session.max_observed_offset,
-        queued_until=session.queued_until,
+        anchor_offset=session.last_range_end,
+        queued_until=queued_until,
         prefetch=prefetch,
         middle_cache=middle_cache,
     )
 
     inserted = 0
     highest_end: int | None = None
+    stop_queueing = False
     for byte_range in ranges:
+        if stop_queueing:
+            break
         if byte_range.start > target_end:
             break
         if byte_range.end > target_end:
             byte_range = ByteRange(byte_range.start, target_end)
-        if store.find_middle_block(session.cache_key, byte_range) is not None:
+        missing_ranges = _subtract_ranges(
+            byte_range,
+            store.reusable_prefetch_ranges(session.cache_key, byte_range),
+        )
+        if not missing_ranges:
             highest_end = byte_range.end
             continue
-        task = store.enqueue_prefetch_task(
-            session.item_id,
-            session.media_source_id,
-            session.cache_key,
-            byte_range.start,
-            byte_range.end,
-            priority=priority,
-            now=now,
-            max_queue_depth=prefetch.max_queue_depth,
-        )
-        if task is None:
-            if store.prefetch_task_exists(
+
+        for missing_range in missing_ranges:
+            task = store.enqueue_prefetch_task(
+                session.item_id,
+                session.media_source_id,
                 session.cache_key,
-                byte_range.start,
-                byte_range.end,
-            ):
-                highest_end = byte_range.end
-                continue
+                missing_range.start,
+                missing_range.end,
+                priority=priority,
+                now=now,
+                max_queue_depth=prefetch.max_queue_depth,
+            )
+            if task is None:
+                if store.prefetch_task_exists(
+                    session.cache_key,
+                    missing_range.start,
+                    missing_range.end,
+                ):
+                    highest_end = missing_range.end
+                    continue
+                stop_queueing = True
+                break
+            inserted += 1
+            LOGGER.info(
+                "prefetch_queued item_id=%s media_source_id=%s session=%s "
+                "cache_key=%s range=%s-%s priority=%s",
+                session.item_id,
+                session.media_source_id,
+                short_hash(session.session_hash),
+                short_hash(session.cache_key),
+                missing_range.start,
+                missing_range.end,
+                priority,
+            )
+            highest_end = missing_range.end
+        if stop_queueing:
             break
-        inserted += 1
-        LOGGER.info(
-            "prefetch_queued item_id=%s media_source_id=%s session=%s "
-            "cache_key=%s range=%s-%s priority=%s",
-            session.item_id,
-            session.media_source_id,
-            short_hash(session.session_hash),
-            short_hash(session.cache_key),
-            byte_range.start,
-            byte_range.end,
-            priority,
-        )
-        highest_end = byte_range.end
 
     if highest_end is not None:
         store.update_session_queued_until(
@@ -387,3 +404,23 @@ def enqueue_prefetch_for_session(
             now=now,
         )
     return inserted
+
+
+def _subtract_ranges(
+    byte_range: ByteRange, existing_ranges: list[ByteRange]
+) -> list[ByteRange]:
+    missing: list[ByteRange] = []
+    current = byte_range.start
+    for existing in existing_ranges:
+        if existing.end < current:
+            continue
+        if existing.start > byte_range.end:
+            break
+        if existing.start > current:
+            missing.append(ByteRange(current, min(existing.start - 1, byte_range.end)))
+        current = max(current, existing.end + 1)
+        if current > byte_range.end:
+            break
+    if current <= byte_range.end:
+        missing.append(ByteRange(current, byte_range.end))
+    return missing

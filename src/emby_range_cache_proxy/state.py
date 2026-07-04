@@ -419,6 +419,43 @@ class SessionStateStore:
             ).fetchone()
         return row is not None
 
+    def reusable_prefetch_ranges(
+        self, cache_key: str, byte_range: ByteRange
+    ) -> list[ByteRange]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT start, end
+                FROM middle_blocks
+                WHERE cache_key = ?
+                  AND start <= ?
+                  AND end >= ?
+                UNION ALL
+                SELECT start, end
+                FROM prefetch_tasks
+                WHERE cache_key = ?
+                  AND start <= ?
+                  AND end >= ?
+                  AND (
+                        status IN ('queued', 'running')
+                     OR (
+                            status IN ('failed', 'skipped')
+                            AND next_attempt_at IS NOT NULL
+                        )
+                  )
+                ORDER BY start ASC, end ASC
+                """,
+                (
+                    cache_key,
+                    byte_range.end,
+                    byte_range.start,
+                    cache_key,
+                    byte_range.end,
+                    byte_range.start,
+                ),
+            ).fetchall()
+        return [ByteRange(row["start"], row["end"]) for row in rows]
+
     def claim_prefetch_tasks(
         self,
         *,
