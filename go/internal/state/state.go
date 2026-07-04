@@ -96,10 +96,18 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	store := &Store{db: db}
-	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
-		db.Close()
-		return nil, err
+	for _, pragma := range []string{
+		`PRAGMA busy_timeout=5000`,
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA synchronous=NORMAL`,
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	if err := store.initSchema(); err != nil {
 		db.Close()

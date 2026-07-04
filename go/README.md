@@ -48,7 +48,7 @@ The Go service opens the existing `session.state_db` and runs additive migration
 - add `prefetch_tasks.next_attempt_at` if it is missing
 - backfill retryable failed/skipped prefetch tasks into the queue
 
-It does not drop or rewrite Python rows. The cache key, head/tail files, middle block files, and current table names stay compatible with the Python phase2 layout.
+It also enables SQLite WAL mode for steadier planner/worker concurrency. It does not drop or rewrite Python rows. The cache key, head/tail files, middle block files, and current table names stay compatible with the Python phase2 layout.
 
 ## Rollback To Python
 
