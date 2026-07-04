@@ -12,6 +12,7 @@ Unified local cache proxy for Emby original media direct-play requests.
 - `.strm` support is not tied to a hard-coded port. The current test server allowlists `http://127.0.0.1:18096/` as its local `.strm` origin; `.strm` files pointing elsewhere fall back to Emby unless that origin prefix is explicitly allowlisted.
 - The cache stores adaptive head and tail ranges for startup, probing, and container metadata reads.
 - The proxy does not actively cache arbitrary middle playback ranges.
+- `POST /internal/prewarm` accepts `itemId` and `mediaSourceId`, then performs the same Emby `PlaybackInfo`, `.strm`, and rollout allowlist checks before warming only head and tail blocks.
 - Out-of-scope requests fall back to the normal Emby proxy path.
 
 ## Security Boundary
@@ -21,6 +22,20 @@ Unified local cache proxy for Emby original media direct-play requests.
 - Cache entries are shared by media source and origin metadata, not by user. Authorization remains per request.
 - Local `.strm` reads are limited to configured path mappings, and resolved `.strm` URLs are limited by `rollout.path_prefix_allowlist`.
 - The prewarm API key only discovers and warms rollout-scoped media. It does not replace user token checks.
+
+## Internal Prewarm Endpoint
+
+`POST /internal/prewarm` is intended for loopback-only callers such as MediaInfoKeeper after media information extraction succeeds. Authenticate with `X-Range-Cache-Prewarm-Key: <prewarm_api_key>` or `Authorization: Bearer <prewarm_api_key>`.
+
+Request body:
+
+```json
+{"itemId":"12345","mediaSourceId":"mediasource_12345"}
+```
+
+The endpoint returns `202` with `queued` for a new in-process prewarm task and `existing` when the same item/source is already queued or running. The task queries Emby PlaybackInfo with the internal key, resolves mapped `.strm` files only when the resolved URL matches `rollout.path_prefix_allowlist`, skips already-complete head/tail cache blocks, uses `prewarm.concurrency` for in-process concurrency, throttles downloads with `prefetch.bandwidth_bytes_per_second`, and evicts through the head/tail cache capacity policy.
+
+`prewarm.enabled` only controls the periodic recent-item scanner. Event-triggered prewarm through `/internal/prewarm` requires `prewarm_api_key` but does not require enabling periodic scans.
 
 ## Caddy Fallback Boundary
 

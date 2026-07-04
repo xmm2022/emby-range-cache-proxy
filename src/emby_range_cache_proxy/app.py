@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
@@ -45,6 +46,12 @@ def create_app(config: Config) -> web.Application:
     app["cache"] = HeadTailCache(config.cache_dir, max_bytes=config.cache.max_bytes)
     app["cache_build_locks"] = {}
     app["cache_build_locks_guard"] = asyncio.Lock()
+    if config.prewarm_api_key:
+        app["internal_prewarm_worker"] = PrewarmWorker(config)
+        app["internal_prewarm_semaphore"] = asyncio.Semaphore(config.prewarm.concurrency)
+        app["internal_prewarm_tasks"] = {}
+        app["internal_prewarm_tasks_guard"] = asyncio.Lock()
+        app.cleanup_ctx.append(internal_prewarm_lifecycle)
     if config.session.enabled or config.middle_cache.enabled or config.prefetch.enabled:
         state_path = (
             Path(config.session.state_db)
@@ -73,6 +80,7 @@ def create_app(config: Config) -> web.Application:
     if config.prewarm.enabled and config.prewarm_api_key:
         app.cleanup_ctx.append(prewarm_lifecycle)
     app.router.add_get("/healthz", healthz)
+    app.router.add_post("/internal/prewarm", internal_prewarm_handler)
     app.router.add_route("*", "/{tail:.*}", proxy_handler)
     return app
 
@@ -191,7 +199,8 @@ async def _prefetch_worker_loop(config: Config, worker: PrefetchWorker) -> None:
 
 async def prewarm_lifecycle(app: web.Application) -> AsyncIterator[None]:
     config: Config = app["config"]
-    task = asyncio.create_task(_prewarm_loop(config))
+    worker: PrewarmWorker = app.get("internal_prewarm_worker") or PrewarmWorker(config)
+    task = asyncio.create_task(_prewarm_loop(config, worker))
     app["prewarm_task"] = task
     try:
         yield
@@ -201,8 +210,7 @@ async def prewarm_lifecycle(app: web.Application) -> AsyncIterator[None]:
             await task
 
 
-async def _prewarm_loop(config: Config) -> None:
-    worker = PrewarmWorker(config)
+async def _prewarm_loop(config: Config, worker: PrewarmWorker) -> None:
     while True:
         try:
             await worker.run_once()
@@ -211,8 +219,97 @@ async def _prewarm_loop(config: Config) -> None:
         await asyncio.sleep(config.prewarm.interval_seconds)
 
 
+async def internal_prewarm_lifecycle(app: web.Application) -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        tasks = list(app["internal_prewarm_tasks"].values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def healthz(request: web.Request) -> web.Response:
     return web.Response(text="ok\n")
+
+
+async def internal_prewarm_handler(request: web.Request) -> web.Response:
+    config: Config = request.app["config"]
+    if not config.prewarm_api_key:
+        raise web.HTTPNotFound(text="not found\n") from None
+    if not _request_contains_prewarm_key(request, config.prewarm_api_key):
+        raise web.HTTPForbidden(text="forbidden\n") from None
+
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise web.HTTPBadRequest(text="invalid json\n") from None
+    if not isinstance(payload, dict):
+        raise web.HTTPBadRequest(text="invalid json\n") from None
+
+    item_id = _payload_string(payload, "itemId", "item_id")
+    media_source_id = _payload_string(payload, "mediaSourceId", "media_source_id")
+    if not item_id or not media_source_id:
+        raise web.HTTPBadRequest(text="itemId and mediaSourceId are required\n") from None
+
+    status = await _enqueue_internal_prewarm(request.app, item_id, media_source_id)
+    return web.json_response(
+        {"status": status, "itemId": item_id, "mediaSourceId": media_source_id},
+        status=202,
+    )
+
+
+async def _enqueue_internal_prewarm(
+    app: web.Application, item_id: str, media_source_id: str
+) -> str:
+    key = (item_id, media_source_id)
+    tasks: dict[tuple[str, str], asyncio.Task] = app["internal_prewarm_tasks"]
+    guard: asyncio.Lock = app["internal_prewarm_tasks_guard"]
+    async with guard:
+        existing = tasks.get(key)
+        if existing is not None and not existing.done():
+            return "existing"
+        if existing is not None:
+            tasks.pop(key, None)
+
+        task = asyncio.create_task(_run_internal_prewarm(app, item_id, media_source_id))
+        tasks[key] = task
+
+        def remove_completed(completed: asyncio.Task) -> None:
+            if tasks.get(key) is completed:
+                tasks.pop(key, None)
+
+        task.add_done_callback(remove_completed)
+        return "queued"
+
+
+async def _run_internal_prewarm(
+    app: web.Application, item_id: str, media_source_id: str
+) -> None:
+    semaphore: asyncio.Semaphore = app["internal_prewarm_semaphore"]
+    worker: PrewarmWorker = app["internal_prewarm_worker"]
+    async with semaphore:
+        try:
+            result = await worker.prewarm_item(item_id, media_source_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.warning(
+                "internal prewarm failed item_id=%s media_source_id=%s error_type=%s",
+                item_id,
+                media_source_id,
+                type(error).__name__,
+            )
+            return
+        LOGGER.info(
+            "internal prewarm result item_id=%s media_source_id=%s scanned=%s prewarmed=%s skipped=%s",
+            item_id,
+            media_source_id,
+            getattr(result, "scanned", "unknown"),
+            getattr(result, "prewarmed", "unknown"),
+            getattr(result, "skipped", "unknown"),
+        )
 
 
 async def proxy_handler(request: web.Request) -> web.StreamResponse:
@@ -667,6 +764,23 @@ def _request_contains_internal_key(request: web.Request, internal_key: str) -> b
         name.lower() == "x-emby-token" and value == internal_key
         for name, value in request.headers.items()
     )
+
+
+def _request_contains_prewarm_key(request: web.Request, internal_key: str) -> bool:
+    header_key = request.headers.get("X-Range-Cache-Prewarm-Key")
+    if header_key is not None and hmac.compare_digest(header_key, internal_key):
+        return True
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, value = authorization.partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(value, internal_key)
+
+
+def _payload_string(payload: dict, *names: str) -> str:
+    for name in names:
+        value = payload.get(name)
+        if isinstance(value, str):
+            return value.strip()
+    return ""
 
 
 def _log_decision(

@@ -250,21 +250,36 @@ Expected: Caddy falls back to `127.0.0.1:8096` because `127.0.0.1:18180` is unav
 
 ## Prewarm Tests
 
-Prewarm uses `prewarm_api_key` only for Emby item discovery and PlaybackInfo lookup during background warming. It must not be accepted as a replacement for a user's playback token.
+Prewarm uses `prewarm_api_key` only for Emby item discovery, PlaybackInfo lookup, and the loopback internal prewarm endpoint. It must not be accepted as a replacement for a user's playback token.
 
-Confirm prewarm is enabled only with a narrow rollout allowlist:
+Confirm the internal key is configured with a narrow rollout allowlist. `prewarm.enabled` controls only the periodic recent-item scanner; MediaInfoKeeper-triggered prewarm through `POST /internal/prewarm` only requires `prewarm_api_key`.
 
 ```bash
 jq '.prewarm, .rollout, (.prewarm_api_key != null)' /etc/emby-range-cache-proxy/config.json
 ```
 
-Trigger or wait for the next scan after adding a new test item or selecting a recently added item. The worker should scan recent media and prewarm only adaptive head and tail ranges.
+For a direct endpoint smoke test, trigger one allowlisted media source over loopback:
+
+```bash
+PREWARM_KEY=$(jq -r '.prewarm_api_key' /etc/emby-range-cache-proxy/config.json)
+curl -fsS -X POST http://127.0.0.1:18180/internal/prewarm \
+  -H "X-Range-Cache-Prewarm-Key: $PREWARM_KEY" \
+  -H 'Content-Type: application/json' \
+  --data "{\"itemId\":\"$ITEM_ID\",\"mediaSourceId\":\"$MEDIA_SOURCE_ID\"}"
+```
+
+Expected: JSON with `status` set to `queued`, or `existing` if the same item/source is already queued or running. The proxy then queries Emby PlaybackInfo itself, resolves `.strm` only through configured path mappings and `rollout.path_prefix_allowlist`, and warms only adaptive head and tail ranges.
+
+When wiring MediaInfoKeeper, call the same `POST /internal/prewarm` endpoint only after media information extraction succeeds. Keep the call loopback-local to `127.0.0.1:18180`, send `itemId` and `mediaSourceId` in the JSON body, and send the secret only in `X-Range-Cache-Prewarm-Key` or a Bearer `Authorization` header.
+
+If periodic prewarm is intentionally enabled, trigger or wait for the next scan after adding a new test item or selecting a recently added item. The worker should scan recent media and prewarm only adaptive head and tail ranges.
 
 Checks:
 
 - New or recent rollout-allowlisted media creates head/tail cache entries only.
 - No arbitrary middle cache entry is created by the prewarm worker.
 - Non-allowlisted media is skipped.
+- A repeated `POST /internal/prewarm` for the same item/source returns `existing` while the first task is queued or running.
 - A playback request using the internal `prewarm_api_key` as `api_key` is rejected by the proxy before Emby authorization.
 - User playback authorization still calls Emby with the user's own token on each playback request.
 

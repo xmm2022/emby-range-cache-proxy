@@ -9,9 +9,10 @@ from aiohttp import web
 
 import emby_range_cache_proxy.app as app_module
 from emby_range_cache_proxy import prefetch as prefetch_module
+from emby_range_cache_proxy import prewarm as prewarm_module
 from emby_range_cache_proxy.auth import AuthUnavailable, AuthorizationError
 from emby_range_cache_proxy.app import create_app
-from emby_range_cache_proxy.cache import CacheReadError
+from emby_range_cache_proxy.cache import CacheReadError, cache_key
 from emby_range_cache_proxy.config import (
     CacheConfig,
     Config,
@@ -23,7 +24,7 @@ from emby_range_cache_proxy.config import (
     SessionConfig,
 )
 from emby_range_cache_proxy.middle_cache import MiddleRangeCache
-from emby_range_cache_proxy.models import ByteRange, RequestContext, SourceMetadata
+from emby_range_cache_proxy.models import ByteRange, MediaSource, RequestContext, SourceMetadata
 from emby_range_cache_proxy.session import origin_signature
 from emby_range_cache_proxy.state import (
     PlaybackSessionUpdate,
@@ -100,6 +101,239 @@ async def test_prewarm_lifecycle_does_not_start_without_internal_key(aiohttp_cli
 
     assert "prewarm_task" not in app
 
+    await client.close()
+
+
+async def test_internal_prewarm_endpoint_rejects_missing_secret(aiohttp_client, tmp_path):
+    fallback_calls = 0
+
+    async def fallback(request):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return web.Response(status=200)
+
+    emby_app = web.Application()
+    emby_app.router.add_route("*", "/{tail:.*}", fallback)
+    emby_server = await aiohttp_client(emby_app)
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal",
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.post(
+        "/internal/prewarm",
+        json={"itemId": "1", "mediaSourceId": "ms1"},
+    )
+
+    assert response.status == 403
+    assert fallback_calls == 0
+
+    await client.close()
+
+
+async def test_internal_prewarm_endpoint_queues_head_tail_prewarm(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prewarm_module, "adaptive_head_tail", lambda size: (16, 4))
+
+    async def playback_info(request):
+        assert request.query["api_key"] == "internal"
+        assert request.query["MediaSourceId"] == "ms1"
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": 100,
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "100"})
+        if request.headers["Range"] == "bytes=0-15":
+            return web.Response(status=206, body=b"0123456789abcdef", headers={"Content-Range": "bytes 0-15/100"})
+        if request.headers["Range"] == "bytes=96-99":
+            return web.Response(status=206, body=b"wxyz", headers={"Content-Range": "bytes 96-99/100"})
+        return web.Response(status=416)
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", origin)
+    origin_server = await aiohttp_client(origin_app)
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_server = await aiohttp_client(emby_app)
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal",
+            rollout=RolloutConfig(enabled=True, item_allowlist={"1"}, media_source_allowlist={"ms1"}),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.post(
+        "/internal/prewarm",
+        json={"itemId": "1", "mediaSourceId": "ms1"},
+        headers={"X-Range-Cache-Prewarm-Key": "internal"},
+    )
+    payload = await response.json()
+
+    assert response.status == 202
+    assert payload == {"status": "queued", "itemId": "1", "mediaSourceId": "ms1"}
+
+    source = MediaSource(
+        item_id="1",
+        media_source_id="ms1",
+        path=str(origin_server.make_url("/movie.mkv")),
+        protocol="Http",
+        size=100,
+    )
+    metadata = SourceMetadata(url=str(origin_server.make_url("/movie.mkv")), size=100)
+    key = cache_key(source, metadata)
+    deadline = asyncio.get_running_loop().time() + 1
+    while app["cache"].read_block(key, "tail", ByteRange(96, 99)) is None:
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.01)
+
+    assert app["cache"].read_block(key, "head", ByteRange(0, 15)) == b"0123456789abcdef"
+    assert app["cache"].read_block(key, "tail", ByteRange(96, 99)) == b"wxyz"
+
+    await client.close()
+
+
+async def test_internal_prewarm_endpoint_dedupes_queued_or_running(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    class FakePrewarmWorker:
+        def __init__(self, config):
+            calls.append(("init", config.prewarm_api_key))
+
+        async def prewarm_item(self, item_id, media_source_id):
+            calls.append(("prewarm_item", item_id, media_source_id))
+            started.set()
+            await release.wait()
+            return None
+
+    async def fallback(request):
+        return web.Response(status=500)
+
+    monkeypatch.setattr(app_module, "PrewarmWorker", FakePrewarmWorker)
+    emby_app = web.Application()
+    emby_app.router.add_route("*", "/{tail:.*}", fallback)
+    emby_server = await aiohttp_client(emby_app)
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal",
+        )
+    )
+    client = await aiohttp_client(app)
+
+    first = await client.post(
+        "/internal/prewarm",
+        json={"itemId": "1", "mediaSourceId": "ms1"},
+        headers={"X-Range-Cache-Prewarm-Key": "internal"},
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    second = await client.post(
+        "/internal/prewarm",
+        json={"itemId": "1", "mediaSourceId": "ms1"},
+        headers={"X-Range-Cache-Prewarm-Key": "internal"},
+    )
+
+    assert first.status == 202
+    assert await first.json() == {"status": "queued", "itemId": "1", "mediaSourceId": "ms1"}
+    assert second.status == 202
+    assert await second.json() == {"status": "existing", "itemId": "1", "mediaSourceId": "ms1"}
+    assert calls == [("init", "internal"), ("prewarm_item", "1", "ms1")]
+
+    release.set()
+    await client.close()
+
+
+async def test_internal_prewarm_endpoint_respects_prewarm_concurrency(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    calls = []
+
+    class FakePrewarmWorker:
+        def __init__(self, config):
+            pass
+
+        async def prewarm_item(self, item_id, media_source_id):
+            calls.append((item_id, media_source_id))
+            if item_id == "1":
+                first_started.set()
+                await release_first.wait()
+            if item_id == "2":
+                second_started.set()
+                await release_second.wait()
+            return None
+
+    async def fallback(request):
+        return web.Response(status=500)
+
+    monkeypatch.setattr(app_module, "PrewarmWorker", FakePrewarmWorker)
+    emby_app = web.Application()
+    emby_app.router.add_route("*", "/{tail:.*}", fallback)
+    emby_server = await aiohttp_client(emby_app)
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal",
+            prewarm=PrewarmConfig(concurrency=1),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    first = await client.post(
+        "/internal/prewarm",
+        json={"itemId": "1", "mediaSourceId": "ms1"},
+        headers={"X-Range-Cache-Prewarm-Key": "internal"},
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    second = await client.post(
+        "/internal/prewarm",
+        json={"itemId": "2", "mediaSourceId": "ms2"},
+        headers={"X-Range-Cache-Prewarm-Key": "internal"},
+    )
+    await asyncio.sleep(0)
+
+    assert first.status == 202
+    assert second.status == 202
+    assert calls == [("1", "ms1")]
+
+    release_first.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    assert calls == [("1", "ms1"), ("2", "ms2")]
+
+    release_second.set()
     await client.close()
 
 

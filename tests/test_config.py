@@ -126,6 +126,12 @@ def test_prewarm_config_rejects_short_interval(interval_seconds):
         PrewarmConfig(enabled=True, interval_seconds=interval_seconds)
 
 
+@pytest.mark.parametrize("concurrency", [0, -1])
+def test_prewarm_config_rejects_non_positive_concurrency(concurrency):
+    with pytest.raises(ValueError, match="prewarm\\.concurrency"):
+        PrewarmConfig(concurrency=concurrency)
+
+
 @pytest.mark.parametrize("interval_seconds", [0, -1, 59])
 def test_load_config_rejects_short_prewarm_interval(tmp_path, interval_seconds):
     path = tmp_path / "config.json"
@@ -140,6 +146,23 @@ def test_load_config_rejects_short_prewarm_interval(tmp_path, interval_seconds):
     )
 
     with pytest.raises(ValueError, match="prewarm\\.interval_seconds"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("concurrency", [0, -1])
+def test_load_config_rejects_non_positive_prewarm_concurrency(tmp_path, concurrency):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "prewarm": {"concurrency": concurrency},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="prewarm\\.concurrency"):
         load_config(path)
 
 

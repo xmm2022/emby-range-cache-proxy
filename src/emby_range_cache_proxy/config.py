@@ -55,6 +55,8 @@ class PrewarmConfig:
     def __post_init__(self) -> None:
         if self.interval_seconds < 60:
             raise ValueError("prewarm.interval_seconds must be >= 60")
+        if self.concurrency <= 0:
+            raise ValueError("prewarm.concurrency must be positive")
 
 
 @dataclass

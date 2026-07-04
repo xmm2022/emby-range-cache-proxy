@@ -47,6 +47,18 @@ def test_docs_explain_strm_origin_allowlist_boundary():
     assert "Port `18096` is a test-server origin convention" in deploy_doc
 
 
+def test_docs_explain_internal_prewarm_endpoint():
+    readme = Path("README.md").read_text()
+    deploy_doc = Path("docs/deploy-test-server.md").read_text()
+
+    assert "POST /internal/prewarm" in readme
+    assert "X-Range-Cache-Prewarm-Key" in readme
+    assert "`prewarm.enabled` only controls the periodic recent-item scanner" in readme
+    assert "MediaInfoKeeper" in deploy_doc
+    assert "POST /internal/prewarm" in deploy_doc
+    assert "X-Range-Cache-Prewarm-Key" in deploy_doc
+
+
 def test_config_example_documents_prefetch_polling_defaults():
     config = json.loads(Path("config.example.json").read_text())
 

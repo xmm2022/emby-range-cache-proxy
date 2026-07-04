@@ -294,6 +294,261 @@ async def test_prewarm_uses_origin_head_metadata_for_runtime_cache_key(aiohttp_c
     assert cache.read_block(key, "tail", ByteRange(96, 99)) == b"wxyz"
 
 
+async def test_prewarm_item_queries_selected_media_source_and_builds_head_tail(
+    aiohttp_client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(prewarm_module, "adaptive_head_tail", lambda size: (16, 4))
+    range_requests = []
+
+    async def playback_info(request):
+        assert request.query["api_key"] == "internal"
+        assert request.query["MediaSourceId"] == "ms1"
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "other",
+                        "Path": "http://example.invalid/other.mkv",
+                        "Protocol": "Http",
+                        "Size": 100,
+                    },
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": 100,
+                    },
+                ]
+            }
+        )
+
+    async def origin(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "100"})
+        range_requests.append(request.headers["Range"])
+        if request.headers["Range"] == "bytes=0-15":
+            return web.Response(status=206, body=b"0123456789abcdef", headers={"Content-Range": "bytes 0-15/100"})
+        if request.headers["Range"] == "bytes=96-99":
+            return web.Response(status=206, body=b"wxyz", headers={"Content-Range": "bytes 96-99/100"})
+        return web.Response(status=416)
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", origin)
+    origin_server = await aiohttp_client(origin_app)
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_server = await aiohttp_client(emby_app)
+
+    config = Config(
+        emby_base_url=str(emby_server.make_url("")),
+        fallback_base_url=str(emby_server.make_url("")),
+        cache_dir=str(tmp_path),
+        prewarm_api_key="internal",
+        rollout=RolloutConfig(enabled=True, item_allowlist={"1"}, media_source_allowlist={"ms1"}),
+    )
+    worker = PrewarmWorker(config)
+
+    result = await worker.prewarm_item("1", "ms1")
+
+    assert result.scanned == 1
+    assert result.prewarmed == 1
+    assert result.skipped == 0
+    assert range_requests == ["bytes=0-15", "bytes=96-99"]
+
+
+async def test_prewarm_item_skips_complete_existing_head_tail(
+    aiohttp_client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(prewarm_module, "adaptive_head_tail", lambda size: (16, 4))
+    range_requests = []
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": 100,
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        if request.method == "HEAD":
+            return web.Response(
+                headers={
+                    "Content-Length": "100",
+                    "ETag": '"stable"',
+                    "Last-Modified": "Wed, 01 Jan 2025 00:00:00 GMT",
+                }
+            )
+        range_requests.append(request.headers["Range"])
+        return web.Response(status=500)
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", origin)
+    origin_server = await aiohttp_client(origin_app)
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_server = await aiohttp_client(emby_app)
+
+    config = Config(
+        emby_base_url=str(emby_server.make_url("")),
+        fallback_base_url=str(emby_server.make_url("")),
+        cache_dir=str(tmp_path),
+        prewarm_api_key="internal",
+        rollout=RolloutConfig(enabled=True, item_allowlist={"1"}, media_source_allowlist={"ms1"}),
+    )
+    source = MediaSource(
+        item_id="1",
+        media_source_id="ms1",
+        path=str(origin_server.make_url("/movie.mkv")),
+        protocol="Http",
+        size=100,
+    )
+    metadata = SourceMetadata(
+        url=str(origin_server.make_url("/movie.mkv")),
+        size=100,
+        etag='"stable"',
+        last_modified="Wed, 01 Jan 2025 00:00:00 GMT",
+    )
+    key = cache_key(source, metadata)
+    cache = HeadTailCache(tmp_path, max_bytes=config.cache.max_bytes)
+    cache.store_block(key, "head", ByteRange(0, 15), b"0123456789abcdef")
+    cache.store_block(key, "tail", ByteRange(96, 99), b"wxyz")
+    worker = PrewarmWorker(config)
+
+    result = await worker.prewarm_item("1", "ms1")
+
+    assert result.scanned == 1
+    assert result.prewarmed == 0
+    assert result.skipped == 1
+    assert range_requests == []
+
+
+async def test_prewarm_item_resolves_strm_with_path_mapping_and_url_prefix(
+    aiohttp_client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(prewarm_module, "adaptive_head_tail", lambda size: (16, 4))
+    strm_root = tmp_path / "strm"
+    strm_root.mkdir()
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": "/strm/movie.strm",
+                        "Protocol": "File",
+                        "Size": 100,
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "100"})
+        if request.headers["Range"] == "bytes=0-15":
+            return web.Response(status=206, body=b"0123456789abcdef", headers={"Content-Range": "bytes 0-15/100"})
+        if request.headers["Range"] == "bytes=96-99":
+            return web.Response(status=206, body=b"wxyz", headers={"Content-Range": "bytes 96-99/100"})
+        return web.Response(status=416)
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", origin)
+    origin_server = await aiohttp_client(origin_app)
+    (strm_root / "movie.strm").write_text(f"{origin_server.make_url('/movie.mkv')}\n")
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_server = await aiohttp_client(emby_app)
+
+    config = Config(
+        emby_base_url=str(emby_server.make_url("")),
+        fallback_base_url=str(emby_server.make_url("")),
+        cache_dir=str(tmp_path),
+        prewarm_api_key="internal",
+        path_mappings=(PathMapping("/strm/", str(strm_root)),),
+        rollout=RolloutConfig(
+            enabled=True,
+            item_allowlist={"1"},
+            media_source_allowlist={"ms1"},
+            path_prefix_allowlist=(str(origin_server.make_url("")),),
+        ),
+    )
+    worker = PrewarmWorker(config)
+
+    result = await worker.prewarm_item("1", "ms1")
+
+    assert result.scanned == 1
+    assert result.prewarmed == 1
+    assert result.skipped == 0
+
+
+async def test_prewarm_item_downloads_through_bandwidth_limiter(
+    aiohttp_client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(prewarm_module, "adaptive_head_tail", lambda size: (16, 4))
+    consumed = []
+
+    class RecordingLimiter:
+        async def consume(self, byte_count):
+            consumed.append(byte_count)
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": str(origin_server.make_url("/movie.mkv")),
+                        "Protocol": "Http",
+                        "Size": 100,
+                    }
+                ]
+            }
+        )
+
+    async def origin(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "100"})
+        if request.headers["Range"] == "bytes=0-15":
+            return web.Response(status=206, body=b"0123456789abcdef", headers={"Content-Range": "bytes 0-15/100"})
+        if request.headers["Range"] == "bytes=96-99":
+            return web.Response(status=206, body=b"wxyz", headers={"Content-Range": "bytes 96-99/100"})
+        return web.Response(status=416)
+
+    origin_app = web.Application()
+    origin_app.router.add_route("*", "/movie.mkv", origin)
+    origin_server = await aiohttp_client(origin_app)
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_server = await aiohttp_client(emby_app)
+
+    config = Config(
+        emby_base_url=str(emby_server.make_url("")),
+        fallback_base_url=str(emby_server.make_url("")),
+        cache_dir=str(tmp_path),
+        prewarm_api_key="internal",
+        rollout=RolloutConfig(enabled=True, item_allowlist={"1"}, media_source_allowlist={"ms1"}),
+    )
+    worker = PrewarmWorker(config)
+    worker.limiter = RecordingLimiter()
+
+    result = await worker.prewarm_item("1", "ms1")
+
+    assert result.prewarmed == 1
+    assert consumed == [16, 4]
+
+
 async def test_prewarm_skips_non_json_playback_info_and_continues(aiohttp_client, tmp_path, monkeypatch):
     monkeypatch.setattr(prewarm_module, "adaptive_head_tail", lambda size: (16, 4))
 
