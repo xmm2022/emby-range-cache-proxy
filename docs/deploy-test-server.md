@@ -54,6 +54,8 @@ Expected: `127.0.0.1`.
 }
 ```
 
+This means the test deployment caches only `.strm` entries whose resolved URL starts with `http://127.0.0.1:18096/`. Other `.strm` URLs are not cached by the range proxy and should fall back to the normal Emby path. Port `18096` is a test-server origin convention, not a code requirement; add another trusted local origin prefix only after confirming reachability, authorization scope, and resource limits.
+
 - Confirm logs are token-safe before enabling traffic. Proxy decision logs must not include raw query strings, `api_key`, `X-Emby-Token`, `PlaySessionId`, `DeviceId`, origin URLs, or internal prewarm keys. The service disables the default aiohttp access log.
 - Keep the config readable only by root and the service group because it may contain `prewarm_api_key`. The service runs as `emby-cache`, so group read is required:
 

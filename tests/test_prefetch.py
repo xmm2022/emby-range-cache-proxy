@@ -717,6 +717,44 @@ def test_enqueue_prefetch_for_session_inserts_deduplicated_tasks(
     assert "http://origin" not in messages
 
 
+def test_enqueue_prefetch_for_session_deduplicates_running_task(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    store = SessionStateStore(tmp_path / "state.db")
+    session = _record_idle_session(store)
+    prefetch = PrefetchConfig(
+        window_bytes=128,
+        resume_overlap_bytes=0,
+        max_session_bytes=128,
+        max_queue_depth=10,
+    )
+    middle_cache = MiddleCacheConfig(segment_bytes=64)
+
+    inserted = enqueue_prefetch_for_session(
+        store,
+        session,
+        prefetch=prefetch,
+        middle_cache=middle_cache,
+        now=20.0,
+        priority=10,
+    )
+    running = store.claim_prefetch_tasks(limit=1, now=21.0)
+    repeated = enqueue_prefetch_for_session(
+        store,
+        store.get_session("s" * 64),
+        prefetch=prefetch,
+        middle_cache=middle_cache,
+        now=22.0,
+        priority=10,
+    )
+
+    assert inserted == 2
+    assert [(task.start, task.end) for task in running] == [(320, 383)]
+    assert repeated == 0
+    assert store.queue_depth() == 1
+
+
 def test_enqueue_prefetch_for_session_uses_last_range_not_high_water_mark(
     monkeypatch, tmp_path
 ):
@@ -758,6 +796,48 @@ def test_enqueue_prefetch_for_session_uses_last_range_not_high_water_mark(
     assert inserted == 2
     assert [task.start for task in claimed] == [192, 256]
     assert [task.end for task in claimed] == [255, 319]
+
+
+def test_enqueue_prefetch_for_session_skips_when_stop_point_is_inside_head(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prefetch_module, "adaptive_head_tail", lambda size: (128, 128))
+    store = SessionStateStore(tmp_path / "state.db")
+    session = PlaybackSessionRecord(
+        session_hash="s" * 64,
+        device_hash=None,
+        item_id="1",
+        media_source_id="ms1",
+        cache_key="a" * 64,
+        origin_signature="o" * 64,
+        media_size=2000,
+        last_range_start=10,
+        last_range_end=64,
+        max_observed_offset=64,
+        first_seen_at=1.0,
+        last_seen_at=10.0,
+        last_emby_observed_at=None,
+        status="idle",
+        queued_until=None,
+    )
+
+    inserted = enqueue_prefetch_for_session(
+        store,
+        session,
+        prefetch=PrefetchConfig(
+            window_bytes=1024,
+            resume_overlap_bytes=0,
+            max_session_bytes=1024,
+            max_queue_depth=10,
+        ),
+        middle_cache=MiddleCacheConfig(segment_bytes=64),
+        now=20.0,
+        priority=10,
+    )
+
+    assert inserted == 0
+    assert store.queue_depth() == 0
+    assert store.get_session("s" * 64) is None
 
 
 def test_enqueue_prefetch_for_session_replans_when_last_range_moves_before_frontier(
@@ -1004,9 +1084,7 @@ def test_plan_middle_ranges_aligns_skips_head_tail_and_caps_window():
 
     assert ranges == [
         ByteRange(256, 319),
-        ByteRange(320, 383),
-        ByteRange(384, 447),
-        ByteRange(448, 511),
+        ByteRange(320, 355),
     ]
 
 
@@ -1023,9 +1101,7 @@ def test_plan_middle_ranges_deduplicates_using_queued_until():
 
     assert ranges == [
         ByteRange(512, 575),
-        ByteRange(576, 639),
-        ByteRange(640, 703),
-        ByteRange(704, 767),
+        ByteRange(576, 611),
     ]
 
 
@@ -1094,10 +1170,82 @@ def test_plan_middle_ranges_caps_by_max_session_bytes():
     ]
 
 
+def test_plan_middle_ranges_uses_large_file_head_size_instead_of_config_window():
+    mib = 1024**2
+    gib = 1024**3
+    anchor = 10 * gib + 11 * mib
+
+    ranges = plan_middle_ranges(
+        media_size=80 * gib,
+        head_size=128 * mib,
+        tail_size=16 * mib,
+        anchor_offset=anchor,
+        queued_until=None,
+        prefetch=PrefetchConfig(
+            window_bytes=2 * gib,
+            resume_overlap_bytes=0,
+            max_session_bytes=4 * gib,
+        ),
+        middle_cache=MiddleCacheConfig(segment_bytes=64 * mib),
+    )
+
+    assert sum(byte_range.length for byte_range in ranges) == 128 * mib
+    assert ranges == [
+        ByteRange(10 * gib, 10 * gib + 64 * mib - 1),
+        ByteRange(10 * gib + 64 * mib, 10 * gib + 128 * mib - 1),
+    ]
+
+
+def test_plan_middle_ranges_uses_small_head_size_without_segment_inflation():
+    mib = 1024**2
+    gib = 1024**3
+    anchor = 128 * mib + 12345
+
+    ranges = plan_middle_ranges(
+        media_size=1 * gib,
+        head_size=16 * mib,
+        tail_size=8 * mib,
+        anchor_offset=anchor,
+        queued_until=None,
+        prefetch=PrefetchConfig(
+            window_bytes=2 * gib,
+            resume_overlap_bytes=0,
+            max_session_bytes=4 * gib,
+        ),
+        middle_cache=MiddleCacheConfig(segment_bytes=64 * mib),
+    )
+
+    assert ranges == [ByteRange(anchor, anchor + 16 * mib - 1)]
+
+
+def test_plan_middle_ranges_clamps_resume_overlap_inside_head_sized_window():
+    mib = 1024**2
+    gib = 1024**3
+    anchor = 128 * mib + 12345
+
+    ranges = plan_middle_ranges(
+        media_size=1 * gib,
+        head_size=16 * mib,
+        tail_size=8 * mib,
+        anchor_offset=anchor,
+        queued_until=None,
+        prefetch=PrefetchConfig(
+            window_bytes=2 * gib,
+            resume_overlap_bytes=128 * mib,
+            max_session_bytes=4 * gib,
+        ),
+        middle_cache=MiddleCacheConfig(segment_bytes=64 * mib),
+    )
+
+    assert ranges[0].start == anchor - 8 * mib
+    assert ranges[-1].end == anchor + 8 * mib - 1
+    assert sum(byte_range.length for byte_range in ranges) == 16 * mib
+
+
 def test_plan_middle_ranges_returns_partial_final_segment():
     ranges = plan_middle_ranges(
         media_size=1000,
-        head_size=0,
+        head_size=100,
         tail_size=0,
         anchor_offset=128,
         queued_until=None,

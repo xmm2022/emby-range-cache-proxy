@@ -9,6 +9,7 @@ Unified local cache proxy for Emby original media direct-play requests.
 - The internal prewarm key is only used by the prewarm worker. It is not used to authorize user playback requests.
 - The proxy accepts HTTP and HTTPS media source paths returned by Emby after authorization.
 - `.strm` media source paths can be resolved through configured path mappings such as `/strm/` to `/home/nax/emby/strm`, then cached from the HTTP URL inside the `.strm` file when that URL also matches `rollout.path_prefix_allowlist`.
+- `.strm` support is not tied to a hard-coded port. The current test server allowlists `http://127.0.0.1:18096/` as its local `.strm` origin; `.strm` files pointing elsewhere fall back to Emby unless that origin prefix is explicitly allowlisted.
 - The cache stores adaptive head and tail ranges for startup, probing, and container metadata reads.
 - The proxy does not actively cache arbitrary middle playback ranges.
 - Out-of-scope requests fall back to the normal Emby proxy path.

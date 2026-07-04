@@ -36,6 +36,17 @@ def test_readme_documents_phase2_disabled_defaults():
     assert "Enable `prefetch.enabled=true` for one or two allowlisted items" in readme
 
 
+def test_docs_explain_strm_origin_allowlist_boundary():
+    readme = Path("README.md").read_text()
+    deploy_doc = Path("docs/deploy-test-server.md").read_text()
+
+    assert "not tied to a hard-coded port" in readme
+    assert "http://127.0.0.1:18096/" in readme
+    assert "fall back to Emby" in readme
+    assert "caches only `.strm` entries" in deploy_doc
+    assert "Port `18096` is a test-server origin convention" in deploy_doc
+
+
 def test_config_example_documents_prefetch_polling_defaults():
     config = json.loads(Path("config.example.json").read_text())
 

@@ -261,6 +261,20 @@ def align_up(value: int, alignment: int) -> int:
     return value + alignment - remainder
 
 
+def middle_prefetch_window_bytes(head_size: int, prefetch: PrefetchConfig) -> int:
+    if head_size <= 0:
+        return 0
+    return min(head_size, prefetch.window_bytes, prefetch.max_session_bytes)
+
+
+def middle_prefetch_overlap_bytes(
+    window_bytes: int, prefetch: PrefetchConfig
+) -> int:
+    if window_bytes <= 1:
+        return 0
+    return min(prefetch.resume_overlap_bytes, window_bytes // 2)
+
+
 def plan_middle_ranges(
     *,
     media_size: int,
@@ -272,22 +286,26 @@ def plan_middle_ranges(
     middle_cache: MiddleCacheConfig,
 ) -> list[ByteRange]:
     segment = middle_cache.segment_bytes
+    window_bytes = middle_prefetch_window_bytes(head_size, prefetch)
+    if window_bytes <= 0:
+        return []
     head_end = min(head_size, media_size) - 1
     tail_start = max(0, media_size - tail_size)
     middle_start = head_end + 1
     middle_end = tail_start - 1
     if middle_start > middle_end:
         return []
-    if middle_end - middle_start + 1 < segment:
-        return []
 
     if queued_until is None:
-        start = max(middle_start, anchor_offset - prefetch.resume_overlap_bytes)
-        start = max(middle_start, align_down(start, segment))
+        if anchor_offset <= head_end:
+            return []
+        overlap_bytes = middle_prefetch_overlap_bytes(window_bytes, prefetch)
+        start = max(middle_start, anchor_offset - overlap_bytes)
+        if window_bytes > segment:
+            start = max(middle_start, align_down(start, segment))
     else:
         start = max(middle_start, queued_until + 1)
-    window_end = min(start + prefetch.window_bytes - 1, middle_end)
-    session_end = min(start + prefetch.max_session_bytes - 1, window_end)
+    session_end = min(start + window_bytes - 1, middle_end)
 
     ranges: list[ByteRange] = []
     current = start
