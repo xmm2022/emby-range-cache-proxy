@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 
@@ -25,9 +26,18 @@ def test_readme_documents_phase2_disabled_defaults():
     assert "session.enabled=false" in readme
     assert "middle_cache.enabled=false" in readme
     assert "prefetch.enabled=false" in readme
+    assert "prefetch.poll_interval_seconds=5" in readme
+    assert "prefetch.error_backoff_seconds=300" in readme
     assert "internal API key is not used for user playback authorization" in readme
     assert "Deploy code with Phase 2 disabled" in readme
     assert "Enable `session.enabled=true`" in readme
     assert "Enable `session.observer_enabled=true`" in readme
     assert "Enable `middle_cache.enabled=true` with `prefetch.enabled=false`" in readme
     assert "Enable `prefetch.enabled=true` for one or two allowlisted items" in readme
+
+
+def test_config_example_documents_prefetch_polling_defaults():
+    config = json.loads(Path("config.example.json").read_text())
+
+    assert config["prefetch"]["poll_interval_seconds"] == 5
+    assert config["prefetch"]["error_backoff_seconds"] == 300

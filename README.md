@@ -45,6 +45,10 @@ Safe defaults:
 - `session.enabled=false`
 - `middle_cache.enabled=false`
 - `prefetch.enabled=false`
+- `prefetch.poll_interval_seconds=5`
+- `prefetch.error_backoff_seconds=300`
+
+The prefetch worker polls an empty queue with `prefetch.poll_interval_seconds` so newly idle sessions are picked up quickly. Fetch or probe failures still use `prefetch.error_backoff_seconds` for retry/backoff.
 
 The internal API key is not used for user playback authorization. User playback requests continue to be authorized with the user's own Emby token through `PlaybackInfo`. The internal key is only for read-only session observation and background work when those features are explicitly enabled.
 

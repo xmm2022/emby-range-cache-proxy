@@ -211,6 +211,7 @@ def test_phase2_config_defaults_are_disabled(tmp_path):
     assert config.prefetch.per_origin_concurrency == 1
     assert config.prefetch.bandwidth_bytes_per_second == 30 * 1024**2
     assert config.prefetch.pause_when_rollout_session_active is True
+    assert config.prefetch.poll_interval_seconds == 5
     assert config.prefetch.error_backoff_seconds == 300
 
 
@@ -248,6 +249,7 @@ def test_phase2_config_reads_explicit_values(tmp_path):
                     "per_origin_concurrency": 1,
                     "bandwidth_bytes_per_second": 555,
                     "pause_when_rollout_session_active": False,
+                    "poll_interval_seconds": 7,
                     "error_backoff_seconds": 66,
                 },
             }
@@ -277,6 +279,7 @@ def test_phase2_config_reads_explicit_values(tmp_path):
     assert config.prefetch.per_origin_concurrency == 1
     assert config.prefetch.bandwidth_bytes_per_second == 555
     assert config.prefetch.pause_when_rollout_session_active is False
+    assert config.prefetch.poll_interval_seconds == 7
     assert config.prefetch.error_backoff_seconds == 66
 
 
@@ -298,6 +301,7 @@ def test_phase2_config_reads_explicit_values(tmp_path):
         (PrefetchConfig, {"concurrency": 0}, "prefetch.concurrency"),
         (PrefetchConfig, {"per_origin_concurrency": 0}, "prefetch.per_origin_concurrency"),
         (PrefetchConfig, {"bandwidth_bytes_per_second": 0}, "prefetch.bandwidth_bytes_per_second"),
+        (PrefetchConfig, {"poll_interval_seconds": 0}, "prefetch.poll_interval_seconds"),
         (PrefetchConfig, {"error_backoff_seconds": 0}, "prefetch.error_backoff_seconds"),
     ],
 )

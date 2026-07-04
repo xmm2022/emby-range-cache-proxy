@@ -105,6 +105,7 @@ class PrefetchConfig:
     per_origin_concurrency: int = 1
     bandwidth_bytes_per_second: int = 30 * 1024**2
     pause_when_rollout_session_active: bool = True
+    poll_interval_seconds: int = 5
     error_backoff_seconds: int = 300
 
     def __post_init__(self) -> None:
@@ -115,6 +116,7 @@ class PrefetchConfig:
             "concurrency",
             "per_origin_concurrency",
             "bandwidth_bytes_per_second",
+            "poll_interval_seconds",
             "error_backoff_seconds",
         )
         for field_name in positive_fields:
@@ -271,7 +273,18 @@ def _prefetch(data: dict[str, Any]) -> PrefetchConfig:
             True,
             "prefetch.pause_when_rollout_session_active",
         ),
-        error_backoff_seconds=_phase2_int(data, "error_backoff_seconds", 300, "prefetch.error_backoff_seconds"),
+        poll_interval_seconds=_phase2_int(
+            data,
+            "poll_interval_seconds",
+            5,
+            "prefetch.poll_interval_seconds",
+        ),
+        error_backoff_seconds=_phase2_int(
+            data,
+            "error_backoff_seconds",
+            300,
+            "prefetch.error_backoff_seconds",
+        ),
     )
 
 

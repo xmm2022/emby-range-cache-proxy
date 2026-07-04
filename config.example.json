@@ -55,6 +55,7 @@
     "per_origin_concurrency": 1,
     "bandwidth_bytes_per_second": 31457280,
     "pause_when_rollout_session_active": true,
+    "poll_interval_seconds": 5,
     "error_backoff_seconds": 300
   }
 }

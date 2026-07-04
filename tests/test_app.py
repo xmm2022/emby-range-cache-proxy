@@ -232,7 +232,7 @@ async def test_prefetch_worker_loop_continues_after_iteration_probe_error(
         await app_module._prefetch_worker_loop(config, Worker())
 
     assert run_calls == 2
-    assert sleep_calls == [7, 7]
+    assert sleep_calls == [7, 5]
 
 
 async def test_prefetch_worker_loop_uses_claimable_count_for_backoff(
@@ -269,6 +269,43 @@ async def test_prefetch_worker_loop_uses_claimable_count_for_backoff(
         await app_module._prefetch_worker_loop(config, Worker())
 
     assert sleep_calls == [1]
+
+
+async def test_prefetch_worker_loop_uses_poll_interval_when_queue_empty(
+    monkeypatch, tmp_path
+):
+    config = Config(
+        emby_base_url="http://emby",
+        fallback_base_url="http://emby",
+        cache_dir=str(tmp_path),
+        prefetch=PrefetchConfig(
+            enabled=True,
+            poll_interval_seconds=13,
+            error_backoff_seconds=300,
+        ),
+    )
+    sleep_calls = []
+
+    class Store:
+        def claimable_prefetch_task_count(self, *, now, running_stale_seconds):
+            return 0
+
+    class Worker:
+        store = Store()
+
+        async def run_once(self, *, now):
+            pass
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(app_module.asyncio, "sleep", fake_sleep)
+
+    with suppress(asyncio.CancelledError):
+        await app_module._prefetch_worker_loop(config, Worker())
+
+    assert sleep_calls == [13]
 
 
 async def test_prefetch_worker_loop_continues_after_run_once_error(
@@ -309,7 +346,7 @@ async def test_prefetch_worker_loop_continues_after_run_once_error(
         await app_module._prefetch_worker_loop(config, Worker())
 
     assert run_calls == 2
-    assert sleep_calls == [9, 9]
+    assert sleep_calls == [9, 5]
 
 
 async def test_session_planner_lifecycle_marks_idle_and_enqueues_prefetch(

@@ -181,7 +181,7 @@ async def _prefetch_worker_loop(config: Config, worker: PrefetchWorker) -> None:
                 now=now,
                 running_stale_seconds=config.prefetch.error_backoff_seconds,
             )
-            sleep_seconds = 1 if claimable else config.prefetch.error_backoff_seconds
+            sleep_seconds = 1 if claimable else config.prefetch.poll_interval_seconds
         except asyncio.CancelledError:
             raise
         except Exception:
