@@ -1,0 +1,22 @@
+[Unit]
+Description=Emby Range Cache Proxy (Go)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=emby-cache
+Group=emby-cache
+WorkingDirectory=/opt/emby-range-cache-proxy
+ExecStart=/opt/emby-range-cache-proxy/go/bin/emby-range-cache-proxy --config /etc/emby-range-cache-proxy/config.json
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/nax/emby/cache/range-proxy
+
+[Install]
+WantedBy=multi-user.target
+

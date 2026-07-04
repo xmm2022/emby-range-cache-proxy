@@ -1,0 +1,184 @@
+package config
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func writeConfig(t *testing.T, value map[string]any) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
+	path := writeConfig(t, map[string]any{
+		"emby_base_url":     "http://127.0.0.1:8096/",
+		"fallback_base_url": "http://127.0.0.1:8096/",
+		"cache_dir":         filepath.Join(t.TempDir(), "cache"),
+		"ctl":               map[string]any{"future": true},
+	})
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+
+	if cfg.EmbyBaseURL != "http://127.0.0.1:8096" {
+		t.Fatalf("EmbyBaseURL = %q", cfg.EmbyBaseURL)
+	}
+	if cfg.FallbackBaseURL != "http://127.0.0.1:8096" {
+		t.Fatalf("FallbackBaseURL = %q", cfg.FallbackBaseURL)
+	}
+	if cfg.ListenHost != "127.0.0.1" || cfg.ListenPort != 18180 {
+		t.Fatalf("listen = %s:%d", cfg.ListenHost, cfg.ListenPort)
+	}
+	if cfg.Cache.MaxBytes != 512*1024*1024*1024 {
+		t.Fatalf("cache max bytes = %d", cfg.Cache.MaxBytes)
+	}
+	if cfg.Cache.DefaultOpenRangeBytes != 16*1024*1024 {
+		t.Fatalf("default open range = %d", cfg.Cache.DefaultOpenRangeBytes)
+	}
+	if cfg.Prewarm.IntervalSeconds != 900 || cfg.Prewarm.Concurrency != 1 {
+		t.Fatalf("prewarm defaults = %+v", cfg.Prewarm)
+	}
+	if cfg.Session.Enabled || cfg.MiddleCache.Enabled || cfg.Prefetch.Enabled {
+		t.Fatalf("phase2 features should default disabled: %+v %+v %+v", cfg.Session, cfg.MiddleCache, cfg.Prefetch)
+	}
+	if cfg.Prefetch.PollIntervalSeconds != 5 || cfg.Prefetch.ErrorBackoffSeconds != 300 {
+		t.Fatalf("prefetch polling defaults = %+v", cfg.Prefetch)
+	}
+}
+
+func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
+	path := writeConfig(t, map[string]any{
+		"emby_base_url":     "http://emby.local/",
+		"fallback_base_url": "http://fallback.local/",
+		"listen_host":       "127.0.0.2",
+		"listen_port":       19090,
+		"cache_dir":         filepath.Join(t.TempDir(), "cache"),
+		"prewarm_api_key":   "secret",
+		"path_mappings": []map[string]any{
+			{"from": "/strm", "to": "/srv/strm"},
+			{"source_prefix": "/media/", "target_prefix": "/srv/media"},
+		},
+		"rollout": map[string]any{
+			"enabled":                    true,
+			"item_allowlist":             []string{"1"},
+			"media_source_allowlist":     []string{"ms1"},
+			"path_prefix_allowlist":      []string{"http://127.0.0.1:18096/"},
+			"ignored_future_rollout_key": true,
+		},
+		"cache": map[string]any{
+			"max_bytes":                "123",
+			"build_wait_seconds":       1.5,
+			"chunk_bytes":              4096,
+			"default_open_range_bytes": 8192,
+			"open_head_response_bytes": 16384,
+		},
+		"prewarm": map[string]any{
+			"enabled":            true,
+			"interval_seconds":   60,
+			"max_items_per_scan": 9,
+			"concurrency":        2,
+		},
+		"session": map[string]any{
+			"enabled":                   true,
+			"state_db":                  "/tmp/state.sqlite3",
+			"observer_enabled":          true,
+			"observer_interval_seconds": "45",
+			"idle_seconds":              240,
+			"stop_grace_seconds":        90,
+			"expire_seconds":            7200,
+		},
+		"middle_cache": map[string]any{
+			"enabled":        true,
+			"max_bytes":      1234,
+			"ttl_seconds":    456,
+			"segment_bytes":  789,
+			"min_free_bytes": 321,
+		},
+		"prefetch": map[string]any{
+			"enabled":                           true,
+			"window_bytes":                      111,
+			"resume_overlap_bytes":              222,
+			"max_session_bytes":                 333,
+			"max_queue_depth":                   44,
+			"concurrency":                       2,
+			"per_origin_concurrency":            3,
+			"bandwidth_bytes_per_second":        555,
+			"pause_when_rollout_session_active": false,
+			"poll_interval_seconds":             6,
+			"error_backoff_seconds":             66,
+		},
+	})
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+
+	if cfg.EmbyBaseURL != "http://emby.local" || cfg.FallbackBaseURL != "http://fallback.local" {
+		t.Fatalf("base URLs = %q %q", cfg.EmbyBaseURL, cfg.FallbackBaseURL)
+	}
+	if len(cfg.PathMappings) != 2 || cfg.PathMappings[0].SourcePrefix != "/strm/" || cfg.PathMappings[1].SourcePrefix != "/media/" {
+		t.Fatalf("path mappings = %+v", cfg.PathMappings)
+	}
+	if !cfg.Rollout.InScope("1", "ms1", "http://127.0.0.1:18096/a.mkv") {
+		t.Fatalf("expected rollout in scope")
+	}
+	if cfg.Cache.MaxBytes != 123 || cfg.Cache.OpenHeadResponseBytes == nil || *cfg.Cache.OpenHeadResponseBytes != 16384 {
+		t.Fatalf("cache = %+v", cfg.Cache)
+	}
+	if !cfg.Prewarm.Enabled || cfg.Prewarm.IntervalSeconds != 60 || cfg.Prewarm.Concurrency != 2 {
+		t.Fatalf("prewarm = %+v", cfg.Prewarm)
+	}
+	if !cfg.Session.Enabled || cfg.Session.StateDB != "/tmp/state.sqlite3" || cfg.Session.ObserverIntervalSeconds != 45 {
+		t.Fatalf("session = %+v", cfg.Session)
+	}
+	if !cfg.MiddleCache.Enabled || cfg.MiddleCache.MinFreeBytes != 321 {
+		t.Fatalf("middle cache = %+v", cfg.MiddleCache)
+	}
+	if !cfg.Prefetch.Enabled || cfg.Prefetch.PerOriginConcurrency != 3 || cfg.Prefetch.PauseWhenRolloutSessionActive {
+		t.Fatalf("prefetch = %+v", cfg.Prefetch)
+	}
+}
+
+func TestLoadConfigRejectsInvalidValues(t *testing.T) {
+	cases := []struct {
+		name  string
+		patch map[string]any
+	}{
+		{"missing emby", map[string]any{"emby_base_url": ""}},
+		{"missing cache", map[string]any{"cache_dir": ""}},
+		{"bad mapping root", map[string]any{"path_mappings": []map[string]any{{"from": "/", "to": "/tmp"}}}},
+		{"string bool", map[string]any{"session": map[string]any{"enabled": "false"}}},
+		{"short prewarm", map[string]any{"prewarm": map[string]any{"interval_seconds": 59}}},
+		{"bad middle free", map[string]any{"middle_cache": map[string]any{"min_free_bytes": -1}}},
+		{"bad prefetch concurrency", map[string]any{"prefetch": map[string]any{"per_origin_concurrency": 0}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := map[string]any{
+				"emby_base_url": "http://127.0.0.1:8096",
+				"cache_dir":     filepath.Join(t.TempDir(), "cache"),
+			}
+			for k, v := range tc.patch {
+				raw[k] = v
+			}
+			if _, err := LoadFile(writeConfig(t, raw)); err == nil {
+				t.Fatalf("expected error")
+			}
+		})
+	}
+}
