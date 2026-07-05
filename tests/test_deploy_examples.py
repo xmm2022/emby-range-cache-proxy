@@ -78,3 +78,16 @@ def test_deploy_assets_package_go_service():
     assert '"/config/config.json"' in dockerfile
     assert "network_mode: host" in compose
     assert "/etc/emby-range-cache-proxy/config.json:/config/config.json:ro" in compose
+
+
+def test_chinese_readme_documents_deployment_and_controls():
+    readme = Path("README.md").read_text()
+    chinese = Path("README.zh-CN.md").read_text()
+
+    assert "[中文说明](README.zh-CN.md)" in readme
+    assert "当前版本适合怎么用" in chinese
+    assert "修改后需要重启服务生效" in chinese
+    assert "Docker Hub 镜像" in chinese
+    assert "xmm2022/emby-range-cache-proxy:0.1.0" in chinese
+    assert "常用配置项" in chinese
+    assert "推荐灰度顺序" in chinese

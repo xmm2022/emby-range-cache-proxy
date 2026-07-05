@@ -2,6 +2,8 @@
 
 Unified local cache proxy for Emby original media direct-play requests.
 
+[中文说明](README.zh-CN.md)
+
 ## Usage
 
 The Go implementation under `go/` is the recommended runtime for production. It
