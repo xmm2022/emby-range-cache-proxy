@@ -84,20 +84,53 @@ func TestHealthzAndStats(t *testing.T) {
 }
 
 func TestProxyRejectsInternalKeyBeforeFallback(t *testing.T) {
-	fallbackHit := false
-	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fallbackHit = true
-	}))
-	defer fallback.Close()
-	server, err := New(testConfig(t, fallback.URL, fallback.URL))
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name string
+		path string
+		set  func(*http.Request)
+	}{
+		{
+			name: "query api key",
+			path: "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=internal-secret",
+		},
+		{
+			name: "x emby token",
+			path: "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token",
+			set:  func(req *http.Request) { req.Header.Set("X-Emby-Token", "internal-secret") },
+		},
+		{
+			name: "prewarm header",
+			path: "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token",
+			set:  func(req *http.Request) { req.Header.Set("X-Range-Cache-Prewarm-Key", "internal-secret") },
+		},
+		{
+			name: "authorization bearer case insensitive",
+			path: "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token",
+			set:  func(req *http.Request) { req.Header.Set("Authorization", "bearer internal-secret") },
+		},
 	}
-	defer server.Close()
-	rec := httptest.NewRecorder()
-	server.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=internal-secret", nil))
-	if rec.Code != http.StatusForbidden || fallbackHit {
-		t.Fatalf("code=%d fallbackHit=%v", rec.Code, fallbackHit)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fallbackHit := false
+			fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fallbackHit = true
+			}))
+			defer fallback.Close()
+			server, err := New(testConfig(t, fallback.URL, fallback.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.Close()
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			if tc.set != nil {
+				tc.set(req)
+			}
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden || fallbackHit {
+				t.Fatalf("code=%d fallbackHit=%v", rec.Code, fallbackHit)
+			}
+		})
 	}
 }
 

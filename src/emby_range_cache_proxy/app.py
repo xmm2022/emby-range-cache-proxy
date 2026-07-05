@@ -758,12 +758,20 @@ async def _wait_for_cache_build(lock: asyncio.Lock) -> None:
 def _request_contains_internal_key(request: web.Request, internal_key: str) -> bool:
     parsed = urlsplit(request.raw_path)
     for name, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if name.lower() in {"api_key", "token", "x-emby-token"} and value == internal_key:
+        if name.lower() in {"api_key", "token", "x-emby-token"} and hmac.compare_digest(value, internal_key):
             return True
-    return any(
-        name.lower() == "x-emby-token" and value == internal_key
-        for name, value in request.headers.items()
-    )
+    for name, value in request.headers.items():
+        lower_name = name.lower()
+        if lower_name in {"x-emby-token", "x-range-cache-prewarm-key"} and hmac.compare_digest(value, internal_key):
+            return True
+        if lower_name == "authorization" and _authorization_bearer_matches(value, internal_key):
+            return True
+    return False
+
+
+def _authorization_bearer_matches(value: str, internal_key: str) -> bool:
+    scheme, _, token = value.partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(token, internal_key)
 
 
 def _request_contains_prewarm_key(request: web.Request, internal_key: str) -> bool:

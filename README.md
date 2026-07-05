@@ -2,6 +2,137 @@
 
 Unified local cache proxy for Emby original media direct-play requests.
 
+## Usage
+
+The Go implementation under `go/` is the recommended runtime for production. It
+uses the same config file, cache directory, and SQLite state layout as the Python
+implementation, so the Python service can remain available for rollback.
+
+### 1. Prepare the config
+
+Copy `config.example.json` to the host config path, usually
+`/etc/emby-range-cache-proxy/config.json`, then set at least:
+
+```json
+{
+  "emby_base_url": "http://127.0.0.1:8096",
+  "fallback_base_url": "http://127.0.0.1:8096",
+  "listen_host": "127.0.0.1",
+  "listen_port": 18180,
+  "cache_dir": "/home/nax/emby/cache/range-proxy",
+  "prewarm_api_key": "replace-with-a-long-random-secret",
+  "rollout": {
+    "enabled": true,
+    "item_allowlist": ["10535"],
+    "media_source_allowlist": ["mediasource_10535"],
+    "path_prefix_allowlist": ["http://127.0.0.1:18096/"]
+  }
+}
+```
+
+Keep `listen_host` on `127.0.0.1` unless the service is protected by a trusted
+local firewall and reverse proxy rules. `path_prefix_allowlist` values should be
+full URL prefixes with a trailing slash, for example `http://127.0.0.1:18096/`,
+so adjacent hostnames or ports are not accidentally included.
+
+### 2. Build and test the Go binary
+
+```bash
+cd /opt/emby-range-cache-proxy/go
+go test ./...
+go build -o bin/emby-range-cache-proxy ./cmd/emby-range-cache-proxy
+```
+
+Run it on an unused port first if Python is still serving `18180`:
+
+```bash
+cp /etc/emby-range-cache-proxy/config.json /tmp/range-cache-go.json
+# edit /tmp/range-cache-go.json and set listen_port to an unused local port
+./bin/emby-range-cache-proxy --config /tmp/range-cache-go.json
+curl -fsS http://127.0.0.1:<port>/healthz
+curl -fsS http://127.0.0.1:<port>/internal/stats
+```
+
+### 3. Install the service
+
+The Go systemd unit is provided at
+`go/deploy/emby-range-cache-proxy-go.service`.
+
+```bash
+install -m 0644 go/deploy/emby-range-cache-proxy-go.service /etc/systemd/system/emby-range-cache-proxy.service
+systemctl daemon-reload
+systemctl restart emby-range-cache-proxy.service
+systemctl status emby-range-cache-proxy.service --no-pager
+curl -fsS http://127.0.0.1:18180/healthz
+curl -fsS http://127.0.0.1:18180/internal/stats
+```
+
+Keep the previous Python unit before cutover if rollback is needed:
+
+```bash
+systemctl cat emby-range-cache-proxy.service > /root/emby-range-cache-proxy-python-unit.backup
+```
+
+### 4. Route only rollout traffic through the proxy
+
+Use Caddy to send only selected original media requests to the range cache proxy,
+with Emby as the fallback upstream:
+
+```caddyfile
+@unified_range_proxy_10535 {
+	path /emby/videos/10535/original.mkv
+	query MediaSourceId=mediasource_10535
+}
+
+handle @unified_range_proxy_10535 {
+	reverse_proxy 127.0.0.1:18180 127.0.0.1:8096 {
+		lb_policy first
+		lb_try_duration 2s
+		lb_try_interval 100ms
+		fail_duration 10s
+		flush_interval -1
+	}
+}
+
+handle {
+	reverse_proxy 127.0.0.1:8096 {
+		flush_interval -1
+	}
+}
+```
+
+Do not expose `/internal/prewarm` through the public reverse proxy. It is for
+loopback callers such as MediaInfoKeeper.
+
+### 5. Trigger a prewarm
+
+Event-driven prewarm does not require `prewarm.enabled=true`; it only requires
+`prewarm_api_key`.
+
+```bash
+curl -fsS -X POST http://127.0.0.1:18180/internal/prewarm \
+  -H 'Content-Type: application/json' \
+  -H "X-Range-Cache-Prewarm-Key: ${RANGE_CACHE_PREWARM_KEY}" \
+  --data '{"itemId":"10535","mediaSourceId":"mediasource_10535"}'
+```
+
+Expected responses:
+
+- `{"status":"queued",...}` when a new task is accepted.
+- `{"status":"existing",...}` when the same item/source is already queued or running.
+
+### 6. Roll back to Python
+
+The Go service writes the same cache files and SQLite schema as Python. To roll
+back, restore the Python systemd unit and restart:
+
+```bash
+cp /root/emby-range-cache-proxy-python-unit.backup /etc/systemd/system/emby-range-cache-proxy.service
+systemctl daemon-reload
+systemctl restart emby-range-cache-proxy.service
+curl -fsS http://127.0.0.1:18180/healthz
+```
+
 ## V1 Behavior
 
 - Caddy forwards eligible `/emby/videos/.../original.*` requests to this proxy during a controlled rollout.

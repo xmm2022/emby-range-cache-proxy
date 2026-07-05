@@ -199,6 +199,14 @@ async def test_internal_prewarm_key_is_rejected_before_rollout_fallback(aiohttp_
             "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=user-token",
             {"Range": "bytes=0-3", "X-Emby-Token": "internal-secret"},
         ),
+        (
+            "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=user-token",
+            {"Range": "bytes=0-3", "X-Range-Cache-Prewarm-Key": "internal-secret"},
+        ),
+        (
+            "/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=user-token",
+            {"Range": "bytes=0-3", "Authorization": "Bearer internal-secret"},
+        ),
     ],
 )
 async def test_internal_prewarm_key_is_rejected_across_all_auth_carriers(

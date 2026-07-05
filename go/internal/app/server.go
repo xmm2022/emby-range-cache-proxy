@@ -604,13 +604,18 @@ func requestContainsInternalKey(r *http.Request, internalKey string) bool {
 		lower := strings.ToLower(key)
 		if lower == "x-emby-token" || lower == "x-range-cache-prewarm-key" || lower == "authorization" {
 			for _, value := range values {
-				if subtleEqual(value, internalKey) || subtleEqual(strings.TrimPrefix(value, "Bearer "), internalKey) {
+				if subtleEqual(value, internalKey) || authorizationBearerMatches(value, internalKey) {
 					return true
 				}
 			}
 		}
 	}
 	return false
+}
+
+func authorizationBearerMatches(value, internalKey string) bool {
+	scheme, token, ok := strings.Cut(value, " ")
+	return ok && strings.EqualFold(scheme, "Bearer") && subtleEqual(token, internalKey)
 }
 
 func subtleEqual(a, b string) bool {
