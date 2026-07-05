@@ -15,6 +15,7 @@ It is an independent Go module under `go/` so the Python service can stay in pla
 cd /opt/emby-range-cache-proxy/go
 go test ./...
 go build -o bin/emby-range-cache-proxy ./cmd/emby-range-cache-proxy
+./bin/emby-range-cache-proxy --config /etc/emby-range-cache-proxy/config.json --check-config
 ```
 
 ## Smoke Test

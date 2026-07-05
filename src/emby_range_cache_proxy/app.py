@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
@@ -238,6 +239,8 @@ async def internal_prewarm_handler(request: web.Request) -> web.Response:
     config: Config = request.app["config"]
     if not config.prewarm_api_key:
         raise web.HTTPNotFound(text="not found\n") from None
+    if not _request_remote_is_loopback(request):
+        raise web.HTTPForbidden(text="forbidden\n") from None
     if not _request_contains_prewarm_key(request, config.prewarm_api_key):
         raise web.HTTPForbidden(text="forbidden\n") from None
 
@@ -767,6 +770,16 @@ def _request_contains_internal_key(request: web.Request, internal_key: str) -> b
         if lower_name == "authorization" and _authorization_bearer_matches(value, internal_key):
             return True
     return False
+
+
+def _request_remote_is_loopback(request: web.Request) -> bool:
+    remote = request.remote
+    if not remote:
+        return False
+    try:
+        return ip_address(remote).is_loopback
+    except ValueError:
+        return False
 
 
 def _authorization_bearer_matches(value: str, internal_key: str) -> bool:

@@ -200,6 +200,10 @@ func (s *Server) handleInternalPrewarm(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !isLoopback(r.RemoteAddr) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	if !requestContainsPrewarmKey(r, s.cfg.PrewarmAPIKey) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return

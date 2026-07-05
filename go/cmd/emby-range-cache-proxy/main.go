@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,19 +16,34 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "", "Path to JSON config file")
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout io.Writer, stderr io.Writer) int {
+	flags := flag.NewFlagSet("emby-range-cache-proxy", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "", "Path to JSON config file")
+	checkConfig := flags.Bool("check-config", false, "Load and validate config, then exit")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
 	if *configPath == "" {
-		fmt.Fprintln(os.Stderr, "--config is required")
-		os.Exit(2)
+		fmt.Fprintln(stderr, "--config is required")
+		return 2
 	}
 	cfg, err := config.LoadFile(*configPath)
 	if err != nil {
-		log.Fatalf("load config failed: %s", err)
+		fmt.Fprintf(stderr, "load config failed: %s\n", err)
+		return 1
+	}
+	if *checkConfig {
+		fmt.Fprintln(stdout, "config ok")
+		return 0
 	}
 	server, err := app.New(cfg)
 	if err != nil {
-		log.Fatalf("create server failed: %s", err)
+		fmt.Fprintf(stderr, "create server failed: %s\n", err)
+		return 1
 	}
 	defer server.Close()
 
@@ -47,8 +62,10 @@ func main() {
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
-	log.Printf("emby range cache proxy listening on %s", httpServer.Addr)
+	fmt.Fprintf(stderr, "emby range cache proxy listening on %s\n", httpServer.Addr)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("listen failed: %s", err)
+		fmt.Fprintf(stderr, "listen failed: %s\n", err)
+		return 1
 	}
+	return 0
 }

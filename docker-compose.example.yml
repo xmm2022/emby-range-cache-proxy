@@ -1,0 +1,10 @@
+services:
+  emby-range-cache-proxy:
+    build: .
+    image: emby-range-cache-proxy:local
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /etc/emby-range-cache-proxy/config.json:/config/config.json:ro
+      - /home/nax/emby/cache/range-proxy:/home/nax/emby/cache/range-proxy
+    command: ["--config", "/config/config.json"]

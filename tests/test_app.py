@@ -136,6 +136,48 @@ async def test_internal_prewarm_endpoint_rejects_missing_secret(aiohttp_client, 
     await client.close()
 
 
+async def test_internal_prewarm_endpoint_rejects_non_loopback_before_queue(
+    aiohttp_client, monkeypatch, tmp_path
+):
+    calls = []
+
+    class FakePrewarmWorker:
+        def __init__(self, config):
+            calls.append(("init", config.prewarm_api_key))
+
+        async def prewarm_item(self, item_id, media_source_id):
+            calls.append(("prewarm_item", item_id, media_source_id))
+
+    async def fallback(request):
+        return web.Response(status=500)
+
+    monkeypatch.setattr(app_module, "PrewarmWorker", FakePrewarmWorker)
+    monkeypatch.setattr(app_module, "_request_remote_is_loopback", lambda request: False, raising=False)
+    emby_app = web.Application()
+    emby_app.router.add_route("*", "/{tail:.*}", fallback)
+    emby_server = await aiohttp_client(emby_app)
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal",
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.post(
+        "/internal/prewarm",
+        json={"itemId": "1", "mediaSourceId": "ms1"},
+        headers={"X-Range-Cache-Prewarm-Key": "internal"},
+    )
+
+    assert response.status == 403
+    assert calls == [("init", "internal")]
+
+    await client.close()
+
+
 async def test_internal_prewarm_endpoint_queues_head_tail_prewarm(
     aiohttp_client, monkeypatch, tmp_path
 ):

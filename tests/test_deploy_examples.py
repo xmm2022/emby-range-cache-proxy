@@ -64,3 +64,17 @@ def test_config_example_documents_prefetch_polling_defaults():
 
     assert config["prefetch"]["poll_interval_seconds"] == 5
     assert config["prefetch"]["error_backoff_seconds"] == 300
+
+
+def test_deploy_assets_package_go_service():
+    makefile = Path("Makefile").read_text()
+    dockerfile = Path("Dockerfile").read_text()
+    compose = Path("docker-compose.example.yml").read_text()
+
+    assert "go build -o bin/emby-range-cache-proxy ./cmd/emby-range-cache-proxy" in makefile
+    assert "--check-config" in makefile
+    assert "FROM golang:" in dockerfile
+    assert "./cmd/emby-range-cache-proxy" in dockerfile
+    assert '"/config/config.json"' in dockerfile
+    assert "network_mode: host" in compose
+    assert "/etc/emby-range-cache-proxy/config.json:/config/config.json:ro" in compose

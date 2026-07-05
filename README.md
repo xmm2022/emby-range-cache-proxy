@@ -38,9 +38,10 @@ so adjacent hostnames or ports are not accidentally included.
 ### 2. Build and test the Go binary
 
 ```bash
-cd /opt/emby-range-cache-proxy/go
-go test ./...
-go build -o bin/emby-range-cache-proxy ./cmd/emby-range-cache-proxy
+cd /opt/emby-range-cache-proxy
+make test-go
+make build
+make check-config CONFIG=/etc/emby-range-cache-proxy/config.json
 ```
 
 Run it on an unused port first if Python is still serving `18180`:
@@ -48,17 +49,19 @@ Run it on an unused port first if Python is still serving `18180`:
 ```bash
 cp /etc/emby-range-cache-proxy/config.json /tmp/range-cache-go.json
 # edit /tmp/range-cache-go.json and set listen_port to an unused local port
-./bin/emby-range-cache-proxy --config /tmp/range-cache-go.json
+./go/bin/emby-range-cache-proxy --config /tmp/range-cache-go.json
 curl -fsS http://127.0.0.1:<port>/healthz
 curl -fsS http://127.0.0.1:<port>/internal/stats
 ```
 
 ### 3. Install the service
 
-The Go systemd unit is provided at
-`go/deploy/emby-range-cache-proxy-go.service`.
+The Go systemd unit is provided at `go/deploy/emby-range-cache-proxy-go.service`.
+Create the runtime user and cache directory before starting the unit:
 
 ```bash
+useradd --system --home /nonexistent --shell /usr/sbin/nologin emby-cache || true
+install -d -o emby-cache -g emby-cache /home/nax/emby/cache/range-proxy
 install -m 0644 go/deploy/emby-range-cache-proxy-go.service /etc/systemd/system/emby-range-cache-proxy.service
 systemctl daemon-reload
 systemctl restart emby-range-cache-proxy.service
@@ -72,6 +75,23 @@ Keep the previous Python unit before cutover if rollback is needed:
 ```bash
 systemctl cat emby-range-cache-proxy.service > /root/emby-range-cache-proxy-python-unit.backup
 ```
+
+### Docker Compose alternative
+
+The example Compose file builds the Go binary in Docker and runs it with host
+networking so `http://127.0.0.1:8096` still reaches the host Emby service.
+
+```bash
+install -d /etc/emby-range-cache-proxy /home/nax/emby/cache/range-proxy
+cp config.example.json /etc/emby-range-cache-proxy/config.json
+# edit /etc/emby-range-cache-proxy/config.json
+docker compose -f docker-compose.example.yml build
+docker compose -f docker-compose.example.yml up -d
+curl -fsS http://127.0.0.1:18180/healthz
+```
+
+The container runs as UID `10001`. If the cache directory is not writable, adjust
+ownership or replace the volume path in `docker-compose.example.yml`.
 
 ### 4. Route only rollout traffic through the proxy
 
@@ -101,8 +121,9 @@ handle {
 }
 ```
 
-Do not expose `/internal/prewarm` through the public reverse proxy. It is for
-loopback callers such as MediaInfoKeeper.
+Do not expose `/internal/prewarm` through the public reverse proxy. The service
+rejects non-loopback callers for internal endpoints, and those endpoints are for
+local callers such as MediaInfoKeeper.
 
 ### 5. Trigger a prewarm
 
@@ -156,7 +177,7 @@ curl -fsS http://127.0.0.1:18180/healthz
 
 ## Internal Prewarm Endpoint
 
-`POST /internal/prewarm` is intended for loopback-only callers such as MediaInfoKeeper after media information extraction succeeds. Authenticate with `X-Range-Cache-Prewarm-Key: <prewarm_api_key>` or `Authorization: Bearer <prewarm_api_key>`.
+`POST /internal/prewarm` is intended for loopback-only callers such as MediaInfoKeeper after media information extraction succeeds. Non-loopback callers receive `403`. Authenticate with `X-Range-Cache-Prewarm-Key: <prewarm_api_key>` or `Authorization: Bearer <prewarm_api_key>`.
 
 Request body:
 
@@ -212,6 +233,8 @@ Recommended rollout order:
 ```bash
 python3 -m pip install -e ".[dev]"
 python3 -m pytest -q
+make test-go
+make build
 python3 -m emby_range_cache_proxy.cli --config config.example.json
 curl -fsS http://127.0.0.1:18180/healthz
 ```

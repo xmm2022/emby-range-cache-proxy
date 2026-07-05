@@ -215,6 +215,7 @@ func TestInternalPrewarmQueuesHeadTail(t *testing.T) {
 	}
 	defer server.Close()
 	req := httptest.NewRequest(http.MethodPost, "/internal/prewarm", strings.NewReader(`{"itemId":"10535","mediaSourceId":"ms1"}`))
+	req.RemoteAddr = "127.0.0.1:12345"
 	req.Header.Set("X-Range-Cache-Prewarm-Key", "internal-secret")
 	rec := httptest.NewRecorder()
 	server.ServeHTTP(rec, req)
@@ -229,4 +230,23 @@ func TestInternalPrewarmQueuesHeadTail(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("prewarm did not complete, stats=%+v", server.SnapshotStats().Prewarm)
+}
+
+func TestInternalPrewarmRejectsNonLoopbackRemote(t *testing.T) {
+	server, err := New(testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	req := httptest.NewRequest(http.MethodPost, "/internal/prewarm", strings.NewReader(`{"itemId":"10535","mediaSourceId":"ms1"}`))
+	req.RemoteAddr = "203.0.113.10:12345"
+	req.Header.Set("X-Range-Cache-Prewarm-Key", "internal-secret")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if stats := server.SnapshotStats().Prewarm; stats.Queued != 0 || stats.Running != 0 || stats.Completed != 0 {
+		t.Fatalf("prewarm unexpectedly queued: %+v", stats)
+	}
 }
