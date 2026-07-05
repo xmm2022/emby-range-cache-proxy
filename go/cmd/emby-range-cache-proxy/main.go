@@ -24,6 +24,8 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "", "Path to JSON config file")
 	checkConfig := flags.Bool("check-config", false, "Load and validate config, then exit")
+	printEffectiveConfig := flags.Bool("print-effective-config", false, "Print effective config as JSON, then exit")
+	showSecrets := flags.Bool("show-secrets", false, "Show secrets in --print-effective-config output")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -38,6 +40,16 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 	if *checkConfig {
 		fmt.Fprintln(stdout, "config ok")
+		return 0
+	}
+	if *printEffectiveConfig {
+		data, err := config.MarshalEffectiveJSON(cfg, *showSecrets)
+		if err != nil {
+			fmt.Fprintf(stderr, "print effective config failed: %s\n", err)
+			return 1
+		}
+		_, _ = stdout.Write(data)
+		fmt.Fprintln(stdout)
 		return 0
 	}
 	server, err := app.New(cfg)

@@ -91,3 +91,14 @@ def test_chinese_readme_documents_deployment_and_controls():
     assert "xmm2022/emby-range-cache-proxy:0.1.0" in chinese
     assert "常用配置项" in chinese
     assert "推荐灰度顺序" in chinese
+
+
+def test_readmes_document_effective_config_and_metrics():
+    readme = Path("README.md").read_text()
+    chinese = Path("README.zh-CN.md").read_text()
+
+    for content in (readme, chinese):
+        assert "--print-effective-config" in content
+        assert "--show-secrets" in content
+        assert "/internal/metrics" in content
+        assert "Prometheus" in content

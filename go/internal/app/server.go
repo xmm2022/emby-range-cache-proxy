@@ -147,6 +147,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	case r.Method == http.MethodGet && r.URL.Path == "/internal/stats":
 		s.handleStats(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/internal/metrics":
+		s.handleMetrics(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/internal/prewarm":
 		s.handleInternalPrewarm(w, r)
 	default:
@@ -161,6 +163,62 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.SnapshotStats())
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if !isLoopback(r.RemoteAddr) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	writeMetrics(w, s.SnapshotStats())
+}
+
+func writeMetrics(w io.Writer, stats Stats) {
+	writeMetric(w, "emby_range_cache_proxy_uptime_seconds", stats.UptimeSeconds)
+	writeMetric(w, "emby_range_cache_proxy_cache_bytes", stats.CacheBytes)
+	writeMetric(w, "emby_range_cache_proxy_middle_blocks_bytes", stats.MiddleBytes)
+	writeMetric(w, "emby_range_cache_proxy_disk_free_bytes", stats.DiskFreeBytes)
+
+	writeMetric(w, "emby_range_cache_proxy_cache_hit_total", stats.Counters.CacheHit)
+	writeMetric(w, "emby_range_cache_proxy_cache_build_total", stats.Counters.CacheBuild)
+	writeMetric(w, "emby_range_cache_proxy_origin_total", stats.Counters.Origin)
+	writeMetric(w, "emby_range_cache_proxy_fallback_total", stats.Counters.Fallback)
+	writeMetric(w, "emby_range_cache_proxy_denied_total", stats.Counters.Denied)
+	writeMetric(w, "emby_range_cache_proxy_middle_hit_total", stats.Counters.MiddleHit)
+	writeMetric(w, "emby_range_cache_proxy_middle_miss_total", stats.Counters.MiddleMiss)
+	writeMetric(w, "emby_range_cache_proxy_proxy_errors_total", stats.Counters.ProxyErrors)
+
+	writeMetric(w, "emby_range_cache_proxy_prewarm_queued", stats.Prewarm.Queued)
+	writeMetric(w, "emby_range_cache_proxy_prewarm_running", stats.Prewarm.Running)
+	writeMetric(w, "emby_range_cache_proxy_prewarm_completed_total", stats.Prewarm.Completed)
+	writeMetric(w, "emby_range_cache_proxy_prewarm_skipped_total", stats.Prewarm.Skipped)
+
+	writeMetric(w, "emby_range_cache_proxy_prefetch_queue", stats.Prefetch.Queue)
+	writeMetric(w, "emby_range_cache_proxy_prefetch_running", stats.Prefetch.Running)
+	writeMetric(w, "emby_range_cache_proxy_prefetch_done_total", stats.Prefetch.Done)
+	writeMetric(w, "emby_range_cache_proxy_prefetch_failed_total", stats.Prefetch.Failed)
+
+	writeMetric(w, "emby_range_cache_proxy_rollout_enabled", boolMetric(stats.Config.RolloutEnabled))
+	writeMetric(w, "emby_range_cache_proxy_middle_cache_enabled", boolMetric(stats.Config.MiddleCacheEnabled))
+	writeMetric(w, "emby_range_cache_proxy_prefetch_enabled", boolMetric(stats.Config.PrefetchEnabled))
+	writeMetric(w, "emby_range_cache_proxy_session_enabled", boolMetric(stats.Config.SessionEnabled))
+	writeMetric(w, "emby_range_cache_proxy_prewarm_enabled", boolMetric(stats.Config.PrewarmEnabled))
+	writeMetric(w, "emby_range_cache_proxy_pause_when_rollout_session_active", boolMetric(stats.Config.PauseWhenActiveSession))
+	writeMetric(w, "emby_range_cache_proxy_prefetch_concurrency", int64(stats.Config.PrefetchConcurrency))
+	writeMetric(w, "emby_range_cache_proxy_prewarm_concurrency", int64(stats.Config.PrewarmConcurrency))
+	writeMetric(w, "emby_range_cache_proxy_per_origin_concurrency", int64(stats.Config.PerOriginConcurrency))
+}
+
+func writeMetric(w io.Writer, name string, value int64) {
+	_, _ = fmt.Fprintf(w, "%s %d\n", name, value)
+}
+
+func boolMetric(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *Server) SnapshotStats() Stats {

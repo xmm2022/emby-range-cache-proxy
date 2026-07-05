@@ -44,7 +44,12 @@ cd /opt/emby-range-cache-proxy
 make test-go
 make build
 make check-config CONFIG=/etc/emby-range-cache-proxy/config.json
+./go/bin/emby-range-cache-proxy --config /etc/emby-range-cache-proxy/config.json --print-effective-config
 ```
+
+`--print-effective-config` prints the fully defaulted JSON config that the Go
+service will use. It redacts `prewarm_api_key` by default; add `--show-secrets`
+only when you intentionally need to inspect secret values.
 
 Run it on an unused port first if Python is still serving `18180`:
 
@@ -94,6 +99,22 @@ curl -fsS http://127.0.0.1:18180/healthz
 
 The container runs as UID `10001`. If the cache directory is not writable, adjust
 ownership or replace the volume path in `docker-compose.example.yml`.
+
+### Metrics
+
+`GET /internal/metrics` exposes a loopback-only Prometheus text endpoint. It
+contains the same operational counters as `/internal/stats`, including cache
+hits/builds, fallback, denies, proxy errors, prewarm queue/running/completed,
+prefetch queue/running/done/failed, cache bytes, middle-cache bytes, disk free
+bytes, and config-state gauges.
+
+```bash
+curl -fsS http://127.0.0.1:18180/internal/metrics
+```
+
+Do not publish `/internal/metrics` through the public reverse proxy. Scrape it
+locally, through a node-local Prometheus agent, or through a private management
+network that terminates on loopback.
 
 ### 4. Route only rollout traffic through the proxy
 
@@ -237,6 +258,7 @@ python3 -m pip install -e ".[dev]"
 python3 -m pytest -q
 make test-go
 make build
+./go/bin/emby-range-cache-proxy --config config.example.json --print-effective-config
 python3 -m emby_range_cache_proxy.cli --config config.example.json
 curl -fsS http://127.0.0.1:18180/healthz
 ```

@@ -20,7 +20,10 @@ Emby 原盘直放请求的本地 Range 缓存代理。生产环境建议使用 G
 cd /opt/emby-range-cache-proxy
 make build
 make check-config CONFIG=/etc/emby-range-cache-proxy/config.json
+./go/bin/emby-range-cache-proxy --config /etc/emby-range-cache-proxy/config.json --print-effective-config
 ```
+
+`--print-effective-config` 会输出合并默认值后的最终 JSON 配置，适合部署前核对实际生效参数。默认会把 `prewarm_api_key` 显示为 `REDACTED`；只有明确需要检查密钥明文时才加 `--show-secrets`。
 
 配置文件建议放在：
 
@@ -90,6 +93,22 @@ curl -fsS http://127.0.0.1:18180/healthz
 ```
 
 容器默认使用 UID `10001` 运行。如果缓存目录无法写入，调整目录权限或修改 `docker-compose.example.yml` 里的 volume 路径。
+
+## Metrics
+
+`GET /internal/metrics` 是 loopback-only 的 Prometheus 文本指标接口，包含 `/internal/stats` 里的主要运行状态：
+
+- cache hit/build/origin/fallback/deny/proxy error 计数。
+- prewarm queued/running/completed/skipped。
+- prefetch queue/running/done/failed。
+- head/tail 缓存字节数、中段缓存字节数、磁盘可用空间。
+- rollout、session、middle cache、prefetch、prewarm 等配置开关状态。
+
+```bash
+curl -fsS http://127.0.0.1:18180/internal/metrics
+```
+
+不要把 `/internal/metrics` 暴露到公网反代。建议只让本机 Prometheus agent、私有管理网络或 SSH 隧道访问。
 
 ## Docker Hub 镜像
 
@@ -201,5 +220,6 @@ python3 -m pytest -q
 make test-go
 make build
 make check-config CONFIG=config.example.json
+./go/bin/emby-range-cache-proxy --config config.example.json --print-effective-config
 go test -race ./...
 ```

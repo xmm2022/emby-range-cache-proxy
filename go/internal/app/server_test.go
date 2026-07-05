@@ -83,6 +83,59 @@ func TestHealthzAndStats(t *testing.T) {
 	}
 }
 
+func TestInternalMetricsExposesStatsForLoopback(t *testing.T) {
+	server, err := New(testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.addStat(func(stats *Stats) {
+		stats.Counters.CacheHit = 2
+		stats.Counters.Fallback = 1
+		stats.Counters.Denied = 3
+		stats.Prewarm.Queued = 4
+		stats.Prefetch.Running = 5
+	})
+	req := httptest.NewRequest(http.MethodGet, "/internal/metrics", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Fatalf("content-type=%q", got)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"emby_range_cache_proxy_cache_hit_total 2",
+		"emby_range_cache_proxy_fallback_total 1",
+		"emby_range_cache_proxy_denied_total 3",
+		"emby_range_cache_proxy_prewarm_queued 4",
+		"emby_range_cache_proxy_prefetch_running 5",
+		"emby_range_cache_proxy_rollout_enabled 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+func TestInternalMetricsRejectsNonLoopbackRemote(t *testing.T) {
+	server, err := New(testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	req := httptest.NewRequest(http.MethodGet, "/internal/metrics", nil)
+	req.RemoteAddr = "203.0.113.10:12345"
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestProxyRejectsInternalKeyBeforeFallback(t *testing.T) {
 	cases := []struct {
 		name string
