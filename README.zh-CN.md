@@ -189,6 +189,7 @@ curl -fsS -X POST http://127.0.0.1:18180/internal/prewarm \
 | `rollout.path_prefix_allowlist` | 限制实际源 URL 前缀 | `.strm` 场景必须配置严谨 |
 | `cache.max_bytes` | head/tail 缓存上限 | 按磁盘容量设置 |
 | `prewarm.concurrency` | 内部预热并发 | 建议从 `1` 开始 |
+| `prewarm.playback_info_timeout_seconds` | 预热查询 Emby PlaybackInfo 的超时 | 默认 `15`，慢冷启动可适当调大 |
 | `session.enabled` | 记录播放会话 | Phase 2 功能，默认关闭 |
 | `middle_cache.enabled` | 启用中段缓存 | 确认稳定后再开 |
 | `prefetch.enabled` | 启用空闲/停止后的中段预取 | 最后灰度开启 |

@@ -11,22 +11,12 @@ import (
 
 const (
 	mib int64 = 1024 * 1024
-	gib int64 = 1024 * 1024 * 1024
 )
 
 var rangeRE = regexp.MustCompile(`^bytes=(\d*)-(\d*)$`)
 
 func AdaptiveHeadTail(size int64) (int64, int64) {
-	if size < 2*gib {
-		return 16 * mib, 8 * mib
-	}
-	if size < 8*gib {
-		return 32 * mib, 8 * mib
-	}
-	if size <= 30*gib {
-		return 64 * mib, 8 * mib
-	}
-	return 128 * mib, 16 * mib
+	return 8 * mib, 8 * mib
 }
 
 func ParseRangeHeader(value string, size int64) (model.ByteRange, error) {

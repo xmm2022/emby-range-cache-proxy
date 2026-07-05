@@ -40,9 +40,10 @@ type Server struct {
 	store  *state.Store
 	middle *middle.Cache
 
-	httpClient *http.Client
-	origin     *origin.Client
-	auth       *emby.AuthClient
+	httpClient  *http.Client
+	origin      *origin.Client
+	auth        *emby.AuthClient
+	prewarmAuth *emby.AuthClient
 
 	originSem chan struct{}
 
@@ -121,14 +122,16 @@ func New(cfg config.Config) (*Server, error) {
 	if prewarmConcurrency <= 0 {
 		prewarmConcurrency = 1
 	}
+	prewarmTimeout := time.Duration(cfg.Prewarm.PlaybackInfoTimeoutSeconds) * time.Second
 	server := &Server{
 		cfg:          cfg,
 		startedAt:    time.Now(),
 		cache:        headtail.NewCache(cfg.CacheDir, cfg.Cache.MaxBytes),
 		store:        store,
-		httpClient:   &http.Client{Timeout: 0},
+		httpClient:   &http.Client{Timeout: prewarmTimeout},
 		origin:       origin.NewClient(cfg.Cache.ChunkBytes),
 		auth:         emby.NewAuthClient(cfg.EmbyBaseURL),
+		prewarmAuth:  emby.NewAuthClientWithTimeout(cfg.EmbyBaseURL, prewarmTimeout),
 		originSem:    make(chan struct{}, 32),
 		prewarmTasks: make(map[string]struct{}),
 		prewarmSem:   make(chan struct{}, prewarmConcurrency),
@@ -323,7 +326,7 @@ func (s *Server) enqueuePrewarm(itemID, mediaSourceID string) string {
 
 func (s *Server) prewarmItem(itemID, mediaSourceID string) error {
 	ctx := model.RequestContext{Method: http.MethodGet, ItemID: itemID, MediaSourceID: mediaSourceID, Token: s.cfg.PrewarmAPIKey}
-	sourceMedia, err := s.auth.Authorize(ctx)
+	sourceMedia, err := s.prewarmAuth.Authorize(ctx)
 	if err != nil {
 		return err
 	}

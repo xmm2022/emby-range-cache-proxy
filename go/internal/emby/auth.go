@@ -34,9 +34,16 @@ type AuthClient struct {
 }
 
 func NewAuthClient(baseURL string) *AuthClient {
+	return NewAuthClientWithTimeout(baseURL, 5*time.Second)
+}
+
+func NewAuthClientWithTimeout(baseURL string, timeout time.Duration) *AuthClient {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
 	return &AuthClient{
 		BaseURL: strings.TrimRight(baseURL, "/"),
-		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		HTTP:    &http.Client{Timeout: timeout},
 	}
 }
 

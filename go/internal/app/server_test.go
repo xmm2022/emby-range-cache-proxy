@@ -33,7 +33,7 @@ func testConfig(t *testing.T, embyBase, fallbackBase string) config.Config {
 			ChunkBytes:            4,
 			DefaultOpenRangeBytes: 16,
 		},
-		Prewarm: config.PrewarmConfig{IntervalSeconds: 900, MaxItemsPerScan: 100, Concurrency: 1},
+		Prewarm: config.PrewarmConfig{IntervalSeconds: 900, MaxItemsPerScan: 100, Concurrency: 1, PlaybackInfoTimeoutSeconds: 15},
 		Session: config.SessionConfig{
 			ObserverIntervalSeconds: 30,
 			IdleSeconds:             180,
@@ -53,6 +53,25 @@ func testConfig(t *testing.T, embyBase, fallbackBase string) config.Config {
 			PollIntervalSeconds:           5,
 			ErrorBackoffSeconds:           30,
 		},
+	}
+}
+
+func TestNewUsesSeparatePrewarmAuthTimeout(t *testing.T) {
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.Prewarm.PlaybackInfoTimeoutSeconds = 17
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if server.auth.HTTP.Timeout != 5*time.Second {
+		t.Fatalf("playback auth timeout = %s", server.auth.HTTP.Timeout)
+	}
+	if server.prewarmAuth.HTTP.Timeout != 17*time.Second {
+		t.Fatalf("prewarm auth timeout = %s", server.prewarmAuth.HTTP.Timeout)
+	}
+	if server.httpClient.Timeout != 17*time.Second {
+		t.Fatalf("prewarm scan timeout = %s", server.httpClient.Timeout)
 	}
 }
 

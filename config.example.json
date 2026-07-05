@@ -27,7 +27,8 @@
     "enabled": false,
     "interval_seconds": 900,
     "max_items_per_scan": 100,
-    "concurrency": 1
+    "concurrency": 1,
+    "playback_info_timeout_seconds": 15
   },
   "session": {
     "enabled": false,

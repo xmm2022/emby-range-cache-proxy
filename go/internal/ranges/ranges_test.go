@@ -14,12 +14,12 @@ func TestAdaptiveHeadTail(t *testing.T) {
 		head int64
 		tail int64
 	}{
-		{2*gib - 1, 16 * mib, 8 * mib},
-		{2 * gib, 32 * mib, 8 * mib},
-		{8*gib - 1, 32 * mib, 8 * mib},
-		{8 * gib, 64 * mib, 8 * mib},
-		{30 * gib, 64 * mib, 8 * mib},
-		{30*gib + 1, 128 * mib, 16 * mib},
+		{2*gib - 1, 8 * mib, 8 * mib},
+		{2 * gib, 8 * mib, 8 * mib},
+		{8*gib - 1, 8 * mib, 8 * mib},
+		{8 * gib, 8 * mib, 8 * mib},
+		{30 * gib, 8 * mib, 8 * mib},
+		{30*gib + 1, 8 * mib, 8 * mib},
 	}
 	for _, tc := range cases {
 		head, tail := AdaptiveHeadTail(tc.size)

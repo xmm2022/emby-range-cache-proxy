@@ -79,6 +79,9 @@ func TestPrintEffectiveConfigRedactsSecretAndIncludesDefaults(t *testing.T) {
 	if prewarm["interval_seconds"].(float64) != 900 {
 		t.Fatalf("prewarm.interval_seconds=%v", prewarm["interval_seconds"])
 	}
+	if prewarm["playback_info_timeout_seconds"].(float64) != 15 {
+		t.Fatalf("prewarm.playback_info_timeout_seconds=%v", prewarm["playback_info_timeout_seconds"])
+	}
 	session := payload["session"].(map[string]any)
 	if session["state_db"] != filepath.ToSlash(filepath.Join(cacheDir, "state", "phase2.sqlite3")) {
 		t.Fatalf("session.state_db=%v", session["state_db"])

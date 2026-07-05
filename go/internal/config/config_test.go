@@ -48,7 +48,7 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 	if cfg.Cache.DefaultOpenRangeBytes != 16*1024*1024 {
 		t.Fatalf("default open range = %d", cfg.Cache.DefaultOpenRangeBytes)
 	}
-	if cfg.Prewarm.IntervalSeconds != 900 || cfg.Prewarm.Concurrency != 1 {
+	if cfg.Prewarm.IntervalSeconds != 900 || cfg.Prewarm.Concurrency != 1 || cfg.Prewarm.PlaybackInfoTimeoutSeconds != 15 {
 		t.Fatalf("prewarm defaults = %+v", cfg.Prewarm)
 	}
 	if cfg.Session.Enabled || cfg.MiddleCache.Enabled || cfg.Prefetch.Enabled {
@@ -86,10 +86,11 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 			"open_head_response_bytes": 16384,
 		},
 		"prewarm": map[string]any{
-			"enabled":            true,
-			"interval_seconds":   60,
-			"max_items_per_scan": 9,
-			"concurrency":        2,
+			"enabled":                       true,
+			"interval_seconds":              60,
+			"max_items_per_scan":            9,
+			"concurrency":                   2,
+			"playback_info_timeout_seconds": 17,
 		},
 		"session": map[string]any{
 			"enabled":                   true,
@@ -139,7 +140,7 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	if cfg.Cache.MaxBytes != 123 || cfg.Cache.OpenHeadResponseBytes == nil || *cfg.Cache.OpenHeadResponseBytes != 16384 {
 		t.Fatalf("cache = %+v", cfg.Cache)
 	}
-	if !cfg.Prewarm.Enabled || cfg.Prewarm.IntervalSeconds != 60 || cfg.Prewarm.Concurrency != 2 {
+	if !cfg.Prewarm.Enabled || cfg.Prewarm.IntervalSeconds != 60 || cfg.Prewarm.Concurrency != 2 || cfg.Prewarm.PlaybackInfoTimeoutSeconds != 17 {
 		t.Fatalf("prewarm = %+v", cfg.Prewarm)
 	}
 	if !cfg.Session.Enabled || cfg.Session.StateDB != "/tmp/state.sqlite3" || cfg.Session.ObserverIntervalSeconds != 45 {
@@ -163,6 +164,7 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{"bad mapping root", map[string]any{"path_mappings": []map[string]any{{"from": "/", "to": "/tmp"}}}},
 		{"string bool", map[string]any{"session": map[string]any{"enabled": "false"}}},
 		{"short prewarm", map[string]any{"prewarm": map[string]any{"interval_seconds": 59}}},
+		{"bad prewarm playbackinfo timeout", map[string]any{"prewarm": map[string]any{"playback_info_timeout_seconds": 0}}},
 		{"bad middle free", map[string]any{"middle_cache": map[string]any{"min_free_bytes": -1}}},
 		{"bad prefetch concurrency", map[string]any{"prefetch": map[string]any{"per_origin_concurrency": 0}}},
 	}

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/model"
 )
@@ -28,6 +29,16 @@ func TestAuthorizeSelectsExactMediaSource(t *testing.T) {
 	}
 	if source.Path != "http://origin/movie.mkv" || source.MediaSourceID != "ms2" || source.Size == nil || *source.Size != 123 {
 		t.Fatalf("source = %+v", source)
+	}
+}
+
+func TestNewAuthClientWithTimeoutConfiguresHTTPTimeout(t *testing.T) {
+	client := NewAuthClientWithTimeout("http://emby.local/", 17*time.Second)
+	if client.BaseURL != "http://emby.local" {
+		t.Fatalf("BaseURL = %q", client.BaseURL)
+	}
+	if client.HTTP.Timeout != 17*time.Second {
+		t.Fatalf("timeout = %s", client.HTTP.Timeout)
 	}
 }
 

@@ -43,10 +43,11 @@ type EffectiveCache struct {
 }
 
 type EffectivePrewarm struct {
-	Enabled         bool `json:"enabled"`
-	IntervalSeconds int  `json:"interval_seconds"`
-	MaxItemsPerScan int  `json:"max_items_per_scan"`
-	Concurrency     int  `json:"concurrency"`
+	Enabled                    bool `json:"enabled"`
+	IntervalSeconds            int  `json:"interval_seconds"`
+	MaxItemsPerScan            int  `json:"max_items_per_scan"`
+	Concurrency                int  `json:"concurrency"`
+	PlaybackInfoTimeoutSeconds int  `json:"playback_info_timeout_seconds"`
 }
 
 type EffectiveSession struct {
@@ -124,10 +125,11 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			OpenHeadResponseBytes: cfg.Cache.OpenHeadResponseBytes,
 		},
 		Prewarm: EffectivePrewarm{
-			Enabled:         cfg.Prewarm.Enabled,
-			IntervalSeconds: cfg.Prewarm.IntervalSeconds,
-			MaxItemsPerScan: cfg.Prewarm.MaxItemsPerScan,
-			Concurrency:     cfg.Prewarm.Concurrency,
+			Enabled:                    cfg.Prewarm.Enabled,
+			IntervalSeconds:            cfg.Prewarm.IntervalSeconds,
+			MaxItemsPerScan:            cfg.Prewarm.MaxItemsPerScan,
+			Concurrency:                cfg.Prewarm.Concurrency,
+			PlaybackInfoTimeoutSeconds: cfg.Prewarm.PlaybackInfoTimeoutSeconds,
 		},
 		Session: EffectiveSession{
 			Enabled:                 cfg.Session.Enabled,

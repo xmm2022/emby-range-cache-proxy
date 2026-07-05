@@ -208,7 +208,7 @@ Request body:
 {"itemId":"12345","mediaSourceId":"mediasource_12345"}
 ```
 
-The endpoint returns `202` with `queued` for a new in-process prewarm task and `existing` when the same item/source is already queued or running. The task queries Emby PlaybackInfo with the internal key, resolves mapped `.strm` files only when the resolved URL matches `rollout.path_prefix_allowlist`, skips already-complete head/tail cache blocks, uses `prewarm.concurrency` for in-process concurrency, throttles downloads with `prefetch.bandwidth_bytes_per_second`, and evicts through the head/tail cache capacity policy.
+The endpoint returns `202` with `queued` for a new in-process prewarm task and `existing` when the same item/source is already queued or running. The task queries Emby PlaybackInfo with the internal key using `prewarm.playback_info_timeout_seconds`, resolves mapped `.strm` files only when the resolved URL matches `rollout.path_prefix_allowlist`, skips already-complete head/tail cache blocks, uses `prewarm.concurrency` for in-process concurrency, throttles downloads with `prefetch.bandwidth_bytes_per_second`, and evicts through the head/tail cache capacity policy.
 
 `prewarm.enabled` only controls the periodic recent-item scanner. Event-triggered prewarm through `/internal/prewarm` requires `prewarm_api_key` but does not require enabling periodic scans.
 

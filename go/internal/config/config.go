@@ -77,10 +77,11 @@ type CacheConfig struct {
 }
 
 type PrewarmConfig struct {
-	Enabled         bool
-	IntervalSeconds int
-	MaxItemsPerScan int
-	Concurrency     int
+	Enabled                    bool
+	IntervalSeconds            int
+	MaxItemsPerScan            int
+	Concurrency                int
+	PlaybackInfoTimeoutSeconds int
 }
 
 type SessionConfig struct {
@@ -138,9 +139,10 @@ func parseRaw(raw map[string]any) (Config, error) {
 			DefaultOpenRangeBytes: 16 * mib,
 		},
 		Prewarm: PrewarmConfig{
-			IntervalSeconds: 900,
-			MaxItemsPerScan: 100,
-			Concurrency:     1,
+			IntervalSeconds:            900,
+			MaxItemsPerScan:            100,
+			Concurrency:                1,
+			PlaybackInfoTimeoutSeconds: 15,
 		},
 		Session: SessionConfig{
 			ObserverIntervalSeconds: 30,
@@ -238,6 +240,9 @@ func (c Config) Validate() error {
 	}
 	if c.Prewarm.Concurrency <= 0 {
 		return fmt.Errorf("prewarm.concurrency must be positive")
+	}
+	if c.Prewarm.PlaybackInfoTimeoutSeconds <= 0 {
+		return fmt.Errorf("prewarm.playback_info_timeout_seconds must be positive")
 	}
 	if c.Session.ObserverIntervalSeconds <= 0 || c.Session.IdleSeconds <= 0 || c.Session.StopGraceSeconds <= 0 || c.Session.ExpireSeconds <= 0 {
 		return fmt.Errorf("session values must be positive")
@@ -345,6 +350,9 @@ func parsePrewarm(value any, cfg *PrewarmConfig) error {
 		return err
 	}
 	if cfg.Concurrency, err = intFieldDefault(data, "concurrency", cfg.Concurrency); err != nil {
+		return err
+	}
+	if cfg.PlaybackInfoTimeoutSeconds, err = intFieldDefault(data, "playback_info_timeout_seconds", cfg.PlaybackInfoTimeoutSeconds); err != nil {
 		return err
 	}
 	return nil
