@@ -153,3 +153,31 @@ func TestMiddleBlockAndSourceMetadataLifecycle(t *testing.T) {
 		t.Fatalf("bytes=%d err=%v", bytes, err)
 	}
 }
+
+func TestFindMiddleBlocksReturnsOverlappingBlocksInOrder(t *testing.T) {
+	store := openTestStore(t)
+	blocks := []MiddleBlockRecord{
+		{CacheKey: "cache", Start: 120, End: 129, Path: "cache/mid/120-129.bin", Size: 10, CreatedAt: 20, LastAccessAt: 20, ExpiresAt: 120},
+		{CacheKey: "other", Start: 110, End: 119, Path: "other/mid/110-119.bin", Size: 10, CreatedAt: 20, LastAccessAt: 20, ExpiresAt: 120},
+		{CacheKey: "cache", Start: 100, End: 109, Path: "cache/mid/100-109.bin", Size: 10, CreatedAt: 20, LastAccessAt: 20, ExpiresAt: 120},
+		{CacheKey: "cache", Start: 110, End: 119, Path: "cache/mid/110-119.bin", Size: 10, CreatedAt: 20, LastAccessAt: 20, ExpiresAt: 120},
+	}
+	for _, block := range blocks {
+		if err := store.UpsertMiddleBlock(block); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	found, err := store.FindMiddleBlocks("cache", model.ByteRange{Start: 105, End: 124})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 3 {
+		t.Fatalf("len(found) = %d, found=%+v", len(found), found)
+	}
+	for i, wantStart := range []int64{100, 110, 120} {
+		if found[i].Start != wantStart {
+			t.Fatalf("found[%d].Start = %d, want %d", i, found[i].Start, wantStart)
+		}
+	}
+}

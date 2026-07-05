@@ -107,6 +107,8 @@ type PrefetchConfig struct {
 	WindowBytes                   int64
 	ResumeOverlapBytes            int64
 	MaxSessionBytes               int64
+	ResumeBackBlocks              int
+	ResumeForwardBlocks           int
 	MaxQueueDepth                 int
 	Concurrency                   int
 	PerOriginConcurrency          int
@@ -157,9 +159,11 @@ func parseRaw(raw map[string]any) (Config, error) {
 			MinFreeBytes: 50 * gib,
 		},
 		Prefetch: PrefetchConfig{
-			WindowBytes:                   2 * gib,
+			WindowBytes:                   256 * mib,
 			ResumeOverlapBytes:            128 * mib,
-			MaxSessionBytes:               4 * gib,
+			MaxSessionBytes:               512 * mib,
+			ResumeBackBlocks:              1,
+			ResumeForwardBlocks:           2,
 			MaxQueueDepth:                 200,
 			Concurrency:                   1,
 			PerOriginConcurrency:          1,
@@ -250,7 +254,7 @@ func (c Config) Validate() error {
 	if c.MiddleCache.MaxBytes <= 0 || c.MiddleCache.TTLSeconds <= 0 || c.MiddleCache.SegmentBytes <= 0 || c.MiddleCache.MinFreeBytes < 0 {
 		return fmt.Errorf("middle_cache values must be valid")
 	}
-	if c.Prefetch.WindowBytes <= 0 || c.Prefetch.ResumeOverlapBytes < 0 || c.Prefetch.MaxSessionBytes <= 0 || c.Prefetch.MaxQueueDepth <= 0 || c.Prefetch.Concurrency <= 0 || c.Prefetch.PerOriginConcurrency <= 0 || c.Prefetch.BandwidthBytesPerSecond <= 0 || c.Prefetch.PollIntervalSeconds <= 0 || c.Prefetch.ErrorBackoffSeconds <= 0 {
+	if c.Prefetch.WindowBytes <= 0 || c.Prefetch.ResumeOverlapBytes < 0 || c.Prefetch.MaxSessionBytes <= 0 || c.Prefetch.ResumeBackBlocks < 0 || c.Prefetch.ResumeForwardBlocks < 0 || c.Prefetch.MaxQueueDepth <= 0 || c.Prefetch.Concurrency <= 0 || c.Prefetch.PerOriginConcurrency <= 0 || c.Prefetch.BandwidthBytesPerSecond <= 0 || c.Prefetch.PollIntervalSeconds <= 0 || c.Prefetch.ErrorBackoffSeconds <= 0 {
 		return fmt.Errorf("prefetch values must be valid")
 	}
 	return nil
@@ -425,6 +429,12 @@ func parsePrefetch(value any, cfg *PrefetchConfig) error {
 		return err
 	}
 	if cfg.MaxSessionBytes, err = int64FieldDefault(data, "max_session_bytes", cfg.MaxSessionBytes); err != nil {
+		return err
+	}
+	if cfg.ResumeBackBlocks, err = intFieldDefault(data, "resume_back_blocks", cfg.ResumeBackBlocks); err != nil {
+		return err
+	}
+	if cfg.ResumeForwardBlocks, err = intFieldDefault(data, "resume_forward_blocks", cfg.ResumeForwardBlocks); err != nil {
 		return err
 	}
 	if cfg.MaxQueueDepth, err = intFieldDefault(data, "max_queue_depth", cfg.MaxQueueDepth); err != nil {

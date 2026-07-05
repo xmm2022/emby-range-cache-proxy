@@ -628,6 +628,18 @@ LIMIT 1`, cacheKey, byteRange.Start, byteRange.End)
 	return scanMiddleBlock(row)
 }
 
+func (s *Store) FindMiddleBlocks(cacheKey string, byteRange model.ByteRange) ([]MiddleBlockRecord, error) {
+	rows, err := s.db.Query(`
+SELECT cache_key, start, end, path, size, created_at, last_access_at, expires_at
+FROM middle_blocks
+WHERE cache_key = ? AND start <= ? AND end >= ?
+ORDER BY start ASC, end ASC`, cacheKey, byteRange.End, byteRange.Start)
+	if err != nil {
+		return nil, err
+	}
+	return scanMiddleBlocks(rows)
+}
+
 func (s *Store) TouchMiddleBlock(cacheKey string, start, end int64, now float64, ttlSeconds int) error {
 	_, err := s.db.Exec(`
 UPDATE middle_blocks

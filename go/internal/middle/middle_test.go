@@ -96,6 +96,39 @@ func TestIterBlockRequiresFullCoverageAndRemovesBrokenFiles(t *testing.T) {
 	}
 }
 
+func TestIterBlockReadsAcrossAdjacentBlocks(t *testing.T) {
+	cache, _ := newTestCache(t)
+	key := strings.Repeat("8", 64)
+	blocks := []struct {
+		byteRange model.ByteRange
+		data      string
+	}{
+		{model.ByteRange{Start: 100, End: 109}, "abcdefghij"},
+		{model.ByteRange{Start: 110, End: 119}, "klmnopqrst"},
+		{model.ByteRange{Start: 120, End: 129}, "uvwxyz1234"},
+	}
+	for _, block := range blocks {
+		if err := cache.StoreBlock(key, block.byteRange, []byte(block.data), 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	chunks, err := cache.IterBlock(key, model.ByteRange{Start: 105, End: 124}, 4, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunks == nil {
+		t.Fatalf("adjacent block coverage should hit")
+	}
+	var got bytes.Buffer
+	for chunk := range chunks {
+		got.Write(chunk)
+	}
+	if got.String() != "fghijklmnopqrstuvwxy" {
+		t.Fatalf("got %q", got.String())
+	}
+}
+
 func TestEvictExpiredAndLRU(t *testing.T) {
 	cache, store := newTestCache(t)
 	cache.MaxBytes = 15

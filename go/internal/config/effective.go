@@ -73,6 +73,8 @@ type EffectivePrefetch struct {
 	WindowBytes                   int64 `json:"window_bytes"`
 	ResumeOverlapBytes            int64 `json:"resume_overlap_bytes"`
 	MaxSessionBytes               int64 `json:"max_session_bytes"`
+	ResumeBackBlocks              int   `json:"resume_back_blocks"`
+	ResumeForwardBlocks           int   `json:"resume_forward_blocks"`
 	MaxQueueDepth                 int   `json:"max_queue_depth"`
 	Concurrency                   int   `json:"concurrency"`
 	PerOriginConcurrency          int   `json:"per_origin_concurrency"`
@@ -152,6 +154,8 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			WindowBytes:                   cfg.Prefetch.WindowBytes,
 			ResumeOverlapBytes:            cfg.Prefetch.ResumeOverlapBytes,
 			MaxSessionBytes:               cfg.Prefetch.MaxSessionBytes,
+			ResumeBackBlocks:              cfg.Prefetch.ResumeBackBlocks,
+			ResumeForwardBlocks:           cfg.Prefetch.ResumeForwardBlocks,
 			MaxQueueDepth:                 cfg.Prefetch.MaxQueueDepth,
 			Concurrency:                   cfg.Prefetch.Concurrency,
 			PerOriginConcurrency:          cfg.Prefetch.PerOriginConcurrency,

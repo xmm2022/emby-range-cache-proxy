@@ -48,9 +48,11 @@
   },
   "prefetch": {
     "enabled": false,
-    "window_bytes": 2147483648,
+    "window_bytes": 268435456,
     "resume_overlap_bytes": 134217728,
-    "max_session_bytes": 4294967296,
+    "max_session_bytes": 536870912,
+    "resume_back_blocks": 1,
+    "resume_forward_blocks": 2,
     "max_queue_depth": 200,
     "concurrency": 1,
     "per_origin_concurrency": 1,

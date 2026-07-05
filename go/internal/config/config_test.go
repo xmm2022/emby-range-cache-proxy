@@ -57,6 +57,12 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 	if cfg.Prefetch.PollIntervalSeconds != 5 || cfg.Prefetch.ErrorBackoffSeconds != 300 {
 		t.Fatalf("prefetch polling defaults = %+v", cfg.Prefetch)
 	}
+	if cfg.Prefetch.WindowBytes != 256*1024*1024 || cfg.Prefetch.MaxSessionBytes != 512*1024*1024 {
+		t.Fatalf("prefetch window defaults = %+v", cfg.Prefetch)
+	}
+	if cfg.Prefetch.ResumeBackBlocks != 1 || cfg.Prefetch.ResumeForwardBlocks != 2 {
+		t.Fatalf("prefetch resume block defaults = %+v", cfg.Prefetch)
+	}
 }
 
 func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
@@ -120,6 +126,8 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 			"pause_when_rollout_session_active": false,
 			"poll_interval_seconds":             6,
 			"error_backoff_seconds":             66,
+			"resume_back_blocks":                2,
+			"resume_forward_blocks":             3,
 		},
 	})
 
@@ -152,6 +160,9 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	if !cfg.Prefetch.Enabled || cfg.Prefetch.PerOriginConcurrency != 3 || cfg.Prefetch.PauseWhenRolloutSessionActive {
 		t.Fatalf("prefetch = %+v", cfg.Prefetch)
 	}
+	if cfg.Prefetch.ResumeBackBlocks != 2 || cfg.Prefetch.ResumeForwardBlocks != 3 {
+		t.Fatalf("prefetch resume blocks = %+v", cfg.Prefetch)
+	}
 }
 
 func TestLoadConfigRejectsInvalidValues(t *testing.T) {
@@ -167,6 +178,8 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{"bad prewarm playbackinfo timeout", map[string]any{"prewarm": map[string]any{"playback_info_timeout_seconds": 0}}},
 		{"bad middle free", map[string]any{"middle_cache": map[string]any{"min_free_bytes": -1}}},
 		{"bad prefetch concurrency", map[string]any{"prefetch": map[string]any{"per_origin_concurrency": 0}}},
+		{"bad prefetch back blocks", map[string]any{"prefetch": map[string]any{"resume_back_blocks": -1}}},
+		{"bad prefetch forward blocks", map[string]any{"prefetch": map[string]any{"resume_forward_blocks": -1}}},
 	}
 
 	for _, tc := range cases {

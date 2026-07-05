@@ -24,6 +24,11 @@ type Cache struct {
 	MinFreeBytes int64
 }
 
+type middleBlockSpan struct {
+	record    state.MiddleBlockRecord
+	byteRange model.ByteRange
+}
+
 func NewCache(root string, store *state.Store, maxBytes int64, ttlSeconds int, minFreeBytes ...int64) *Cache {
 	_ = os.MkdirAll(root, 0o755)
 	cache := &Cache{Root: root, Store: store, MaxBytes: maxBytes, TTLSeconds: ttlSeconds}
@@ -145,57 +150,98 @@ func (c *Cache) IterBlock(key string, requested model.ByteRange, chunkBytes int6
 	if !keyRE.MatchString(key) || requested.Start < 0 || requested.End < requested.Start {
 		return nil, fmt.Errorf("invalid middle cache request")
 	}
-	record, err := c.Store.FindMiddleBlock(key, requested)
-	if err != nil || record == nil {
+	records, err := c.Store.FindMiddleBlocks(key, requested)
+	if err != nil || len(records) == 0 {
 		return nil, err
 	}
-	if !recordCovers(*record, requested) || !c.validRecord(*record) {
-		_ = c.Store.DeleteMiddleBlockRecord(record.CacheKey, record.Start, record.End)
+	spans, ok := c.coveringSpans(records, requested, now)
+	if !ok {
 		return nil, nil
 	}
-	if record.ExpiresAt <= now {
-		_ = c.RemoveBlock(*record)
-		return nil, nil
+	for _, span := range spans {
+		_ = c.Store.TouchMiddleBlock(key, span.record.Start, span.record.End, now, c.TTLSeconds)
 	}
-	path, sidecar := c.recordPaths(*record)
-	if !validFiles(*record, path, sidecar) {
-		_ = c.RemoveBlock(*record)
-		return nil, nil
-	}
-	handle, err := os.Open(path)
-	if err != nil {
-		_ = c.RemoveBlock(*record)
-		return nil, nil
-	}
-	if _, err := handle.Seek(requested.Start-record.Start, io.SeekStart); err != nil {
-		handle.Close()
-		_ = c.RemoveBlock(*record)
-		return nil, nil
-	}
-	_ = c.Store.TouchMiddleBlock(key, record.Start, record.End, now, c.TTLSeconds)
 	out := make(chan []byte)
 	go func() {
 		defer close(out)
-		defer handle.Close()
 		buf := make([]byte, int(chunkBytes))
-		remaining := requested.Length()
-		for remaining > 0 {
-			n := int64(len(buf))
-			if n > remaining {
-				n = remaining
-			}
-			readBuf := buf[:n]
-			if _, err := io.ReadFull(handle, readBuf); err != nil {
-				_ = c.RemoveBlock(*record)
+		for _, span := range spans {
+			if !c.streamSpan(out, span, buf) {
 				return
 			}
-			chunk := make([]byte, n)
-			copy(chunk, readBuf)
-			out <- chunk
-			remaining -= n
 		}
 	}()
 	return out, nil
+}
+
+func (c *Cache) coveringSpans(records []state.MiddleBlockRecord, requested model.ByteRange, now float64) ([]middleBlockSpan, bool) {
+	expectedStart := requested.Start
+	var spans []middleBlockSpan
+	for _, record := range records {
+		if record.End < expectedStart {
+			continue
+		}
+		if record.Start > expectedStart {
+			return nil, false
+		}
+		if !c.validRecord(record) {
+			_ = c.Store.DeleteMiddleBlockRecord(record.CacheKey, record.Start, record.End)
+			return nil, false
+		}
+		if record.ExpiresAt <= now {
+			_ = c.RemoveBlock(record)
+			return nil, false
+		}
+		path, sidecar := c.recordPaths(record)
+		if !validFiles(record, path, sidecar) {
+			_ = c.RemoveBlock(record)
+			return nil, false
+		}
+		spanEnd := record.End
+		if spanEnd > requested.End {
+			spanEnd = requested.End
+		}
+		spans = append(spans, middleBlockSpan{
+			record:    record,
+			byteRange: model.ByteRange{Start: expectedStart, End: spanEnd},
+		})
+		if spanEnd >= requested.End {
+			return spans, true
+		}
+		expectedStart = spanEnd + 1
+	}
+	return nil, false
+}
+
+func (c *Cache) streamSpan(out chan<- []byte, span middleBlockSpan, buf []byte) bool {
+	path, _ := c.recordPaths(span.record)
+	handle, err := os.Open(path)
+	if err != nil {
+		_ = c.RemoveBlock(span.record)
+		return false
+	}
+	defer handle.Close()
+	if _, err := handle.Seek(span.byteRange.Start-span.record.Start, io.SeekStart); err != nil {
+		_ = c.RemoveBlock(span.record)
+		return false
+	}
+	remaining := span.byteRange.Length()
+	for remaining > 0 {
+		n := int64(len(buf))
+		if n > remaining {
+			n = remaining
+		}
+		readBuf := buf[:n]
+		if _, err := io.ReadFull(handle, readBuf); err != nil {
+			_ = c.RemoveBlock(span.record)
+			return false
+		}
+		chunk := make([]byte, n)
+		copy(chunk, readBuf)
+		out <- chunk
+		remaining -= n
+	}
+	return true
 }
 
 func (c *Cache) EvictExpired(now float64) (int, error) {

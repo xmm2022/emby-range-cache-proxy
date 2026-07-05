@@ -140,8 +140,7 @@ func (w *Worker) runTask(task state.PrefetchTaskRecord, now float64) RunResult {
 
 func PlanMiddleRanges(mediaSize, headSize, tailSize, anchorOffset int64, queuedUntil *int64, prefetch config.PrefetchConfig, middleCache config.MiddleCacheConfig) []model.ByteRange {
 	segment := middleCache.SegmentBytes
-	windowBytes := minPositive(headSize, prefetch.WindowBytes, prefetch.MaxSessionBytes)
-	if segment <= 0 || windowBytes <= 0 {
+	if segment <= 0 {
 		return nil
 	}
 	headEnd := headSize - 1
@@ -157,34 +156,18 @@ func PlanMiddleRanges(mediaSize, headSize, tailSize, anchorOffset int64, queuedU
 	if middleStart > middleEnd {
 		return nil
 	}
-	var start int64
-	if queuedUntil == nil {
-		if anchorOffset <= headEnd {
-			return nil
-		}
-		overlap := prefetch.ResumeOverlapBytes
-		if half := windowBytes / 2; overlap > half {
-			overlap = half
-		}
-		start = anchorOffset - overlap
-		if start < middleStart {
-			start = middleStart
-		}
-		if windowBytes > segment {
-			start = alignDown(start, segment)
-			if start < middleStart {
-				start = middleStart
-			}
-		}
-	} else {
-		start = *queuedUntil + 1
-		if start < middleStart {
-			start = middleStart
-		}
+	start, sessionEnd, ok := planMiddleWindow(middleStart, middleEnd, segment, headEnd, anchorOffset, queuedUntil, prefetch)
+	if !ok {
+		return nil
 	}
-	sessionEnd := start + windowBytes - 1
+	if start < middleStart {
+		start = middleStart
+	}
 	if sessionEnd > middleEnd {
 		sessionEnd = middleEnd
+	}
+	if start > sessionEnd {
+		return nil
 	}
 	var out []model.ByteRange
 	current := start
@@ -210,6 +193,56 @@ func PlanMiddleRanges(mediaSize, headSize, tailSize, anchorOffset int64, queuedU
 		current = end + 1
 	}
 	return out
+}
+
+func planMiddleWindow(middleStart, middleEnd, segment, headEnd, anchorOffset int64, queuedUntil *int64, prefetch config.PrefetchConfig) (int64, int64, bool) {
+	if prefetch.ResumeBackBlocks > 0 || prefetch.ResumeForwardBlocks > 0 {
+		if anchorOffset <= headEnd {
+			return 0, 0, false
+		}
+		anchorBlockStart := alignDown(anchorOffset, segment)
+		start := anchorBlockStart - int64(prefetch.ResumeBackBlocks)*segment
+		sessionEnd := anchorBlockStart + int64(prefetch.ResumeForwardBlocks+1)*segment - 1
+		if queuedUntil != nil {
+			start = *queuedUntil + 1
+		}
+		return start, sessionEnd, true
+	}
+
+	windowBytes := minPositive(headEnd+1, prefetch.WindowBytes, prefetch.MaxSessionBytes)
+	if windowBytes <= 0 {
+		return 0, 0, false
+	}
+	var start int64
+	if queuedUntil == nil {
+		if anchorOffset <= headEnd {
+			return 0, 0, false
+		}
+		overlap := prefetch.ResumeOverlapBytes
+		if half := windowBytes / 2; overlap > half {
+			overlap = half
+		}
+		start = anchorOffset - overlap
+		if start < middleStart {
+			start = middleStart
+		}
+		if windowBytes > segment {
+			start = alignDown(start, segment)
+			if start < middleStart {
+				start = middleStart
+			}
+		}
+	} else {
+		start = *queuedUntil + 1
+		if start < middleStart {
+			start = middleStart
+		}
+	}
+	sessionEnd := start + windowBytes - 1
+	if sessionEnd > middleEnd {
+		sessionEnd = middleEnd
+	}
+	return start, sessionEnd, true
 }
 
 func EnqueueForSession(store *state.Store, session state.PlaybackSessionRecord, prefetch config.PrefetchConfig, middleCache config.MiddleCacheConfig, now float64, priority int) (int, error) {

@@ -35,6 +35,63 @@ func TestPlanMiddleRangesSkipsHeadTailAndUsesOverlap(t *testing.T) {
 	}
 }
 
+func TestPlanMiddleRangesUsesResumeBlockCounts(t *testing.T) {
+	const mib = 1024 * 1024
+	cfg := config.PrefetchConfig{
+		WindowBytes:         2 * 1024 * mib,
+		ResumeOverlapBytes:  128 * mib,
+		MaxSessionBytes:     4 * 1024 * mib,
+		ResumeBackBlocks:    1,
+		ResumeForwardBlocks: 2,
+	}
+	mid := config.MiddleCacheConfig{SegmentBytes: 64 * mib}
+
+	got := PlanMiddleRanges(2*1024*mib, 32*mib, 8*mib, 19*64*mib+32*mib, nil, cfg, mid)
+
+	want := []model.ByteRange{
+		{Start: 18 * 64 * mib, End: 19*64*mib - 1},
+		{Start: 19 * 64 * mib, End: 20*64*mib - 1},
+		{Start: 20 * 64 * mib, End: 21*64*mib - 1},
+		{Start: 21 * 64 * mib, End: 22*64*mib - 1},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %+v want %+v", got, want)
+		}
+	}
+}
+
+func TestPlanMiddleRangesUsesQueuedUntilWithinResumeBlockWindow(t *testing.T) {
+	const mib = 1024 * 1024
+	cfg := config.PrefetchConfig{
+		WindowBytes:         2 * 1024 * mib,
+		ResumeOverlapBytes:  128 * mib,
+		MaxSessionBytes:     4 * 1024 * mib,
+		ResumeBackBlocks:    1,
+		ResumeForwardBlocks: 2,
+	}
+	mid := config.MiddleCacheConfig{SegmentBytes: 64 * mib}
+	queuedUntil := int64(20*64*mib - 1)
+
+	got := PlanMiddleRanges(2*1024*mib, 32*mib, 8*mib, 19*64*mib+32*mib, &queuedUntil, cfg, mid)
+
+	want := []model.ByteRange{
+		{Start: 20 * 64 * mib, End: 21*64*mib - 1},
+		{Start: 21 * 64 * mib, End: 22*64*mib - 1},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %+v want %+v", got, want)
+		}
+	}
+}
+
 func TestEnqueuePrefetchForSessionDeduplicatesReusableRanges(t *testing.T) {
 	root := t.TempDir()
 	store, err := state.Open(filepath.Join(root, "state.sqlite3"))
