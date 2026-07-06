@@ -16,7 +16,17 @@ const (
 var rangeRE = regexp.MustCompile(`^bytes=(\d*)-(\d*)$`)
 
 func AdaptiveHeadTail(size int64) (int64, int64) {
-	return 8 * mib, 8 * mib
+	return ConfiguredHeadTail(size, 8*mib, 8*mib)
+}
+
+func ConfiguredHeadTail(size, headBytes, tailBytes int64) (int64, int64) {
+	if headBytes <= 0 {
+		headBytes = 8 * mib
+	}
+	if tailBytes <= 0 {
+		tailBytes = 8 * mib
+	}
+	return headBytes, tailBytes
 }
 
 func ParseRangeHeader(value string, size int64) (model.ByteRange, error) {

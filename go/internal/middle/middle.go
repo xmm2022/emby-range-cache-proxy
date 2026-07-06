@@ -8,8 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 
+	"github.com/xmm2022/emby-range-cache-proxy/go/internal/diskfree"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/model"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/state"
 )
@@ -308,7 +308,7 @@ func (c *Cache) ensureFree(writeBytes int64) error {
 	if c.MinFreeBytes <= 0 {
 		return nil
 	}
-	free := diskFree(c.Root)
+	free := diskfree.FreeBytes(c.Root)
 	if free >= 0 && free-writeBytes < c.MinFreeBytes {
 		return fmt.Errorf("insufficient disk free space")
 	}
@@ -383,12 +383,4 @@ func readSidecar(path string) (int64, int64, error) {
 		return 0, 0, err
 	}
 	return start, end, nil
-}
-
-func diskFree(path string) int64 {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return -1
-	}
-	return int64(stat.Bavail) * int64(stat.Bsize)
 }

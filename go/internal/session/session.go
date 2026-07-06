@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/model"
-	"github.com/xmm2022/emby-range-cache-proxy/go/internal/ranges"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/state"
 )
 
@@ -59,8 +58,7 @@ func BuildUpdate(ctx model.RequestContext, cacheKey string, metadata model.Sourc
 	}
 }
 
-func IsTailMetadataRange(size int64, byteRange model.ByteRange) bool {
-	headSize, tailSize := ranges.AdaptiveHeadTail(size)
+func IsTailMetadataRange(size int64, byteRange model.ByteRange, headSize, tailSize int64) bool {
 	headEnd := headSize
 	if headEnd > size {
 		headEnd = size

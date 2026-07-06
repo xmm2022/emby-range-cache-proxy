@@ -72,8 +72,15 @@ func TestPrintEffectiveConfigRedactsSecretAndIncludesDefaults(t *testing.T) {
 	if payload["listen_host"] != "127.0.0.1" || payload["listen_port"].(float64) != 18180 {
 		t.Fatalf("listen=%v:%v", payload["listen_host"], payload["listen_port"])
 	}
+	if payload["playback_info_timeout_seconds"].(float64) != 15 {
+		t.Fatalf("playback_info_timeout_seconds=%v", payload["playback_info_timeout_seconds"])
+	}
 	if payload["prewarm_api_key"] != "REDACTED" {
 		t.Fatalf("prewarm_api_key=%v", payload["prewarm_api_key"])
+	}
+	cache := payload["cache"].(map[string]any)
+	if cache["head_bytes"].(float64) != 8*1024*1024 || cache["tail_bytes"].(float64) != 8*1024*1024 {
+		t.Fatalf("cache head/tail=%v/%v", cache["head_bytes"], cache["tail_bytes"])
 	}
 	prewarm := payload["prewarm"].(map[string]any)
 	if prewarm["interval_seconds"].(float64) != 900 {

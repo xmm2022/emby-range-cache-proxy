@@ -7,19 +7,20 @@ import (
 )
 
 type EffectiveConfig struct {
-	EmbyBaseURL     string                 `json:"emby_base_url"`
-	FallbackBaseURL string                 `json:"fallback_base_url"`
-	ListenHost      string                 `json:"listen_host"`
-	ListenPort      int                    `json:"listen_port"`
-	CacheDir        string                 `json:"cache_dir"`
-	PrewarmAPIKey   any                    `json:"prewarm_api_key"`
-	PathMappings    []EffectivePathMapping `json:"path_mappings"`
-	Rollout         EffectiveRollout       `json:"rollout"`
-	Cache           EffectiveCache         `json:"cache"`
-	Prewarm         EffectivePrewarm       `json:"prewarm"`
-	Session         EffectiveSession       `json:"session"`
-	MiddleCache     EffectiveMiddleCache   `json:"middle_cache"`
-	Prefetch        EffectivePrefetch      `json:"prefetch"`
+	EmbyBaseURL                string                 `json:"emby_base_url"`
+	FallbackBaseURL            string                 `json:"fallback_base_url"`
+	ListenHost                 string                 `json:"listen_host"`
+	ListenPort                 int                    `json:"listen_port"`
+	CacheDir                   string                 `json:"cache_dir"`
+	PrewarmAPIKey              any                    `json:"prewarm_api_key"`
+	PlaybackInfoTimeoutSeconds int                    `json:"playback_info_timeout_seconds"`
+	PathMappings               []EffectivePathMapping `json:"path_mappings"`
+	Rollout                    EffectiveRollout       `json:"rollout"`
+	Cache                      EffectiveCache         `json:"cache"`
+	Prewarm                    EffectivePrewarm       `json:"prewarm"`
+	Session                    EffectiveSession       `json:"session"`
+	MiddleCache                EffectiveMiddleCache   `json:"middle_cache"`
+	Prefetch                   EffectivePrefetch      `json:"prefetch"`
 }
 
 type EffectivePathMapping struct {
@@ -37,6 +38,8 @@ type EffectiveRollout struct {
 type EffectiveCache struct {
 	MaxBytes              int64   `json:"max_bytes"`
 	BuildWaitSeconds      float64 `json:"build_wait_seconds"`
+	HeadBytes             int64   `json:"head_bytes"`
+	TailBytes             int64   `json:"tail_bytes"`
 	ChunkBytes            int64   `json:"chunk_bytes"`
 	DefaultOpenRangeBytes int64   `json:"default_open_range_bytes"`
 	OpenHeadResponseBytes *int64  `json:"open_head_response_bytes"`
@@ -106,13 +109,14 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 		stateDB = filepath.Join(cfg.CacheDir, "state", "phase2.sqlite3")
 	}
 	return EffectiveConfig{
-		EmbyBaseURL:     cfg.EmbyBaseURL,
-		FallbackBaseURL: cfg.FallbackBaseURL,
-		ListenHost:      cfg.ListenHost,
-		ListenPort:      cfg.ListenPort,
-		CacheDir:        cfg.CacheDir,
-		PrewarmAPIKey:   prewarmKey,
-		PathMappings:    pathMappings,
+		EmbyBaseURL:                cfg.EmbyBaseURL,
+		FallbackBaseURL:            cfg.FallbackBaseURL,
+		ListenHost:                 cfg.ListenHost,
+		ListenPort:                 cfg.ListenPort,
+		CacheDir:                   cfg.CacheDir,
+		PrewarmAPIKey:              prewarmKey,
+		PlaybackInfoTimeoutSeconds: cfg.PlaybackInfoTimeoutSeconds,
+		PathMappings:               pathMappings,
 		Rollout: EffectiveRollout{
 			Enabled:              cfg.Rollout.Enabled,
 			ItemAllowlist:        sortedSet(cfg.Rollout.ItemAllowlist),
@@ -122,6 +126,8 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 		Cache: EffectiveCache{
 			MaxBytes:              cfg.Cache.MaxBytes,
 			BuildWaitSeconds:      cfg.Cache.BuildWaitSeconds,
+			HeadBytes:             cfg.Cache.HeadBytes,
+			TailBytes:             cfg.Cache.TailBytes,
 			ChunkBytes:            cfg.Cache.ChunkBytes,
 			DefaultOpenRangeBytes: cfg.Cache.DefaultOpenRangeBytes,
 			OpenHeadResponseBytes: cfg.Cache.OpenHeadResponseBytes,

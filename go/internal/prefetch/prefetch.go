@@ -245,8 +245,8 @@ func planMiddleWindow(middleStart, middleEnd, segment, headEnd, anchorOffset int
 	return start, sessionEnd, true
 }
 
-func EnqueueForSession(store *state.Store, session state.PlaybackSessionRecord, prefetch config.PrefetchConfig, middleCache config.MiddleCacheConfig, now float64, priority int) (int, error) {
-	headSize, tailSize := ranges.AdaptiveHeadTail(session.MediaSize)
+func EnqueueForSession(store *state.Store, session state.PlaybackSessionRecord, cacheConfig config.CacheConfig, prefetch config.PrefetchConfig, middleCache config.MiddleCacheConfig, now float64, priority int) (int, error) {
+	headSize, tailSize := ranges.ConfiguredHeadTail(session.MediaSize, cacheConfig.HeadBytes, cacheConfig.TailBytes)
 	rangesToQueue := PlanMiddleRanges(session.MediaSize, headSize, tailSize, session.LastRangeEnd, nil, prefetch, middleCache)
 	if len(rangesToQueue) == 0 {
 		return 0, nil

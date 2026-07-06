@@ -42,8 +42,14 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 	if cfg.ListenHost != "127.0.0.1" || cfg.ListenPort != 18180 {
 		t.Fatalf("listen = %s:%d", cfg.ListenHost, cfg.ListenPort)
 	}
+	if cfg.PlaybackInfoTimeoutSeconds != 15 {
+		t.Fatalf("playback info timeout = %d", cfg.PlaybackInfoTimeoutSeconds)
+	}
 	if cfg.Cache.MaxBytes != 512*1024*1024*1024 {
 		t.Fatalf("cache max bytes = %d", cfg.Cache.MaxBytes)
+	}
+	if cfg.Cache.HeadBytes != 8*1024*1024 || cfg.Cache.TailBytes != 8*1024*1024 {
+		t.Fatalf("cache head/tail = %d/%d", cfg.Cache.HeadBytes, cfg.Cache.TailBytes)
 	}
 	if cfg.Cache.DefaultOpenRangeBytes != 16*1024*1024 {
 		t.Fatalf("default open range = %d", cfg.Cache.DefaultOpenRangeBytes)
@@ -67,12 +73,13 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 
 func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	path := writeConfig(t, map[string]any{
-		"emby_base_url":     "http://emby.local/",
-		"fallback_base_url": "http://fallback.local/",
-		"listen_host":       "127.0.0.2",
-		"listen_port":       19090,
-		"cache_dir":         filepath.Join(t.TempDir(), "cache"),
-		"prewarm_api_key":   "secret",
+		"emby_base_url":                 "http://emby.local/",
+		"fallback_base_url":             "http://fallback.local/",
+		"listen_host":                   "127.0.0.2",
+		"listen_port":                   19090,
+		"cache_dir":                     filepath.Join(t.TempDir(), "cache"),
+		"prewarm_api_key":               "secret",
+		"playback_info_timeout_seconds": 11,
 		"path_mappings": []map[string]any{
 			{"from": "/strm", "to": "/srv/strm"},
 			{"source_prefix": "/media/", "target_prefix": "/srv/media"},
@@ -87,6 +94,8 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 		"cache": map[string]any{
 			"max_bytes":                "123",
 			"build_wait_seconds":       1.5,
+			"head_bytes":               32,
+			"tail_bytes":               64,
 			"chunk_bytes":              4096,
 			"default_open_range_bytes": 8192,
 			"open_head_response_bytes": 16384,
@@ -139,13 +148,16 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	if cfg.EmbyBaseURL != "http://emby.local" || cfg.FallbackBaseURL != "http://fallback.local" {
 		t.Fatalf("base URLs = %q %q", cfg.EmbyBaseURL, cfg.FallbackBaseURL)
 	}
+	if cfg.PlaybackInfoTimeoutSeconds != 11 {
+		t.Fatalf("playback info timeout = %d", cfg.PlaybackInfoTimeoutSeconds)
+	}
 	if len(cfg.PathMappings) != 2 || cfg.PathMappings[0].SourcePrefix != "/strm/" || cfg.PathMappings[1].SourcePrefix != "/media/" {
 		t.Fatalf("path mappings = %+v", cfg.PathMappings)
 	}
 	if !cfg.Rollout.InScope("1", "ms1", "http://127.0.0.1:18096/a.mkv") {
 		t.Fatalf("expected rollout in scope")
 	}
-	if cfg.Cache.MaxBytes != 123 || cfg.Cache.OpenHeadResponseBytes == nil || *cfg.Cache.OpenHeadResponseBytes != 16384 {
+	if cfg.Cache.MaxBytes != 123 || cfg.Cache.HeadBytes != 32 || cfg.Cache.TailBytes != 64 || cfg.Cache.OpenHeadResponseBytes == nil || *cfg.Cache.OpenHeadResponseBytes != 16384 {
 		t.Fatalf("cache = %+v", cfg.Cache)
 	}
 	if !cfg.Prewarm.Enabled || cfg.Prewarm.IntervalSeconds != 60 || cfg.Prewarm.Concurrency != 2 || cfg.Prewarm.PlaybackInfoTimeoutSeconds != 17 {
@@ -172,6 +184,9 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 	}{
 		{"missing emby", map[string]any{"emby_base_url": ""}},
 		{"missing cache", map[string]any{"cache_dir": ""}},
+		{"bad playbackinfo timeout", map[string]any{"playback_info_timeout_seconds": 0}},
+		{"bad cache head", map[string]any{"cache": map[string]any{"head_bytes": 0}}},
+		{"bad cache tail", map[string]any{"cache": map[string]any{"tail_bytes": 0}}},
 		{"bad mapping root", map[string]any{"path_mappings": []map[string]any{{"from": "/", "to": "/tmp"}}}},
 		{"string bool", map[string]any{"session": map[string]any{"enabled": "false"}}},
 		{"short prewarm", map[string]any{"prewarm": map[string]any{"interval_seconds": 59}}},

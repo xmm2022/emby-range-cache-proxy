@@ -14,19 +14,20 @@ const (
 )
 
 type Config struct {
-	EmbyBaseURL     string
-	FallbackBaseURL string
-	ListenHost      string
-	ListenPort      int
-	CacheDir        string
-	PrewarmAPIKey   string
-	PathMappings    []PathMapping
-	Rollout         RolloutConfig
-	Cache           CacheConfig
-	Prewarm         PrewarmConfig
-	Session         SessionConfig
-	MiddleCache     MiddleCacheConfig
-	Prefetch        PrefetchConfig
+	EmbyBaseURL                string
+	FallbackBaseURL            string
+	ListenHost                 string
+	ListenPort                 int
+	CacheDir                   string
+	PrewarmAPIKey              string
+	PlaybackInfoTimeoutSeconds int
+	PathMappings               []PathMapping
+	Rollout                    RolloutConfig
+	Cache                      CacheConfig
+	Prewarm                    PrewarmConfig
+	Session                    SessionConfig
+	MiddleCache                MiddleCacheConfig
+	Prefetch                   PrefetchConfig
 }
 
 type PathMapping struct {
@@ -71,6 +72,8 @@ func (r RolloutConfig) InScope(itemID, mediaSourceID, path string) bool {
 type CacheConfig struct {
 	MaxBytes              int64
 	BuildWaitSeconds      float64
+	HeadBytes             int64
+	TailBytes             int64
 	ChunkBytes            int64
 	DefaultOpenRangeBytes int64
 	OpenHeadResponseBytes *int64
@@ -132,11 +135,14 @@ func LoadFile(filePath string) (Config, error) {
 
 func parseRaw(raw map[string]any) (Config, error) {
 	cfg := Config{
-		ListenHost: "127.0.0.1",
-		ListenPort: 18180,
+		ListenHost:                 "127.0.0.1",
+		ListenPort:                 18180,
+		PlaybackInfoTimeoutSeconds: 15,
 		Cache: CacheConfig{
 			MaxBytes:              512 * gib,
 			BuildWaitSeconds:      0.25,
+			HeadBytes:             8 * mib,
+			TailBytes:             8 * mib,
 			ChunkBytes:            mib,
 			DefaultOpenRangeBytes: 16 * mib,
 		},
@@ -199,6 +205,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 	if cfg.PrewarmAPIKey, err = stringField(raw, "prewarm_api_key", false); err != nil {
 		return Config{}, err
 	}
+	if cfg.PlaybackInfoTimeoutSeconds, err = intFieldDefault(raw, "playback_info_timeout_seconds", cfg.PlaybackInfoTimeoutSeconds); err != nil {
+		return Config{}, err
+	}
 	if cfg.PathMappings, err = parsePathMappings(raw["path_mappings"]); err != nil {
 		return Config{}, err
 	}
@@ -236,7 +245,10 @@ func (c Config) Validate() error {
 	if c.ListenPort <= 0 || c.ListenPort > 65535 {
 		return fmt.Errorf("listen_port must be valid")
 	}
-	if c.Cache.MaxBytes <= 0 || c.Cache.BuildWaitSeconds < 0 || c.Cache.ChunkBytes <= 0 || c.Cache.DefaultOpenRangeBytes <= 0 {
+	if c.PlaybackInfoTimeoutSeconds <= 0 {
+		return fmt.Errorf("playback_info_timeout_seconds must be positive")
+	}
+	if c.Cache.MaxBytes <= 0 || c.Cache.BuildWaitSeconds < 0 || c.Cache.HeadBytes <= 0 || c.Cache.TailBytes <= 0 || c.Cache.ChunkBytes <= 0 || c.Cache.DefaultOpenRangeBytes <= 0 {
 		return fmt.Errorf("cache values must be positive")
 	}
 	if c.Prewarm.IntervalSeconds < 60 {
@@ -321,6 +333,12 @@ func parseCache(value any, cfg *CacheConfig) error {
 		return err
 	}
 	if cfg.BuildWaitSeconds, err = floatFieldDefault(data, "build_wait_seconds", cfg.BuildWaitSeconds); err != nil {
+		return err
+	}
+	if cfg.HeadBytes, err = int64FieldDefault(data, "head_bytes", cfg.HeadBytes); err != nil {
+		return err
+	}
+	if cfg.TailBytes, err = int64FieldDefault(data, "tail_bytes", cfg.TailBytes); err != nil {
 		return err
 	}
 	if cfg.ChunkBytes, err = int64FieldDefault(data, "chunk_bytes", cfg.ChunkBytes); err != nil {

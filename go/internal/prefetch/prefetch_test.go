@@ -110,12 +110,13 @@ func TestEnqueuePrefetchForSessionDeduplicatesReusableRanges(t *testing.T) {
 		MaxObservedOffset: 300,
 	}
 	cfg := config.PrefetchConfig{WindowBytes: 4 * 1024 * 1024, ResumeOverlapBytes: 1024 * 1024, MaxSessionBytes: 8 * 1024 * 1024, MaxQueueDepth: 10}
+	cacheCfg := config.CacheConfig{HeadBytes: 8 * 1024 * 1024, TailBytes: 8 * 1024 * 1024}
 	mid := config.MiddleCacheConfig{SegmentBytes: 1024 * 1024}
-	inserted, err := EnqueueForSession(store, session, cfg, mid, 10, 10)
+	inserted, err := EnqueueForSession(store, session, cacheCfg, cfg, mid, 10, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := EnqueueForSession(store, session, cfg, mid, 11, 10)
+	again, err := EnqueueForSession(store, session, cacheCfg, cfg, mid, 11, 10)
 	if err != nil {
 		t.Fatal(err)
 	}

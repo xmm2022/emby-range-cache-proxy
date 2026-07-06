@@ -1,26 +1,32 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/config"
+	"github.com/xmm2022/emby-range-cache-proxy/go/internal/emby"
 )
 
 func testConfig(t *testing.T, embyBase, fallbackBase string) config.Config {
 	t.Helper()
 	return config.Config{
-		EmbyBaseURL:     embyBase,
-		FallbackBaseURL: fallbackBase,
-		ListenHost:      "127.0.0.1",
-		ListenPort:      18180,
-		CacheDir:        filepath.Join(t.TempDir(), "cache"),
-		PrewarmAPIKey:   "internal-secret",
+		EmbyBaseURL:                embyBase,
+		FallbackBaseURL:            fallbackBase,
+		ListenHost:                 "127.0.0.1",
+		ListenPort:                 18180,
+		CacheDir:                   filepath.Join(t.TempDir(), "cache"),
+		PrewarmAPIKey:              "internal-secret",
+		PlaybackInfoTimeoutSeconds: 15,
 		Rollout: config.RolloutConfig{
 			Enabled:              true,
 			ItemAllowlist:        map[string]struct{}{"10535": {}},
@@ -30,6 +36,8 @@ func testConfig(t *testing.T, embyBase, fallbackBase string) config.Config {
 		Cache: config.CacheConfig{
 			MaxBytes:              1024 * 1024,
 			BuildWaitSeconds:      0.01,
+			HeadBytes:             8 * 1024 * 1024,
+			TailBytes:             8 * 1024 * 1024,
 			ChunkBytes:            4,
 			DefaultOpenRangeBytes: 16,
 		},
@@ -58,13 +66,14 @@ func testConfig(t *testing.T, embyBase, fallbackBase string) config.Config {
 
 func TestNewUsesSeparatePrewarmAuthTimeout(t *testing.T) {
 	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.PlaybackInfoTimeoutSeconds = 11
 	cfg.Prewarm.PlaybackInfoTimeoutSeconds = 17
 	server, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	if server.auth.HTTP.Timeout != 5*time.Second {
+	if server.auth.HTTP.Timeout != 11*time.Second {
 		t.Fatalf("playback auth timeout = %s", server.auth.HTTP.Timeout)
 	}
 	if server.prewarmAuth.HTTP.Timeout != 17*time.Second {
@@ -72,6 +81,9 @@ func TestNewUsesSeparatePrewarmAuthTimeout(t *testing.T) {
 	}
 	if server.httpClient.Timeout != 17*time.Second {
 		t.Fatalf("prewarm scan timeout = %s", server.httpClient.Timeout)
+	}
+	if server.fallbackClient.Timeout != 0 {
+		t.Fatalf("fallback timeout = %s", server.fallbackClient.Timeout)
 	}
 }
 
@@ -155,6 +167,22 @@ func TestInternalMetricsRejectsNonLoopbackRemote(t *testing.T) {
 	}
 }
 
+func TestInternalMetricsRejectsForwardedNonLoopbackClient(t *testing.T) {
+	server, err := New(testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	req := httptest.NewRequest(http.MethodGet, "/internal/metrics", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.10")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestProxyRejectsInternalKeyBeforeFallback(t *testing.T) {
 	cases := []struct {
 		name string
@@ -203,6 +231,87 @@ func TestProxyRejectsInternalKeyBeforeFallback(t *testing.T) {
 				t.Fatalf("code=%d fallbackHit=%v", rec.Code, fallbackHit)
 			}
 		})
+	}
+}
+
+func TestDirBytesSkipsMiddleCacheDirectories(t *testing.T) {
+	root := t.TempDir()
+	keyDir := filepath.Join(root, strings.Repeat("a", 64))
+	if err := os.MkdirAll(filepath.Join(keyDir, "mid"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(keyDir, "head.bin"), []byte("head"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(keyDir, "mid", "0-3.bin"), []byte("middle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := dirBytes(root, func(path string) bool {
+		return strings.HasSuffix(path, ".bin")
+	})
+	if got != 4 {
+		t.Fatalf("dir bytes = %d", got)
+	}
+}
+
+func TestRecentErrorEventsIncludeTimestampAndMessage(t *testing.T) {
+	server, err := New(testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.addError("example failure")
+	stats := server.SnapshotStats()
+	if len(stats.RecentErrors) != 1 || stats.RecentErrors[0] != "example failure" {
+		t.Fatalf("recent errors = %+v", stats.RecentErrors)
+	}
+	if len(stats.ErrorEvents) != 1 || stats.ErrorEvents[0].Message != "example failure" {
+		t.Fatalf("error events = %+v", stats.ErrorEvents)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, stats.ErrorEvents[0].Timestamp); err != nil {
+		t.Fatalf("timestamp = %q", stats.ErrorEvents[0].Timestamp)
+	}
+}
+
+func TestErrorClassRecognizesWrappedErrors(t *testing.T) {
+	if got := errorClass(fmt.Errorf("outer: %w", context.DeadlineExceeded)); got != "DeadlineExceeded" {
+		t.Fatalf("deadline class = %s", got)
+	}
+	if got := errorClass(fmt.Errorf("outer: %w", emby.AuthUnavailable{Reason: "slow"})); got != "AuthUnavailable" {
+		t.Fatalf("auth class = %s", got)
+	}
+}
+
+func TestFallbackStreamIgnoresShortAPITimeout(t *testing.T) {
+	chunks := []string{"aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "eeeeeeee", "ffffffff"}
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(strings.Join(chunks, ""))))
+		flusher, _ := w.(http.Flusher)
+		for _, chunk := range chunks {
+			_, _ = w.Write([]byte(chunk))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+	}))
+	defer fallback.Close()
+
+	cfg := testConfig(t, "http://127.0.0.1:1", fallback.URL)
+	cfg.Prewarm.PlaybackInfoTimeoutSeconds = 1
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/not-an-original-media-path", nil)
+	server.ServeHTTP(rec, req)
+
+	want := strings.Join(chunks, "")
+	if rec.Code != http.StatusOK || rec.Body.String() != want {
+		t.Fatalf("fallback code=%d body_len=%d want_len=%d body=%q", rec.Code, rec.Body.Len(), len(want), rec.Body.String())
 	}
 }
 
@@ -258,6 +367,85 @@ func TestAuthorizedHeadRangeBuildsAndHitsHeadCache(t *testing.T) {
 	stats := server.SnapshotStats()
 	if stats.Counters.CacheBuild == 0 || stats.Counters.CacheHit == 0 {
 		t.Fatalf("stats = %+v", stats.Counters)
+	}
+}
+
+func TestConcurrentHeadRangeRequestsShareInProgressBuild(t *testing.T) {
+	var originGets int32
+	firstGetStarted := make(chan struct{})
+	releaseOrigin := make(chan struct{})
+	originBody := strings.Repeat("x", 64)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "64")
+			w.Header().Set("ETag", `"v1"`)
+		case http.MethodGet:
+			if got := r.Header.Get("Range"); got != "bytes=0-63" {
+				t.Errorf("origin range = %q", got)
+			}
+			if atomic.AddInt32(&originGets, 1) == 1 {
+				close(firstGetStarted)
+			}
+			<-releaseOrigin
+			w.Header().Set("Content-Range", "bytes 0-63/64")
+			w.Header().Set("Content-Length", "64")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte(originBody))
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mkv","Protocol":"Http"}]}`))
+	}))
+	defer emby.Close()
+
+	cfg := testConfig(t, emby.URL, emby.URL)
+	cfg.Cache.ChunkBytes = 8
+	cfg.Cache.BuildWaitSeconds = 2
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	type response struct {
+		code int
+		body string
+	}
+	requestRange := func(done chan<- response) {
+		req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token", nil)
+		req.Header.Set("Range", "bytes=0-15")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		done <- response{code: rec.Code, body: rec.Body.String()}
+	}
+
+	done1 := make(chan response, 1)
+	done2 := make(chan response, 1)
+	go requestRange(done1)
+	select {
+	case <-firstGetStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first origin GET did not start")
+	}
+	go requestRange(done2)
+	time.Sleep(100 * time.Millisecond)
+	close(releaseOrigin)
+
+	for i, done := range []chan response{done1, done2} {
+		select {
+		case got := <-done:
+			if got.code != http.StatusPartialContent || got.body != strings.Repeat("x", 16) {
+				t.Fatalf("response %d code=%d body=%q", i+1, got.code, got.body)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("response %d did not complete", i+1)
+		}
+	}
+	if got := atomic.LoadInt32(&originGets); got != 1 {
+		t.Fatalf("originGets=%d", got)
 	}
 }
 

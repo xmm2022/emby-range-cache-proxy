@@ -41,6 +41,7 @@ make check-config CONFIG=/etc/emby-range-cache-proxy/config.json
   "listen_port": 18180,
   "cache_dir": "/home/nax/emby/cache/range-proxy",
   "prewarm_api_key": "replace-with-a-long-random-secret",
+  "playback_info_timeout_seconds": 15,
   "rollout": {
     "enabled": true,
     "item_allowlist": ["10535"],
@@ -154,7 +155,7 @@ handle {
 }
 ```
 
-不要把 `/internal/prewarm` 暴露到公网反代。服务会拒绝非 loopback 调用，内部接口只应该给本机插件或本机脚本使用。
+不要把 `/internal/prewarm` 暴露到公网反代。服务会拒绝非 loopback 调用；如果 loopback 反代请求带有非 loopback 的 `X-Forwarded-For` 或 `X-Real-IP`，也会拒绝。内部接口只应该给本机插件或本机脚本使用。
 
 ## 内部预热接口
 
@@ -183,13 +184,15 @@ curl -fsS -X POST http://127.0.0.1:18180/internal/prewarm \
 | `listen_host` / `listen_port` | 缓存代理监听地址 | 建议 `127.0.0.1:18180` |
 | `cache_dir` | head/tail/middle 缓存和状态库目录 | 放在容量足够的磁盘 |
 | `prewarm_api_key` | 内部预热和后台任务密钥 | 使用长随机值，不要复用 Emby 用户 token |
+| `playback_info_timeout_seconds` | 用户播放请求查询 Emby PlaybackInfo 的前台鉴权超时 | 默认 `15`，冷启动慢可调大 |
 | `rollout.enabled` | 是否启用缓存代理命中范围 | 灰度时设为 `true` |
 | `rollout.item_allowlist` | 只允许指定 item 进入代理逻辑 | 初期只放一两个影片 |
 | `rollout.media_source_allowlist` | 只允许指定 MediaSource | 避免同影片多源误命中 |
 | `rollout.path_prefix_allowlist` | 限制实际源 URL 前缀 | `.strm` 场景必须配置严谨 |
 | `cache.max_bytes` | head/tail 缓存上限 | 按磁盘容量设置 |
+| `cache.head_bytes` / `cache.tail_bytes` | 起播头部块和尾部元数据块大小 | 默认各 `8388608` |
 | `prewarm.concurrency` | 内部预热并发 | 建议从 `1` 开始 |
-| `prewarm.playback_info_timeout_seconds` | 预热查询 Emby PlaybackInfo 的超时 | 默认 `15`，慢冷启动可适当调大 |
+| `prewarm.playback_info_timeout_seconds` | 内部预热查询 Emby PlaybackInfo 的超时 | 默认 `15`，与前台播放鉴权超时分开 |
 | `session.enabled` | 记录播放会话 | Phase 2 功能，默认关闭 |
 | `middle_cache.enabled` | 启用中段缓存 | 确认稳定后再开 |
 | `prefetch.enabled` | 启用空闲/停止后的中段预取 | 最后灰度开启 |

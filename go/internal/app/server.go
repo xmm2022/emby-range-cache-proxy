@@ -14,11 +14,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/cache"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/config"
+	"github.com/xmm2022/emby-range-cache-proxy/go/internal/diskfree"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/emby"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/headtail"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/middle"
@@ -40,15 +40,19 @@ type Server struct {
 	store  *state.Store
 	middle *middle.Cache
 
-	httpClient  *http.Client
-	origin      *origin.Client
-	auth        *emby.AuthClient
-	prewarmAuth *emby.AuthClient
+	httpClient     *http.Client
+	fallbackClient *http.Client
+	origin         *origin.Client
+	auth           *emby.AuthClient
+	prewarmAuth    *emby.AuthClient
 
 	originSem chan struct{}
 
 	statsMu sync.Mutex
 	stats   Stats
+
+	cacheBuildMu    sync.Mutex
+	cacheBuildLocks map[string]*cacheBuildLock
 
 	prewarmMu    sync.Mutex
 	prewarmTasks map[string]struct{}
@@ -65,6 +69,12 @@ type Stats struct {
 	Prefetch      PrefetchStats `json:"prefetch"`
 	MiddleBytes   int64         `json:"middle_blocks_bytes"`
 	RecentErrors  []string      `json:"recent_errors"`
+	ErrorEvents   []ErrorEvent  `json:"recent_error_events"`
+}
+
+type ErrorEvent struct {
+	Timestamp string `json:"timestamp"`
+	Message   string `json:"message"`
 }
 
 type ConfigSummary struct {
@@ -122,19 +132,22 @@ func New(cfg config.Config) (*Server, error) {
 	if prewarmConcurrency <= 0 {
 		prewarmConcurrency = 1
 	}
+	playbackInfoTimeout := time.Duration(cfg.PlaybackInfoTimeoutSeconds) * time.Second
 	prewarmTimeout := time.Duration(cfg.Prewarm.PlaybackInfoTimeoutSeconds) * time.Second
 	server := &Server{
-		cfg:          cfg,
-		startedAt:    time.Now(),
-		cache:        headtail.NewCache(cfg.CacheDir, cfg.Cache.MaxBytes),
-		store:        store,
-		httpClient:   &http.Client{Timeout: prewarmTimeout},
-		origin:       origin.NewClient(cfg.Cache.ChunkBytes),
-		auth:         emby.NewAuthClient(cfg.EmbyBaseURL),
-		prewarmAuth:  emby.NewAuthClientWithTimeout(cfg.EmbyBaseURL, prewarmTimeout),
-		originSem:    make(chan struct{}, 32),
-		prewarmTasks: make(map[string]struct{}),
-		prewarmSem:   make(chan struct{}, prewarmConcurrency),
+		cfg:             cfg,
+		startedAt:       time.Now(),
+		cache:           headtail.NewCache(cfg.CacheDir, cfg.Cache.MaxBytes),
+		store:           store,
+		httpClient:      &http.Client{Timeout: prewarmTimeout},
+		fallbackClient:  &http.Client{Timeout: 0},
+		origin:          origin.NewClient(cfg.Cache.ChunkBytes),
+		auth:            emby.NewAuthClientWithTimeout(cfg.EmbyBaseURL, playbackInfoTimeout),
+		prewarmAuth:     emby.NewAuthClientWithTimeout(cfg.EmbyBaseURL, prewarmTimeout),
+		originSem:       make(chan struct{}, 32),
+		cacheBuildLocks: make(map[string]*cacheBuildLock),
+		prewarmTasks:    make(map[string]struct{}),
+		prewarmSem:      make(chan struct{}, prewarmConcurrency),
 	}
 	server.middle = middle.NewCache(cfg.CacheDir, store, cfg.MiddleCache.MaxBytes, cfg.MiddleCache.TTLSeconds, cfg.MiddleCache.MinFreeBytes)
 	return server, nil
@@ -160,7 +173,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	if !isLoopback(r.RemoteAddr) {
+	if !isInternalCaller(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -169,7 +182,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	if !isLoopback(r.RemoteAddr) {
+	if !isInternalCaller(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -251,8 +264,9 @@ func (s *Server) SnapshotStats() Stats {
 	if queue, err := s.store.QueueDepth(); err == nil {
 		stats.Prefetch.Queue = int64(queue)
 	}
-	stats.DiskFreeBytes = diskFree(s.cfg.CacheDir)
+	stats.DiskFreeBytes = diskfree.FreeBytes(s.cfg.CacheDir)
 	stats.RecentErrors = append([]string(nil), s.stats.RecentErrors...)
+	stats.ErrorEvents = append([]ErrorEvent(nil), s.stats.ErrorEvents...)
 	return stats
 }
 
@@ -261,7 +275,7 @@ func (s *Server) handleInternalPrewarm(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !isLoopback(r.RemoteAddr) {
+	if !isInternalCaller(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -339,7 +353,7 @@ func (s *Server) prewarmItem(itemID, mediaSourceID string) error {
 		return err
 	}
 	key := cache.Key(sourceMedia, meta)
-	headSize, tailSize := ranges.AdaptiveHeadTail(meta.Size)
+	headSize, tailSize := s.headTailBytes(meta.Size)
 	toWarm := []struct {
 		name string
 		rng  model.ByteRange
@@ -419,7 +433,7 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 	if err != nil {
 		return err
 	}
-	headSize, tailSize := ranges.AdaptiveHeadTail(meta.Size)
+	headSize, tailSize := s.headTailBytes(meta.Size)
 	byteRange, err := ranges.PlanPlaybackRange(r.Header.Get("Range"), meta.Size, headSize, tailSize, s.cfg.Cache.DefaultOpenRangeBytes, s.cfg.Cache.OpenHeadResponseBytes)
 	if err != nil {
 		return err
@@ -470,6 +484,54 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 			}
 			return nil
 		}
+		buildLock := s.cacheBuildLock(key, blockName)
+		if !buildLock.tryAcquire() {
+			buildLock.wait(time.Duration(s.cfg.Cache.BuildWaitSeconds * float64(time.Second)))
+			chunks, err = s.cache.IterBlock(key, blockName, byteRange, s.cfg.Cache.ChunkBytes)
+			if err != nil {
+				return err
+			}
+			if chunks != nil {
+				s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
+				w.WriteHeader(status)
+				if err := writeChunks(w, chunks, func() {
+					s.recordSession(ctx, key, meta, byteRange)
+				}); err != nil {
+					s.addError("cache response failed: " + errorClass(err))
+					s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+				}
+				return nil
+			}
+			if !buildLock.tryAcquire() {
+				w.WriteHeader(status)
+				if err := s.streamOriginRange(meta.URL, meta, byteRange, w); err != nil {
+					s.addError("origin stream failed: " + errorClass(err))
+					s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+					return nil
+				}
+				s.addStat(func(stats *Stats) { stats.Counters.Origin++ })
+				s.recordSession(ctx, key, meta, byteRange)
+				return nil
+			}
+			chunks, err := s.cache.IterBlock(key, blockName, byteRange, s.cfg.Cache.ChunkBytes)
+			if err != nil {
+				buildLock.release()
+				return err
+			}
+			if chunks != nil {
+				buildLock.release()
+				s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
+				w.WriteHeader(status)
+				if err := writeChunks(w, chunks, func() {
+					s.recordSession(ctx, key, meta, byteRange)
+				}); err != nil {
+					s.addError("cache response failed: " + errorClass(err))
+					s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+				}
+				return nil
+			}
+		}
+		defer buildLock.release()
 		w.WriteHeader(status)
 		if err := s.buildHeadTailBlock(sourceMedia.Path, meta, key, blockName, blockRange, byteRange, w); err != nil {
 			s.addError("cache build stream failed: " + errorClass(err))
@@ -493,7 +555,7 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 
 func (s *Server) buildHeadTailBlock(sourceURL string, meta model.SourceMetadata, key, blockName string, blockRange, responseRange model.ByteRange, writers ...io.Writer) error {
 	if s.cfg.MiddleCache.MinFreeBytes > 0 {
-		free := diskFree(s.cfg.CacheDir)
+		free := diskfree.FreeBytes(s.cfg.CacheDir)
 		if free >= 0 && free-blockRange.Length() < s.cfg.MiddleCache.MinFreeBytes {
 			return fmt.Errorf("insufficient disk free space")
 		}
@@ -562,8 +624,64 @@ func (s *Server) streamOriginRange(url string, meta model.SourceMetadata, byteRa
 	return err
 }
 
+func (s *Server) headTailBytes(size int64) (int64, int64) {
+	return ranges.ConfiguredHeadTail(size, s.cfg.Cache.HeadBytes, s.cfg.Cache.TailBytes)
+}
+
+type cacheBuildLock struct {
+	token chan struct{}
+}
+
+func newCacheBuildLock() *cacheBuildLock {
+	lock := &cacheBuildLock{token: make(chan struct{}, 1)}
+	lock.token <- struct{}{}
+	return lock
+}
+
+func (l *cacheBuildLock) tryAcquire() bool {
+	select {
+	case <-l.token:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *cacheBuildLock) wait(timeout time.Duration) {
+	if timeout <= 0 {
+		return
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-l.token:
+		l.release()
+	case <-timer.C:
+	}
+}
+
+func (l *cacheBuildLock) release() {
+	select {
+	case l.token <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) cacheBuildLock(key, blockName string) *cacheBuildLock {
+	lockKey := key + "\x00" + blockName
+	s.cacheBuildMu.Lock()
+	defer s.cacheBuildMu.Unlock()
+	lock := s.cacheBuildLocks[lockKey]
+	if lock == nil {
+		lock = newCacheBuildLock()
+		s.cacheBuildLocks[lockKey] = lock
+	}
+	return lock
+}
+
 func (s *Server) recordSession(ctx model.RequestContext, key string, meta model.SourceMetadata, byteRange model.ByteRange) {
-	if !s.cfg.Session.Enabled || session.IsTailMetadataRange(meta.Size, byteRange) {
+	headSize, tailSize := s.headTailBytes(meta.Size)
+	if !s.cfg.Session.Enabled || session.IsTailMetadataRange(meta.Size, byteRange, headSize, tailSize) {
 		return
 	}
 	update := session.BuildUpdate(ctx, key, meta, byteRange, float64(time.Now().Unix()))
@@ -580,7 +698,7 @@ func (s *Server) streamFallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyForwardHeaders(req.Header, r.Header)
-	resp, err := s.httpClient.Do(req)
+	resp, err := s.fallbackClient.Do(req)
 	if err != nil {
 		http.Error(w, "fallback unavailable", http.StatusBadGateway)
 		return
@@ -643,6 +761,10 @@ func (s *Server) addError(message string) {
 	if len(s.stats.RecentErrors) > 20 {
 		s.stats.RecentErrors = s.stats.RecentErrors[len(s.stats.RecentErrors)-20:]
 	}
+	s.stats.ErrorEvents = append(s.stats.ErrorEvents, ErrorEvent{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Message: message})
+	if len(s.stats.ErrorEvents) > 20 {
+		s.stats.ErrorEvents = s.stats.ErrorEvents[len(s.stats.ErrorEvents)-20:]
+	}
 }
 
 func requestContainsPrewarmKey(r *http.Request, internalKey string) bool {
@@ -703,6 +825,22 @@ func isLoopback(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+func isInternalCaller(r *http.Request) bool {
+	if !isLoopback(r.RemoteAddr) {
+		return false
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		first, _, _ := strings.Cut(xff, ",")
+		if !isLoopback(strings.TrimSpace(first)) {
+			return false
+		}
+	}
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" && !isLoopback(realIP) {
+		return false
+	}
+	return true
+}
+
 func isHTTP(value string) bool {
 	parsed, err := url.Parse(value)
 	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https")
@@ -721,6 +859,34 @@ func errorClass(err error) string {
 	if err == nil {
 		return "none"
 	}
+	var authErr emby.AuthorizationError
+	if errors.As(err, &authErr) {
+		return "AuthorizationError"
+	}
+	var authUnavailable emby.AuthUnavailable
+	if errors.As(err, &authUnavailable) {
+		return "AuthUnavailable"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "Canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "DeadlineExceeded"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "Timeout"
+		}
+		return "NetError"
+	}
+	for {
+		unwrapped := errors.Unwrap(err)
+		if unwrapped == nil {
+			break
+		}
+		err = unwrapped
+	}
 	name := fmt.Sprintf("%T", err)
 	if idx := strings.LastIndex(name, "."); idx >= 0 {
 		return name[idx+1:]
@@ -731,7 +897,16 @@ func errorClass(err error) string {
 func dirBytes(root string, include func(string) bool) int64 {
 	var total int64
 	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || !include(path) {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			if entry.Name() == "mid" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !include(path) {
 			return nil
 		}
 		if info, err := entry.Info(); err == nil {
@@ -740,14 +915,6 @@ func dirBytes(root string, include func(string) bool) int64 {
 		return nil
 	})
 	return total
-}
-
-func diskFree(path string) int64 {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return -1
-	}
-	return int64(stat.Bavail) * int64(stat.Bsize)
 }
 
 var hopByHopHeaders = map[string]struct{}{
@@ -837,7 +1004,7 @@ func (s *Server) sessionPlannerLoop(ctx context.Context) {
 				if candidate.Status == "stopped" {
 					priority = 20
 				}
-				_, _ = prefetch.EnqueueForSession(s.store, candidate, s.cfg.Prefetch, s.cfg.MiddleCache, now, priority)
+				_, _ = prefetch.EnqueueForSession(s.store, candidate, s.cfg.Cache, s.cfg.Prefetch, s.cfg.MiddleCache, now, priority)
 			}
 		}
 	}

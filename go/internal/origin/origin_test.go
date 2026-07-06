@@ -63,13 +63,38 @@ func TestOpenRangeRequires206AndMatchingContentRange(t *testing.T) {
 	}
 }
 
+func TestOpenRangeSlicesStatusOKBody(t *testing.T) {
+	body := "abcdefghijklmnopqrstuvwxyz"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=10-19" {
+			t.Fatalf("Range = %q", got)
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+
+	resp, err := NewClient(4).OpenRange(srv.URL, model.ByteRange{Start: 10, End: 19}, int64(len(body)))
+	if err != nil {
+		t.Fatalf("OpenRange error: %v", err)
+	}
+	defer resp.Close()
+	got, err := io.ReadAll(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "klmnopqrst" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
 func TestOpenRangeRejectsBadOriginResponses(t *testing.T) {
 	cases := []struct {
 		name   string
 		status int
 		crange string
 	}{
-		{"status 200", http.StatusOK, "bytes 10-19/100"},
 		{"missing content range", http.StatusPartialContent, ""},
 		{"mismatched content range", http.StatusPartialContent, "bytes 10-18/100"},
 	}

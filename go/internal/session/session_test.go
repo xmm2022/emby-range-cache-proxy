@@ -40,10 +40,10 @@ func TestBuildSessionUpdateSyntheticUsesTimeBucket(t *testing.T) {
 
 func TestIsTailMetadataRange(t *testing.T) {
 	size := int64(100 * 1024 * 1024)
-	if !IsTailMetadataRange(size, model.ByteRange{Start: size - 1024, End: size - 1}) {
+	if !IsTailMetadataRange(size, model.ByteRange{Start: size - 1024, End: size - 1}, 8*1024*1024, 8*1024*1024) {
 		t.Fatalf("expected tail metadata")
 	}
-	if IsTailMetadataRange(size, model.ByteRange{Start: 20 * 1024 * 1024, End: 21 * 1024 * 1024}) {
+	if IsTailMetadataRange(size, model.ByteRange{Start: 20 * 1024 * 1024, End: 21 * 1024 * 1024}, 8*1024*1024, 8*1024*1024) {
 		t.Fatalf("middle range should not be tail metadata")
 	}
 }

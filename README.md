@@ -23,6 +23,7 @@ Copy `config.example.json` to the host config path, usually
   "listen_port": 18180,
   "cache_dir": "/home/nax/emby/cache/range-proxy",
   "prewarm_api_key": "replace-with-a-long-random-secret",
+  "playback_info_timeout_seconds": 15,
   "rollout": {
     "enabled": true,
     "item_allowlist": ["10535"],
@@ -145,8 +146,9 @@ handle {
 ```
 
 Do not expose `/internal/prewarm` through the public reverse proxy. The service
-rejects non-loopback callers for internal endpoints, and those endpoints are for
-local callers such as MediaInfoKeeper.
+rejects non-loopback callers for internal endpoints, and also rejects loopback
+reverse-proxy requests that carry non-loopback `X-Forwarded-For` or `X-Real-IP`.
+Those endpoints are for local callers such as MediaInfoKeeper.
 
 ### 5. Trigger a prewarm
 
@@ -180,12 +182,12 @@ curl -fsS http://127.0.0.1:18180/healthz
 ## V1 Behavior
 
 - Caddy forwards eligible `/emby/videos/.../original.*` requests to this proxy during a controlled rollout.
-- User playback requests are authorized with the user's own Emby token by calling Emby `PlaybackInfo`.
+- User playback requests are authorized with the user's own Emby token by calling Emby `PlaybackInfo`; `playback_info_timeout_seconds` controls this foreground authorization timeout.
 - The internal prewarm key is only used by the prewarm worker. It is not used to authorize user playback requests.
 - The proxy accepts HTTP and HTTPS media source paths returned by Emby after authorization.
 - `.strm` media source paths can be resolved through configured path mappings such as `/strm/` to `/home/nax/emby/strm`, then cached from the HTTP URL inside the `.strm` file when that URL also matches `rollout.path_prefix_allowlist`.
 - `.strm` support is not tied to a hard-coded port. The current test server allowlists `http://127.0.0.1:18096/` as its local `.strm` origin; `.strm` files pointing elsewhere fall back to Emby unless that origin prefix is explicitly allowlisted.
-- The cache stores adaptive head and tail ranges for startup, probing, and container metadata reads.
+- The cache stores configured head and tail ranges for startup, probing, and container metadata reads.
 - The proxy does not actively cache arbitrary middle playback ranges.
 - `POST /internal/prewarm` accepts `itemId` and `mediaSourceId`, then performs the same Emby `PlaybackInfo`, `.strm`, and rollout allowlist checks before warming only head and tail blocks.
 - Out-of-scope requests fall back to the normal Emby proxy path.
@@ -208,7 +210,7 @@ Request body:
 {"itemId":"12345","mediaSourceId":"mediasource_12345"}
 ```
 
-The endpoint returns `202` with `queued` for a new in-process prewarm task and `existing` when the same item/source is already queued or running. The task queries Emby PlaybackInfo with the internal key using `prewarm.playback_info_timeout_seconds`, resolves mapped `.strm` files only when the resolved URL matches `rollout.path_prefix_allowlist`, skips already-complete head/tail cache blocks, uses `prewarm.concurrency` for in-process concurrency, throttles downloads with `prefetch.bandwidth_bytes_per_second`, and evicts through the head/tail cache capacity policy.
+The endpoint returns `202` with `queued` for a new in-process prewarm task and `existing` when the same item/source is already queued or running. The task queries Emby PlaybackInfo with the internal key using `prewarm.playback_info_timeout_seconds`, resolves mapped `.strm` files only when the resolved URL matches `rollout.path_prefix_allowlist`, skips already-complete head/tail cache blocks, uses `prewarm.concurrency` for in-process concurrency, throttles downloads with `prefetch.bandwidth_bytes_per_second`, and evicts through the head/tail cache capacity policy. This prewarm timeout is separate from the foreground playback authorization timeout.
 
 `prewarm.enabled` only controls the periodic recent-item scanner. Event-triggered prewarm through `/internal/prewarm` requires `prewarm_api_key` but does not require enabling periodic scans.
 
@@ -222,8 +224,8 @@ That boundary is limited. If the cache proxy has already returned `403` or `5xx`
 
 V1 keeps the cache intentionally narrow:
 
-- Adaptive head cache for startup and initial probe reads.
-- Adaptive tail cache for end-of-file metadata reads.
+- Configured head cache for startup and initial probe reads.
+- Configured tail cache for end-of-file metadata reads.
 - No active arbitrary middle range cache during normal playback.
 - Prewarm builds the same head and tail blocks for rollout-scoped media.
 

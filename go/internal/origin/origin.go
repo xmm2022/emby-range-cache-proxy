@@ -65,22 +65,31 @@ func (c *Client) OpenRange(url string, byteRange model.ByteRange, size int64) (i
 	if err != nil {
 		return nil, fmt.Errorf("origin range GET failed: %w", err)
 	}
-	if resp.StatusCode != http.StatusPartialContent {
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		if !contentRangeMatches(resp.Header.Get("Content-Range"), byteRange, size) {
+			resp.Body.Close()
+			return nil, fmt.Errorf("origin range GET failed: invalid Content-Range")
+		}
+		if length := resp.Header.Get("Content-Length"); length != "" {
+			parsed, err := strconv.ParseInt(length, 10, 64)
+			if err != nil || parsed != byteRange.Length() {
+				resp.Body.Close()
+				return nil, fmt.Errorf("origin range GET failed: invalid Content-Length")
+			}
+		}
+		return resp.Body, nil
+	case http.StatusOK:
+		body, err := sliceStatusOKBody(resp.Body, resp.Header.Get("Content-Length"), byteRange, size)
+		if err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		return body, nil
+	default:
 		resp.Body.Close()
 		return nil, fmt.Errorf("origin range GET failed: status=%d", resp.StatusCode)
 	}
-	if !contentRangeMatches(resp.Header.Get("Content-Range"), byteRange, size) {
-		resp.Body.Close()
-		return nil, fmt.Errorf("origin range GET failed: invalid Content-Range")
-	}
-	if length := resp.Header.Get("Content-Length"); length != "" {
-		parsed, err := strconv.ParseInt(length, 10, 64)
-		if err != nil || parsed != byteRange.Length() {
-			resp.Body.Close()
-			return nil, fmt.Errorf("origin range GET failed: invalid Content-Length")
-		}
-	}
-	return resp.Body, nil
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -128,4 +137,46 @@ func parseContentRange(value string) (int64, int64, int64, bool) {
 func contentRangeMatches(value string, byteRange model.ByteRange, size int64) bool {
 	start, end, total, ok := parseContentRange(value)
 	return ok && start == byteRange.Start && end == byteRange.End && total == size
+}
+
+func sliceStatusOKBody(body io.ReadCloser, lengthHeader string, byteRange model.ByteRange, size int64) (io.ReadCloser, error) {
+	if size <= 0 || byteRange.Start < 0 || byteRange.End < byteRange.Start || byteRange.End >= size {
+		return nil, fmt.Errorf("origin range GET failed: invalid byte range")
+	}
+	if lengthHeader != "" {
+		parsed, err := strconv.ParseInt(lengthHeader, 10, 64)
+		if err != nil || parsed != size {
+			return nil, fmt.Errorf("origin range GET failed: invalid full-body Content-Length")
+		}
+	}
+	if byteRange.Start > 0 {
+		if _, err := io.CopyN(io.Discard, body, byteRange.Start); err != nil {
+			return nil, fmt.Errorf("origin range GET failed: short 200 response")
+		}
+	}
+	return &boundedReadCloser{body: body, remaining: byteRange.Length()}, nil
+}
+
+type boundedReadCloser struct {
+	body      io.ReadCloser
+	remaining int64
+}
+
+func (r *boundedReadCloser) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.body.Read(p)
+	r.remaining -= int64(n)
+	if err == io.EOF && r.remaining > 0 {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, err
+}
+
+func (r *boundedReadCloser) Close() error {
+	return r.body.Close()
 }

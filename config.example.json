@@ -5,6 +5,7 @@
   "listen_port": 18180,
   "cache_dir": "/home/nax/emby/cache/range-proxy",
   "prewarm_api_key": null,
+  "playback_info_timeout_seconds": 15,
   "path_mappings": [
     {
       "from": "/strm/",
@@ -20,6 +21,8 @@
   "cache": {
     "max_bytes": 549755813888,
     "build_wait_seconds": 0.25,
+    "head_bytes": 8388608,
+    "tail_bytes": 8388608,
     "chunk_bytes": 1048576,
     "default_open_range_bytes": 16777216
   },

@@ -29,6 +29,18 @@ func TestAdaptiveHeadTail(t *testing.T) {
 	}
 }
 
+func TestConfiguredHeadTail(t *testing.T) {
+	mib := int64(1024 * 1024)
+	head, tail := ConfiguredHeadTail(100*mib, 32*mib, 16*mib)
+	if head != 32*mib || tail != 16*mib {
+		t.Fatalf("head/tail = %d/%d", head, tail)
+	}
+	head, tail = ConfiguredHeadTail(100*mib, 0, 0)
+	if head != 8*mib || tail != 8*mib {
+		t.Fatalf("fallback head/tail = %d/%d", head, tail)
+	}
+}
+
 func TestPlanPlaybackRange(t *testing.T) {
 	openHead := int64(32)
 	cases := []struct {
