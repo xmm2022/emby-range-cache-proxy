@@ -14,20 +14,21 @@ const (
 )
 
 type Config struct {
-	EmbyBaseURL                string
-	FallbackBaseURL            string
-	ListenHost                 string
-	ListenPort                 int
-	CacheDir                   string
-	PrewarmAPIKey              string
-	PlaybackInfoTimeoutSeconds int
-	PathMappings               []PathMapping
-	Rollout                    RolloutConfig
-	Cache                      CacheConfig
-	Prewarm                    PrewarmConfig
-	Session                    SessionConfig
-	MiddleCache                MiddleCacheConfig
-	Prefetch                   PrefetchConfig
+	EmbyBaseURL                 string
+	FallbackBaseURL             string
+	ListenHost                  string
+	ListenPort                  int
+	CacheDir                    string
+	PrewarmAPIKey               string
+	PlaybackInfoTimeoutSeconds  int
+	PlaybackAuthCacheTTLSeconds int
+	PathMappings                []PathMapping
+	Rollout                     RolloutConfig
+	Cache                       CacheConfig
+	Prewarm                     PrewarmConfig
+	Session                     SessionConfig
+	MiddleCache                 MiddleCacheConfig
+	Prefetch                    PrefetchConfig
 }
 
 type PathMapping struct {
@@ -135,9 +136,10 @@ func LoadFile(filePath string) (Config, error) {
 
 func parseRaw(raw map[string]any) (Config, error) {
 	cfg := Config{
-		ListenHost:                 "127.0.0.1",
-		ListenPort:                 18180,
-		PlaybackInfoTimeoutSeconds: 15,
+		ListenHost:                  "127.0.0.1",
+		ListenPort:                  18180,
+		PlaybackInfoTimeoutSeconds:  15,
+		PlaybackAuthCacheTTLSeconds: 30,
 		Cache: CacheConfig{
 			MaxBytes:              512 * gib,
 			BuildWaitSeconds:      0.25,
@@ -208,6 +210,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 	if cfg.PlaybackInfoTimeoutSeconds, err = intFieldDefault(raw, "playback_info_timeout_seconds", cfg.PlaybackInfoTimeoutSeconds); err != nil {
 		return Config{}, err
 	}
+	if cfg.PlaybackAuthCacheTTLSeconds, err = intFieldDefault(raw, "playback_auth_cache_ttl_seconds", cfg.PlaybackAuthCacheTTLSeconds); err != nil {
+		return Config{}, err
+	}
 	if cfg.PathMappings, err = parsePathMappings(raw["path_mappings"]); err != nil {
 		return Config{}, err
 	}
@@ -247,6 +252,9 @@ func (c Config) Validate() error {
 	}
 	if c.PlaybackInfoTimeoutSeconds <= 0 {
 		return fmt.Errorf("playback_info_timeout_seconds must be positive")
+	}
+	if c.PlaybackAuthCacheTTLSeconds < 0 {
+		return fmt.Errorf("playback_auth_cache_ttl_seconds must be >= 0")
 	}
 	if c.Cache.MaxBytes <= 0 || c.Cache.BuildWaitSeconds < 0 || c.Cache.HeadBytes <= 0 || c.Cache.TailBytes <= 0 || c.Cache.ChunkBytes <= 0 || c.Cache.DefaultOpenRangeBytes <= 0 {
 		return fmt.Errorf("cache values must be positive")

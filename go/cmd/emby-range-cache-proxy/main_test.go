@@ -75,6 +75,9 @@ func TestPrintEffectiveConfigRedactsSecretAndIncludesDefaults(t *testing.T) {
 	if payload["playback_info_timeout_seconds"].(float64) != 15 {
 		t.Fatalf("playback_info_timeout_seconds=%v", payload["playback_info_timeout_seconds"])
 	}
+	if payload["playback_auth_cache_ttl_seconds"].(float64) != 30 {
+		t.Fatalf("playback_auth_cache_ttl_seconds=%v", payload["playback_auth_cache_ttl_seconds"])
+	}
 	if payload["prewarm_api_key"] != "REDACTED" {
 		t.Fatalf("prewarm_api_key=%v", payload["prewarm_api_key"])
 	}

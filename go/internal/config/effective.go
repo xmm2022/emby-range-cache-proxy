@@ -7,20 +7,21 @@ import (
 )
 
 type EffectiveConfig struct {
-	EmbyBaseURL                string                 `json:"emby_base_url"`
-	FallbackBaseURL            string                 `json:"fallback_base_url"`
-	ListenHost                 string                 `json:"listen_host"`
-	ListenPort                 int                    `json:"listen_port"`
-	CacheDir                   string                 `json:"cache_dir"`
-	PrewarmAPIKey              any                    `json:"prewarm_api_key"`
-	PlaybackInfoTimeoutSeconds int                    `json:"playback_info_timeout_seconds"`
-	PathMappings               []EffectivePathMapping `json:"path_mappings"`
-	Rollout                    EffectiveRollout       `json:"rollout"`
-	Cache                      EffectiveCache         `json:"cache"`
-	Prewarm                    EffectivePrewarm       `json:"prewarm"`
-	Session                    EffectiveSession       `json:"session"`
-	MiddleCache                EffectiveMiddleCache   `json:"middle_cache"`
-	Prefetch                   EffectivePrefetch      `json:"prefetch"`
+	EmbyBaseURL                 string                 `json:"emby_base_url"`
+	FallbackBaseURL             string                 `json:"fallback_base_url"`
+	ListenHost                  string                 `json:"listen_host"`
+	ListenPort                  int                    `json:"listen_port"`
+	CacheDir                    string                 `json:"cache_dir"`
+	PrewarmAPIKey               any                    `json:"prewarm_api_key"`
+	PlaybackInfoTimeoutSeconds  int                    `json:"playback_info_timeout_seconds"`
+	PlaybackAuthCacheTTLSeconds int                    `json:"playback_auth_cache_ttl_seconds"`
+	PathMappings                []EffectivePathMapping `json:"path_mappings"`
+	Rollout                     EffectiveRollout       `json:"rollout"`
+	Cache                       EffectiveCache         `json:"cache"`
+	Prewarm                     EffectivePrewarm       `json:"prewarm"`
+	Session                     EffectiveSession       `json:"session"`
+	MiddleCache                 EffectiveMiddleCache   `json:"middle_cache"`
+	Prefetch                    EffectivePrefetch      `json:"prefetch"`
 }
 
 type EffectivePathMapping struct {
@@ -109,14 +110,15 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 		stateDB = filepath.Join(cfg.CacheDir, "state", "phase2.sqlite3")
 	}
 	return EffectiveConfig{
-		EmbyBaseURL:                cfg.EmbyBaseURL,
-		FallbackBaseURL:            cfg.FallbackBaseURL,
-		ListenHost:                 cfg.ListenHost,
-		ListenPort:                 cfg.ListenPort,
-		CacheDir:                   cfg.CacheDir,
-		PrewarmAPIKey:              prewarmKey,
-		PlaybackInfoTimeoutSeconds: cfg.PlaybackInfoTimeoutSeconds,
-		PathMappings:               pathMappings,
+		EmbyBaseURL:                 cfg.EmbyBaseURL,
+		FallbackBaseURL:             cfg.FallbackBaseURL,
+		ListenHost:                  cfg.ListenHost,
+		ListenPort:                  cfg.ListenPort,
+		CacheDir:                    cfg.CacheDir,
+		PrewarmAPIKey:               prewarmKey,
+		PlaybackInfoTimeoutSeconds:  cfg.PlaybackInfoTimeoutSeconds,
+		PlaybackAuthCacheTTLSeconds: cfg.PlaybackAuthCacheTTLSeconds,
+		PathMappings:                pathMappings,
 		Rollout: EffectiveRollout{
 			Enabled:              cfg.Rollout.Enabled,
 			ItemAllowlist:        sortedSet(cfg.Rollout.ItemAllowlist),

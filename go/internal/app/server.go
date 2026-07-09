@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/cache"
@@ -45,6 +46,9 @@ type Server struct {
 	origin         *origin.Client
 	auth           *emby.AuthClient
 	prewarmAuth    *emby.AuthClient
+	authCacheTTL   time.Duration
+	authCacheMu    sync.Mutex
+	authCache      map[authCacheKey]authCacheEntry
 
 	originSem chan struct{}
 
@@ -118,6 +122,77 @@ type PrefetchStats struct {
 
 var errPrewarmAlreadyCached = errors.New("prewarm already cached")
 
+var accessLogSeq uint64
+
+type authCacheKey struct {
+	itemID        string
+	mediaSourceID string
+	token         string
+}
+
+type authCacheEntry struct {
+	source    model.MediaSource
+	expiresAt time.Time
+}
+
+type accessLogEvent struct {
+	requestID     uint64
+	startedAt     time.Time
+	method        string
+	path          string
+	itemID        string
+	mediaSourceID string
+	rangeHeader   string
+	userAgent     string
+	clientIP      string
+	authCache     string
+	authMS        int64
+	route         string
+	err           string
+}
+
+type accessLogResponseWriter struct {
+	http.ResponseWriter
+	status       int
+	bytes        int64
+	firstWriteAt time.Time
+}
+
+func (w *accessLogResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.firstWriteAt = time.Now()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *accessLogResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+		w.firstWriteAt = time.Now()
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *accessLogResponseWriter) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *accessLogResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
 func New(cfg config.Config) (*Server, error) {
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
 		return nil, err
@@ -146,6 +221,8 @@ func New(cfg config.Config) (*Server, error) {
 		origin:          origin.NewClient(cfg.Cache.ChunkBytes),
 		auth:            emby.NewAuthClientWithTimeout(cfg.EmbyBaseURL, playbackInfoTimeout),
 		prewarmAuth:     emby.NewAuthClientWithTimeout(cfg.EmbyBaseURL, prewarmTimeout),
+		authCacheTTL:    time.Duration(cfg.PlaybackAuthCacheTTLSeconds) * time.Second,
+		authCache:       make(map[authCacheKey]authCacheEntry),
 		originSem:       make(chan struct{}, 32),
 		cacheBuildLocks: make(map[string]*cacheBuildLock),
 		prewarmTasks:    make(map[string]struct{}),
@@ -389,42 +466,57 @@ func (s *Server) prewarmItem(itemID, mediaSourceID string) error {
 }
 
 func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
+	trace := newAccessLogEvent(r)
+	aw := &accessLogResponseWriter{ResponseWriter: w}
+	defer s.logAccess(trace, aw)
 	if s.cfg.PrewarmAPIKey != "" && requestContainsInternalKey(r, s.cfg.PrewarmAPIKey) {
+		trace.route = "denied"
 		s.addStat(func(stats *Stats) { stats.Counters.Denied++ })
-		http.Error(w, "forbidden", http.StatusForbidden)
+		http.Error(aw, "forbidden", http.StatusForbidden)
 		return
 	}
 	ctx, ok := request.ParseOriginal(r.Method, r.URL.RequestURI(), r.Header)
+	if ok {
+		trace.itemID = ctx.ItemID
+		trace.mediaSourceID = ctx.MediaSourceID
+	}
 	if !ok || !s.preAuthRollout(ctx) {
+		trace.route = "fallback"
 		s.addStat(func(stats *Stats) { stats.Counters.Fallback++ })
-		s.streamFallback(w, r)
+		s.streamFallback(aw, r)
 		return
 	}
-	sourceMedia, err := s.auth.Authorize(ctx)
+	sourceMedia, err := s.authorizePlayback(ctx, trace)
 	if err != nil {
+		trace.err = errorClass(err)
 		var authErr emby.AuthorizationError
 		if errors.As(err, &authErr) {
+			trace.route = "denied"
 			s.addStat(func(stats *Stats) { stats.Counters.Denied++ })
-			http.Error(w, "forbidden", http.StatusForbidden)
+			http.Error(aw, "forbidden", http.StatusForbidden)
 			return
 		}
+		trace.route = "fallback"
 		s.addStat(func(stats *Stats) { stats.Counters.Fallback++ })
-		s.streamFallback(w, r)
+		s.streamFallback(aw, r)
 		return
 	}
 	sourceMedia = source.ResolveMediaSource(sourceMedia, s.cfg.PathMappings, s.cfg.Rollout.PathPrefixAllowlist)
 	if !isHTTP(sourceMedia.Path) || !s.cfg.Rollout.InScope(ctx.ItemID, ctx.MediaSourceID, sourceMedia.Path) {
+		trace.route = "fallback"
 		s.addStat(func(stats *Stats) { stats.Counters.Fallback++ })
-		s.streamFallback(w, r)
+		s.streamFallback(aw, r)
 		return
 	}
-	if err := s.serveAuthorizedRange(w, r, sourceMedia, ctx); err != nil {
+	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace); err != nil {
+		trace.err = errorClass(err)
 		s.addError("proxy failed: " + errorClass(err))
 		s.addStat(func(stats *Stats) {
 			stats.Counters.ProxyErrors++
 			stats.Counters.Fallback++
 		})
-		s.streamFallback(w, r)
+		trace.route = "fallback"
+		s.streamFallback(aw, r)
 	}
 }
 
@@ -432,8 +524,48 @@ func (s *Server) preAuthRollout(ctx model.RequestContext) bool {
 	return s.cfg.Rollout.Enabled && s.cfg.Rollout.ItemAllowed(ctx.ItemID) && s.cfg.Rollout.MediaSourceAllowed(ctx.MediaSourceID)
 }
 
-func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext) error {
-	if served, err := s.serveCachedHeadTailIfAvailable(w, r, sourceMedia, ctx); served || err != nil {
+func (s *Server) authorizePlayback(ctx model.RequestContext, trace *accessLogEvent) (model.MediaSource, error) {
+	if s.authCacheTTL > 0 {
+		key := authCacheKey{itemID: ctx.ItemID, mediaSourceID: ctx.MediaSourceID, token: ctx.Token}
+		now := time.Now()
+		s.authCacheMu.Lock()
+		entry, ok := s.authCache[key]
+		if ok && now.Before(entry.expiresAt) {
+			s.authCacheMu.Unlock()
+			if trace != nil {
+				trace.authCache = "hit"
+			}
+			return entry.source, nil
+		}
+		if ok {
+			delete(s.authCache, key)
+		}
+		s.authCacheMu.Unlock()
+	}
+	if trace != nil {
+		if s.authCacheTTL > 0 {
+			trace.authCache = "miss"
+		} else {
+			trace.authCache = "disabled"
+		}
+	}
+	start := time.Now()
+	sourceMedia, err := s.auth.Authorize(ctx)
+	if trace != nil {
+		trace.authMS = time.Since(start).Milliseconds()
+	}
+	if err != nil || s.authCacheTTL <= 0 {
+		return sourceMedia, err
+	}
+	key := authCacheKey{itemID: ctx.ItemID, mediaSourceID: ctx.MediaSourceID, token: ctx.Token}
+	s.authCacheMu.Lock()
+	s.authCache[key] = authCacheEntry{source: sourceMedia, expiresAt: time.Now().Add(s.authCacheTTL)}
+	s.authCacheMu.Unlock()
+	return sourceMedia, nil
+}
+
+func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext, trace *accessLogEvent) error {
+	if served, err := s.serveCachedHeadTailIfAvailable(w, r, sourceMedia, ctx, trace); served || err != nil {
 		return err
 	}
 	s.originSem <- struct{}{}
@@ -465,10 +597,12 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 				stats.Counters.MiddleHit++
 				stats.Counters.CacheHit++
 			})
+			setAccessRoute(trace, "middle_cache")
 			w.WriteHeader(status)
 			if err := writeChunks(w, chunks, func() {
 				s.recordSession(ctx, key, meta, byteRange)
 			}); err != nil {
+				setAccessError(trace, err)
 				s.addError("middle cache response failed: " + errorClass(err))
 				s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
 			}
@@ -484,10 +618,12 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 		}
 		if chunks != nil {
 			s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
+			setAccessRoute(trace, "head_tail_cache")
 			w.WriteHeader(status)
 			if err := writeChunks(w, chunks, func() {
 				s.recordSession(ctx, key, meta, byteRange)
 			}); err != nil {
+				setAccessError(trace, err)
 				s.addError("cache response failed: " + errorClass(err))
 				s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
 			}
@@ -502,18 +638,22 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 			}
 			if chunks != nil {
 				s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
+				setAccessRoute(trace, "head_tail_cache")
 				w.WriteHeader(status)
 				if err := writeChunks(w, chunks, func() {
 					s.recordSession(ctx, key, meta, byteRange)
 				}); err != nil {
+					setAccessError(trace, err)
 					s.addError("cache response failed: " + errorClass(err))
 					s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
 				}
 				return nil
 			}
 			if !buildLock.tryAcquire() {
+				setAccessRoute(trace, "origin")
 				w.WriteHeader(status)
 				if err := s.streamOriginRange(meta.URL, meta, byteRange, w); err != nil {
+					setAccessError(trace, err)
 					s.addError("origin stream failed: " + errorClass(err))
 					s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
 					return nil
@@ -530,10 +670,12 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 			if chunks != nil {
 				buildLock.release()
 				s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
+				setAccessRoute(trace, "head_tail_cache")
 				w.WriteHeader(status)
 				if err := writeChunks(w, chunks, func() {
 					s.recordSession(ctx, key, meta, byteRange)
 				}); err != nil {
+					setAccessError(trace, err)
 					s.addError("cache response failed: " + errorClass(err))
 					s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
 				}
@@ -541,8 +683,10 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 			}
 		}
 		defer buildLock.release()
+		setAccessRoute(trace, "head_tail_build")
 		w.WriteHeader(status)
 		if err := s.buildHeadTailBlock(sourceMedia.Path, meta, key, blockName, blockRange, byteRange, w); err != nil {
+			setAccessError(trace, err)
 			s.addError("cache build stream failed: " + errorClass(err))
 			s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
 			return nil
@@ -551,8 +695,10 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 		s.recordSession(ctx, key, meta, byteRange)
 		return nil
 	}
+	setAccessRoute(trace, "origin")
 	w.WriteHeader(status)
 	if err := s.streamOriginRange(meta.URL, meta, byteRange, w); err != nil {
+		setAccessError(trace, err)
 		s.addError("origin stream failed: " + errorClass(err))
 		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
 		return nil
@@ -562,7 +708,7 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 	return nil
 }
 
-func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext) (bool, error) {
+func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext, trace *accessLogEvent) (bool, error) {
 	record, err := s.store.LatestSourceMetadata(ctx.ItemID, ctx.MediaSourceID)
 	if err != nil || record == nil {
 		return false, err
@@ -587,6 +733,7 @@ func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.R
 			return false, err
 		}
 		s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
+		setAccessRoute(trace, "head_tail_cache")
 		writeRangeHeaders(w, status, byteRange, meta)
 		w.WriteHeader(status)
 		return true, nil
@@ -596,11 +743,13 @@ func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.R
 		return false, err
 	}
 	s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
+	setAccessRoute(trace, "head_tail_cache")
 	writeRangeHeaders(w, status, byteRange, meta)
 	w.WriteHeader(status)
 	if err := writeChunks(w, chunks, func() {
 		s.recordSession(ctx, record.CacheKey, meta, byteRange)
 	}); err != nil {
+		setAccessError(trace, err)
 		s.addError("cache response failed: " + errorClass(err))
 		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
 	}
@@ -851,6 +1000,80 @@ func (s *Server) addError(message string) {
 	if len(s.stats.ErrorEvents) > 20 {
 		s.stats.ErrorEvents = s.stats.ErrorEvents[len(s.stats.ErrorEvents)-20:]
 	}
+}
+
+func newAccessLogEvent(r *http.Request) *accessLogEvent {
+	return &accessLogEvent{
+		requestID:   atomic.AddUint64(&accessLogSeq, 1),
+		startedAt:   time.Now(),
+		method:      r.Method,
+		path:        r.URL.Path,
+		rangeHeader: r.Header.Get("Range"),
+		userAgent:   r.UserAgent(),
+		clientIP:    requestClientIP(r),
+		authCache:   "none",
+		route:       "unknown",
+		err:         "none",
+	}
+}
+
+func (s *Server) logAccess(event *accessLogEvent, w *accessLogResponseWriter) {
+	if event == nil || w == nil {
+		return
+	}
+	durationMS := time.Since(event.startedAt).Milliseconds()
+	ttfbMS := int64(-1)
+	if !w.firstWriteAt.IsZero() {
+		ttfbMS = w.firstWriteAt.Sub(event.startedAt).Milliseconds()
+	}
+	log.Printf(
+		"event=access request_id=%d method=%s path=%q item_id=%s media_source_id=%s range=%q status=%d bytes=%d duration_ms=%d ttfb_ms=%d auth_ms=%d auth_cache=%s route=%s error=%s client_ip=%s user_agent=%q",
+		event.requestID,
+		event.method,
+		event.path,
+		event.itemID,
+		event.mediaSourceID,
+		event.rangeHeader,
+		w.statusCode(),
+		w.bytes,
+		durationMS,
+		ttfbMS,
+		event.authMS,
+		event.authCache,
+		event.route,
+		event.err,
+		event.clientIP,
+		event.userAgent,
+	)
+}
+
+func setAccessRoute(event *accessLogEvent, route string) {
+	if event != nil {
+		event.route = route
+	}
+}
+
+func setAccessError(event *accessLogEvent, err error) {
+	if event != nil && err != nil {
+		event.err = errorClass(err)
+	}
+}
+
+func requestClientIP(r *http.Request) string {
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+		return realIP
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		first, _, _ := strings.Cut(xff, ",")
+		if first = strings.TrimSpace(first); first != "" {
+			return first
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 func requestContainsPrewarmKey(r *http.Request, internalKey string) bool {

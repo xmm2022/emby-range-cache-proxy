@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,13 +22,14 @@ import (
 func testConfig(t *testing.T, embyBase, fallbackBase string) config.Config {
 	t.Helper()
 	return config.Config{
-		EmbyBaseURL:                embyBase,
-		FallbackBaseURL:            fallbackBase,
-		ListenHost:                 "127.0.0.1",
-		ListenPort:                 18180,
-		CacheDir:                   filepath.Join(t.TempDir(), "cache"),
-		PrewarmAPIKey:              "internal-secret",
-		PlaybackInfoTimeoutSeconds: 15,
+		EmbyBaseURL:                 embyBase,
+		FallbackBaseURL:             fallbackBase,
+		ListenHost:                  "127.0.0.1",
+		ListenPort:                  18180,
+		CacheDir:                    filepath.Join(t.TempDir(), "cache"),
+		PrewarmAPIKey:               "internal-secret",
+		PlaybackInfoTimeoutSeconds:  15,
+		PlaybackAuthCacheTTLSeconds: 30,
 		Rollout: config.RolloutConfig{
 			Enabled:              true,
 			ItemAllowlist:        map[string]struct{}{"10535": {}},
@@ -523,6 +526,104 @@ func TestAuthorizedOpenMiddleRangeStreamsToEOF(t *testing.T) {
 	}
 	if originGets != 1 {
 		t.Fatalf("originGets=%d", originGets)
+	}
+}
+
+func TestPlaybackAuthorizationCacheReusesSuccessfulResult(t *testing.T) {
+	var authRequests int32
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "26")
+			w.Header().Set("ETag", `"v1"`)
+		case http.MethodGet:
+			w.Header().Set("Content-Range", "bytes 0-25/26")
+			w.Header().Set("Content-Length", "26")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(originBody)
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&authRequests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mkv","Protocol":"Http","Size":26}]}`))
+	}))
+	defer emby.Close()
+
+	server, err := New(testConfig(t, emby.URL, emby.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token", nil)
+		req.Header.Set("Range", "bytes=0-9")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcdefghij" {
+			t.Fatalf("iter=%d code=%d body=%q", i, rec.Code, rec.Body.String())
+		}
+	}
+	if got := atomic.LoadInt32(&authRequests); got != 1 {
+		t.Fatalf("authRequests=%d", got)
+	}
+}
+
+func TestProxyAccessLogIncludesTimingAndRedactsToken(t *testing.T) {
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+	})
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "26")
+			w.Header().Set("ETag", `"v1"`)
+		case http.MethodGet:
+			w.Header().Set("Content-Range", "bytes 0-25/26")
+			w.Header().Set("Content-Length", "26")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("abcdefghijklmnopqrstuvwxyz"))
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mkv","Protocol":"Http"}]}`))
+	}))
+	defer emby.Close()
+
+	server, err := New(testConfig(t, emby.URL, emby.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token", nil)
+	req.Header.Set("Range", "bytes=0-9")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	body := logs.String()
+	for _, want := range []string{"event=access", "method=GET", "status=206", "item_id=10535", "media_source_id=ms1", "range=\"bytes=0-9\"", "auth_ms=", "duration_ms=", "bytes=10"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("access log missing %q in:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "user-token") {
+		t.Fatalf("access log leaked token:\n%s", body)
 	}
 }
 

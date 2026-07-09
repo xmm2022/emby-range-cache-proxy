@@ -45,6 +45,9 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 	if cfg.PlaybackInfoTimeoutSeconds != 15 {
 		t.Fatalf("playback info timeout = %d", cfg.PlaybackInfoTimeoutSeconds)
 	}
+	if cfg.PlaybackAuthCacheTTLSeconds != 30 {
+		t.Fatalf("playback auth cache ttl = %d", cfg.PlaybackAuthCacheTTLSeconds)
+	}
 	if cfg.Cache.MaxBytes != 512*1024*1024*1024 {
 		t.Fatalf("cache max bytes = %d", cfg.Cache.MaxBytes)
 	}
@@ -73,13 +76,14 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 
 func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	path := writeConfig(t, map[string]any{
-		"emby_base_url":                 "http://emby.local/",
-		"fallback_base_url":             "http://fallback.local/",
-		"listen_host":                   "127.0.0.2",
-		"listen_port":                   19090,
-		"cache_dir":                     filepath.Join(t.TempDir(), "cache"),
-		"prewarm_api_key":               "secret",
-		"playback_info_timeout_seconds": 11,
+		"emby_base_url":                   "http://emby.local/",
+		"fallback_base_url":               "http://fallback.local/",
+		"listen_host":                     "127.0.0.2",
+		"listen_port":                     19090,
+		"cache_dir":                       filepath.Join(t.TempDir(), "cache"),
+		"prewarm_api_key":                 "secret",
+		"playback_info_timeout_seconds":   11,
+		"playback_auth_cache_ttl_seconds": 7,
 		"path_mappings": []map[string]any{
 			{"from": "/strm", "to": "/srv/strm"},
 			{"source_prefix": "/media/", "target_prefix": "/srv/media"},
@@ -151,6 +155,9 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	if cfg.PlaybackInfoTimeoutSeconds != 11 {
 		t.Fatalf("playback info timeout = %d", cfg.PlaybackInfoTimeoutSeconds)
 	}
+	if cfg.PlaybackAuthCacheTTLSeconds != 7 {
+		t.Fatalf("playback auth cache ttl = %d", cfg.PlaybackAuthCacheTTLSeconds)
+	}
 	if len(cfg.PathMappings) != 2 || cfg.PathMappings[0].SourcePrefix != "/strm/" || cfg.PathMappings[1].SourcePrefix != "/media/" {
 		t.Fatalf("path mappings = %+v", cfg.PathMappings)
 	}
@@ -185,6 +192,7 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{"missing emby", map[string]any{"emby_base_url": ""}},
 		{"missing cache", map[string]any{"cache_dir": ""}},
 		{"bad playbackinfo timeout", map[string]any{"playback_info_timeout_seconds": 0}},
+		{"bad playback auth cache ttl", map[string]any{"playback_auth_cache_ttl_seconds": -1}},
 		{"bad cache head", map[string]any{"cache": map[string]any{"head_bytes": 0}}},
 		{"bad cache tail", map[string]any{"cache": map[string]any{"tail_bytes": 0}}},
 		{"bad mapping root", map[string]any{"path_mappings": []map[string]any{{"from": "/", "to": "/tmp"}}}},
