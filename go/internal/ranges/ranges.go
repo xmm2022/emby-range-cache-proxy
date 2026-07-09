@@ -1,6 +1,7 @@
 package ranges
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -12,6 +13,8 @@ import (
 const (
 	mib int64 = 1024 * 1024
 )
+
+var ErrRangeNotSatisfiable = errors.New("range not satisfiable")
 
 var rangeRE = regexp.MustCompile(`^bytes=(\d*)-(\d*)$`)
 
@@ -63,7 +66,7 @@ func ParseRangeHeader(value string, size int64) (model.ByteRange, error) {
 		return model.ByteRange{}, fmt.Errorf("invalid range start")
 	}
 	if start >= size {
-		return model.ByteRange{}, fmt.Errorf("range start beyond size")
+		return model.ByteRange{}, fmt.Errorf("%w: range start beyond size", ErrRangeNotSatisfiable)
 	}
 	end := size - 1
 	if right != "" {

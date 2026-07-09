@@ -577,6 +577,11 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 	headSize, tailSize := s.headTailBytes(meta.Size)
 	byteRange, err := ranges.PlanPlaybackRange(r.Header.Get("Range"), meta.Size, headSize, tailSize, s.cfg.Cache.DefaultOpenRangeBytes, s.cfg.Cache.OpenHeadResponseBytes)
 	if err != nil {
+		if errors.Is(err, ranges.ErrRangeNotSatisfiable) {
+			setAccessRoute(trace, "range_unsatisfiable")
+			writeUnsatisfiableRange(w, meta.Size)
+			return nil
+		}
 		return err
 	}
 	key := cache.Key(sourceMedia, meta)
@@ -720,6 +725,11 @@ func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.R
 	headSize, tailSize := s.headTailBytes(meta.Size)
 	byteRange, err := ranges.PlanPlaybackRange(r.Header.Get("Range"), meta.Size, headSize, tailSize, s.cfg.Cache.DefaultOpenRangeBytes, s.cfg.Cache.OpenHeadResponseBytes)
 	if err != nil {
+		if errors.Is(err, ranges.ErrRangeNotSatisfiable) {
+			setAccessRoute(trace, "range_unsatisfiable")
+			writeUnsatisfiableRange(w, meta.Size)
+			return true, nil
+		}
 		return false, err
 	}
 	blockName, _ := headtail.BlockForRequest(byteRange, meta.Size, headSize, tailSize)
@@ -761,6 +771,12 @@ func responseStatus(r *http.Request, byteRange model.ByteRange, meta model.Sourc
 		return http.StatusPartialContent
 	}
 	return http.StatusOK
+}
+
+func writeUnsatisfiableRange(w http.ResponseWriter, size int64) {
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+	w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 }
 
 func sourceMetadataRecord(itemID, mediaSourceID, key string, meta model.SourceMetadata, updatedAt float64) state.SourceMetadataRecord {

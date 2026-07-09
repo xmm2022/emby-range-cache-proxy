@@ -529,6 +529,126 @@ func TestAuthorizedOpenMiddleRangeStreamsToEOF(t *testing.T) {
 	}
 }
 
+func TestUnsatisfiablePlaybackRangeReturns416WithoutFallback(t *testing.T) {
+	originGets := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("ETag", `"v1"`)
+		case http.MethodGet:
+			originGets++
+			http.Error(w, "origin should not be read", http.StatusInternalServerError)
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mp4","Protocol":"Http"}]}`))
+	}))
+	defer emby.Close()
+	fallbackHits := 0
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits++
+		http.Error(w, "fallback should not be used", http.StatusInternalServerError)
+	}))
+	defer fallback.Close()
+
+	server, err := New(testConfig(t, emby.URL, fallback.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mp4?MediaSourceId=ms1&api_key=user-token", nil)
+	req.Header.Set("Range", "bytes=100-")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("code=%d body=%q headers=%v", rec.Code, rec.Body.String(), rec.Header())
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes */100" {
+		t.Fatalf("content-range=%q", got)
+	}
+	if fallbackHits != 0 {
+		t.Fatalf("fallbackHits=%d", fallbackHits)
+	}
+	if originGets != 0 {
+		t.Fatalf("originGets=%d", originGets)
+	}
+	stats := server.SnapshotStats()
+	if stats.Counters.Fallback != 0 {
+		t.Fatalf("fallback counter=%d", stats.Counters.Fallback)
+	}
+}
+
+func TestUnsatisfiablePlaybackRangeWithCachedMetadataReturns416WithoutFallback(t *testing.T) {
+	originHeads := 0
+	originGets := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			originHeads++
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("ETag", `"v1"`)
+		case http.MethodGet:
+			originGets++
+			http.Error(w, "origin should not be read", http.StatusInternalServerError)
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mp4","Protocol":"Http"}]}`))
+	}))
+	defer emby.Close()
+	fallbackHits := 0
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits++
+		http.Error(w, "fallback should not be used", http.StatusInternalServerError)
+	}))
+	defer fallback.Close()
+
+	server, err := New(testConfig(t, emby.URL, fallback.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	warmReq := httptest.NewRequest(http.MethodHead, "/emby/videos/10535/original.mp4?MediaSourceId=ms1&api_key=user-token", nil)
+	warmReq.Header.Set("Range", "bytes=0-0")
+	warmRec := httptest.NewRecorder()
+	server.ServeHTTP(warmRec, warmReq)
+	if warmRec.Code != http.StatusPartialContent {
+		t.Fatalf("warm code=%d headers=%v", warmRec.Code, warmRec.Header())
+	}
+	if originHeads != 1 {
+		t.Fatalf("originHeads after warm=%d", originHeads)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mp4?MediaSourceId=ms1&api_key=user-token", nil)
+	req.Header.Set("Range", "bytes=100-")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("code=%d body=%q headers=%v", rec.Code, rec.Body.String(), rec.Header())
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes */100" {
+		t.Fatalf("content-range=%q", got)
+	}
+	if fallbackHits != 0 {
+		t.Fatalf("fallbackHits=%d", fallbackHits)
+	}
+	if originGets != 0 {
+		t.Fatalf("originGets=%d", originGets)
+	}
+	if originHeads != 1 {
+		t.Fatalf("originHeads=%d", originHeads)
+	}
+}
+
 func TestPlaybackAuthorizationCacheReusesSuccessfulResult(t *testing.T) {
 	var authRequests int32
 	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
