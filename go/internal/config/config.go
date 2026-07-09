@@ -24,6 +24,7 @@ type Config struct {
 	PlaybackAuthCacheTTLSeconds int
 	PathMappings                []PathMapping
 	OpenList                    OpenListConfig
+	DirectOpenList              DirectOpenListConfig
 	Rollout                     RolloutConfig
 	Cache                       CacheConfig
 	Prewarm                     PrewarmConfig
@@ -43,6 +44,12 @@ type OpenListConfig struct {
 	Token          string
 	Password       string
 	TimeoutSeconds int
+}
+
+type DirectOpenListConfig struct {
+	Enabled    bool
+	PathPrefix string
+	Token      string
 }
 
 type RolloutConfig struct {
@@ -192,6 +199,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 		OpenList: OpenListConfig{
 			TimeoutSeconds: 10,
 		},
+		DirectOpenList: DirectOpenListConfig{
+			PathPrefix: "/openlist/",
+		},
 	}
 
 	var err error
@@ -229,6 +239,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 		return Config{}, err
 	}
 	if err := parseOpenList(raw["openlist"], &cfg.OpenList); err != nil {
+		return Config{}, err
+	}
+	if err := parseDirectOpenList(raw["direct_openlist"], &cfg.DirectOpenList); err != nil {
 		return Config{}, err
 	}
 	if cfg.Rollout, err = parseRollout(raw["rollout"]); err != nil {
@@ -276,6 +289,17 @@ func (c Config) Validate() error {
 	}
 	if c.OpenList.TimeoutSeconds <= 0 {
 		return fmt.Errorf("openlist.timeout_seconds must be positive")
+	}
+	if c.DirectOpenList.Enabled {
+		if !c.OpenList.Enabled {
+			return fmt.Errorf("openlist.enabled must be true when direct_openlist.enabled=true")
+		}
+		if c.DirectOpenList.PathPrefix == "" || !strings.HasPrefix(c.DirectOpenList.PathPrefix, "/") || !strings.HasSuffix(c.DirectOpenList.PathPrefix, "/") {
+			return fmt.Errorf("direct_openlist.path_prefix must start and end with /")
+		}
+		if c.DirectOpenList.Token == "" {
+			return fmt.Errorf("direct_openlist.token is required when direct_openlist.enabled=true")
+		}
 	}
 	if c.Cache.MaxBytes <= 0 || c.Cache.BuildWaitSeconds < 0 || c.Cache.HeadBytes <= 0 || c.Cache.TailBytes <= 0 || c.Cache.ChunkBytes <= 0 || c.Cache.DefaultOpenRangeBytes <= 0 {
 		return fmt.Errorf("cache values must be positive")
@@ -372,6 +396,32 @@ func parseOpenList(value any, cfg *OpenListConfig) error {
 		return err
 	}
 	if cfg.TimeoutSeconds, err = intFieldDefault(data, "timeout_seconds", cfg.TimeoutSeconds); err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseDirectOpenList(value any, cfg *DirectOpenListConfig) error {
+	data, err := object(value, "direct_openlist")
+	if err != nil {
+		return err
+	}
+	if cfg.Enabled, err = boolFieldDefault(data, "enabled", cfg.Enabled); err != nil {
+		return err
+	}
+	if cfg.PathPrefix, err = stringFieldDefault(data, "path_prefix", cfg.PathPrefix); err != nil {
+		return err
+	}
+	if cfg.PathPrefix == "" {
+		cfg.PathPrefix = "/openlist/"
+	}
+	if !strings.HasPrefix(cfg.PathPrefix, "/") {
+		cfg.PathPrefix = "/" + cfg.PathPrefix
+	}
+	if !strings.HasSuffix(cfg.PathPrefix, "/") {
+		cfg.PathPrefix += "/"
+	}
+	if cfg.Token, err = stringFieldDefault(data, "token", cfg.Token); err != nil {
 		return err
 	}
 	return nil

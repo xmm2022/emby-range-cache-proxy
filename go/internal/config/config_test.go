@@ -51,6 +51,9 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 	if cfg.OpenList.Enabled || cfg.OpenList.TimeoutSeconds != 10 {
 		t.Fatalf("openlist defaults = %+v", cfg.OpenList)
 	}
+	if cfg.DirectOpenList.Enabled || cfg.DirectOpenList.PathPrefix != "/openlist/" {
+		t.Fatalf("direct openlist defaults = %+v", cfg.DirectOpenList)
+	}
 	if cfg.Cache.MaxBytes != 512*1024*1024*1024 {
 		t.Fatalf("cache max bytes = %d", cfg.Cache.MaxBytes)
 	}
@@ -97,6 +100,11 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 			"token":           "openlist-token",
 			"password":        "path-password",
 			"timeout_seconds": 3,
+		},
+		"direct_openlist": map[string]any{
+			"enabled":     true,
+			"path_prefix": "edge-openlist",
+			"token":       "direct-token",
 		},
 		"rollout": map[string]any{
 			"enabled":                    true,
@@ -174,6 +182,9 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	if !cfg.OpenList.Enabled || cfg.OpenList.BaseURL != "https://openlist.example" || cfg.OpenList.Token != "openlist-token" || cfg.OpenList.Password != "path-password" || cfg.OpenList.TimeoutSeconds != 3 {
 		t.Fatalf("openlist = %+v", cfg.OpenList)
 	}
+	if !cfg.DirectOpenList.Enabled || cfg.DirectOpenList.PathPrefix != "/edge-openlist/" || cfg.DirectOpenList.Token != "direct-token" {
+		t.Fatalf("direct openlist = %+v", cfg.DirectOpenList)
+	}
 	if !cfg.Rollout.InScope("1", "ms1", "http://127.0.0.1:18096/a.mkv") {
 		t.Fatalf("expected rollout in scope")
 	}
@@ -208,6 +219,8 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{"bad playback auth cache ttl", map[string]any{"playback_auth_cache_ttl_seconds": -1}},
 		{"bad openlist missing base", map[string]any{"openlist": map[string]any{"enabled": true}}},
 		{"bad openlist timeout", map[string]any{"openlist": map[string]any{"timeout_seconds": 0}}},
+		{"bad direct openlist without openlist", map[string]any{"direct_openlist": map[string]any{"enabled": true, "token": "secret"}}},
+		{"bad direct openlist without token", map[string]any{"openlist": map[string]any{"enabled": true, "base_url": "http://openlist.local"}, "direct_openlist": map[string]any{"enabled": true}}},
 		{"bad cache head", map[string]any{"cache": map[string]any{"head_bytes": 0}}},
 		{"bad cache tail", map[string]any{"cache": map[string]any{"tail_bytes": 0}}},
 		{"bad mapping root", map[string]any{"path_mappings": []map[string]any{{"from": "/", "to": "/tmp"}}}},

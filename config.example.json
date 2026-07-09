@@ -19,6 +19,11 @@
     "password": "",
     "timeout_seconds": 10
   },
+  "direct_openlist": {
+    "enabled": false,
+    "path_prefix": "/openlist/",
+    "token": null
+  },
   "rollout": {
     "enabled": false,
     "item_allowlist": [],

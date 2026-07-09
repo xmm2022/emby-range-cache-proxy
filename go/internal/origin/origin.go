@@ -40,7 +40,53 @@ func (c *Client) Head(url string) (model.SourceMetadata, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
+		status := resp.StatusCode
+		if shouldProbeMetadataWithRange(status) {
+			meta, probeErr := c.probeMetadataWithRange(url)
+			if probeErr == nil {
+				return meta, nil
+			}
+			return model.SourceMetadata{}, fmt.Errorf("origin HEAD failed: status=%d; range probe failed: %w", status, probeErr)
+		}
 		return model.SourceMetadata{}, fmt.Errorf("origin HEAD failed: status=%d", resp.StatusCode)
+	}
+	size, err := parseHeadSize(resp)
+	if err != nil {
+		return model.SourceMetadata{}, err
+	}
+	return model.SourceMetadata{
+		URL:          resp.Request.URL.String(),
+		Size:         size,
+		ContentType:  resp.Header.Get("Content-Type"),
+		ETag:         resp.Header.Get("ETag"),
+		LastModified: resp.Header.Get("Last-Modified"),
+	}, nil
+}
+
+func shouldProbeMetadataWithRange(status int) bool {
+	switch status {
+	case http.StatusForbidden, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) probeMetadataWithRange(url string) (model.SourceMetadata, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return model.SourceMetadata{}, err
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return model.SourceMetadata{}, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusPartialContent, http.StatusOK:
+	default:
+		return model.SourceMetadata{}, fmt.Errorf("status=%d", resp.StatusCode)
 	}
 	size, err := parseHeadSize(resp)
 	if err != nil {

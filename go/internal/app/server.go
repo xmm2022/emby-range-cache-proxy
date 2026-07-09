@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -87,6 +90,7 @@ type ConfigSummary struct {
 	Listen                 string `json:"listen"`
 	CacheDir               string `json:"cache_dir"`
 	RolloutEnabled         bool   `json:"rollout_enabled"`
+	DirectOpenListEnabled  bool   `json:"direct_openlist_enabled"`
 	MiddleCacheEnabled     bool   `json:"middle_cache_enabled"`
 	PrefetchEnabled        bool   `json:"prefetch_enabled"`
 	SessionEnabled         bool   `json:"session_enabled"`
@@ -249,9 +253,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleMetrics(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/internal/prewarm":
 		s.handleInternalPrewarm(w, r)
+	case s.isDirectOpenListRequest(r):
+		s.handleDirectOpenList(w, r)
 	default:
 		s.proxyHandler(w, r)
 	}
+}
+
+func (s *Server) isDirectOpenListRequest(r *http.Request) bool {
+	if !s.cfg.DirectOpenList.Enabled {
+		return false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	return strings.HasPrefix(r.URL.Path, s.cfg.DirectOpenList.PathPrefix)
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -298,6 +314,7 @@ func writeMetrics(w io.Writer, stats Stats) {
 	writeMetric(w, "emby_range_cache_proxy_prefetch_failed_total", stats.Prefetch.Failed)
 
 	writeMetric(w, "emby_range_cache_proxy_rollout_enabled", boolMetric(stats.Config.RolloutEnabled))
+	writeMetric(w, "emby_range_cache_proxy_direct_openlist_enabled", boolMetric(stats.Config.DirectOpenListEnabled))
 	writeMetric(w, "emby_range_cache_proxy_middle_cache_enabled", boolMetric(stats.Config.MiddleCacheEnabled))
 	writeMetric(w, "emby_range_cache_proxy_prefetch_enabled", boolMetric(stats.Config.PrefetchEnabled))
 	writeMetric(w, "emby_range_cache_proxy_session_enabled", boolMetric(stats.Config.SessionEnabled))
@@ -328,6 +345,7 @@ func (s *Server) SnapshotStats() Stats {
 		Listen:                 fmt.Sprintf("%s:%d", s.cfg.ListenHost, s.cfg.ListenPort),
 		CacheDir:               s.cfg.CacheDir,
 		RolloutEnabled:         s.cfg.Rollout.Enabled,
+		DirectOpenListEnabled:  s.cfg.DirectOpenList.Enabled,
 		MiddleCacheEnabled:     s.cfg.MiddleCache.Enabled,
 		PrefetchEnabled:        s.cfg.Prefetch.Enabled,
 		SessionEnabled:         s.cfg.Session.Enabled,
@@ -385,6 +403,113 @@ func (s *Server) handleInternalPrewarm(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": status, "itemId": itemID, "mediaSourceId": mediaSourceID})
+}
+
+func (s *Server) handleDirectOpenList(w http.ResponseWriter, r *http.Request) {
+	trace := newAccessLogEvent(r)
+	aw := &accessLogResponseWriter{ResponseWriter: w}
+	defer s.logAccess(trace, aw)
+	if !requestContainsDirectOpenListToken(r, s.cfg.DirectOpenList.Token) {
+		trace.route = "denied"
+		s.addStat(func(stats *Stats) { stats.Counters.Denied++ })
+		http.Error(aw, "forbidden", http.StatusForbidden)
+		return
+	}
+	openListPath, err := s.directOpenListPath(r)
+	if err != nil {
+		trace.route = "direct_openlist_error"
+		trace.err = errorClass(err)
+		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+		http.Error(aw, "invalid openlist path", http.StatusBadRequest)
+		return
+	}
+	ctx := directOpenListRequestContext(r, openListPath)
+	trace.itemID = ctx.ItemID
+	trace.mediaSourceID = ctx.MediaSourceID
+	sourceMedia := model.MediaSource{
+		ItemID:        ctx.ItemID,
+		MediaSourceID: ctx.MediaSourceID,
+		Path:          "openlist://" + openListPath,
+		Protocol:      "OpenList",
+	}
+	if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace); served {
+		return
+	} else if err != nil {
+		trace.route = "direct_openlist_error"
+		trace.err = errorClass(err)
+		s.addError("direct openlist cache probe failed: " + errorClass(err))
+		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+		http.Error(aw, "cache unavailable", http.StatusBadGateway)
+		return
+	}
+	sourceMedia = s.openList.Resolve(r.Context(), sourceMedia)
+	if !isHTTP(sourceMedia.Path) {
+		trace.route = "direct_openlist_error"
+		trace.err = "OpenListResolveFailed"
+		s.addError("direct openlist resolve failed")
+		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+		http.Error(aw, "openlist unavailable", http.StatusBadGateway)
+		return
+	}
+	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace); err != nil {
+		trace.err = errorClass(err)
+		s.addError("direct openlist proxy failed: " + errorClass(err))
+		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+		http.Error(aw, "proxy error", http.StatusBadGateway)
+		return
+	}
+}
+
+func requestContainsDirectOpenListToken(r *http.Request, token string) bool {
+	if token == "" {
+		return false
+	}
+	if subtleEqual(r.URL.Query().Get("token"), token) {
+		return true
+	}
+	if subtleEqual(r.Header.Get("X-Direct-OpenList-Token"), token) {
+		return true
+	}
+	return authorizationBearerMatches(r.Header.Get("Authorization"), token)
+}
+
+func (s *Server) directOpenListPath(r *http.Request) (string, error) {
+	prefix := s.cfg.DirectOpenList.PathPrefix
+	escapedPath := r.URL.EscapedPath()
+	if !strings.HasPrefix(escapedPath, prefix) {
+		return "", fmt.Errorf("path prefix mismatch")
+	}
+	relative, err := url.PathUnescape(strings.TrimPrefix(escapedPath, prefix))
+	if err != nil {
+		return "", err
+	}
+	if relative == "" {
+		return "", fmt.Errorf("empty openlist path")
+	}
+	for _, segment := range strings.Split(relative, "/") {
+		if segment == "." || segment == ".." {
+			return "", fmt.Errorf("invalid openlist path")
+		}
+	}
+	cleaned := pathpkg.Clean("/" + relative)
+	if cleaned == "/" {
+		return "", fmt.Errorf("empty openlist path")
+	}
+	return cleaned, nil
+}
+
+func directOpenListRequestContext(r *http.Request, openListPath string) model.RequestContext {
+	sum := sha256.Sum256([]byte(openListPath))
+	mediaSourceID := "direct_openlist_" + hex.EncodeToString(sum[:8])
+	ext := strings.TrimPrefix(pathpkg.Ext(openListPath), ".")
+	return model.RequestContext{
+		Method:        r.Method,
+		RawPath:       r.URL.RequestURI(),
+		ItemID:        "direct_openlist",
+		MediaSourceID: mediaSourceID,
+		Token:         "direct_openlist",
+		Extension:     strings.ToLower(ext),
+	}
 }
 
 func (s *Server) enqueuePrewarm(itemID, mediaSourceID string) string {
@@ -506,6 +631,23 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sourceMedia = source.ResolveMediaSource(sourceMedia, s.cfg.PathMappings, s.cfg.Rollout.PathPrefixAllowlist)
+	if s.canServeCachedBeforeOriginResolution(ctx, sourceMedia) {
+		served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace)
+		if served {
+			return
+		}
+		if err != nil {
+			trace.err = errorClass(err)
+			s.addError("cache probe failed: " + errorClass(err))
+			s.addStat(func(stats *Stats) {
+				stats.Counters.ProxyErrors++
+				stats.Counters.Fallback++
+			})
+			trace.route = "fallback"
+			s.streamFallback(aw, r)
+			return
+		}
+	}
 	sourceMedia = s.openList.Resolve(r.Context(), sourceMedia)
 	if !isHTTP(sourceMedia.Path) || !s.cfg.Rollout.InScope(ctx.ItemID, ctx.MediaSourceID, sourceMedia.Path) {
 		trace.route = "fallback"
@@ -523,6 +665,17 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		trace.route = "fallback"
 		s.streamFallback(aw, r)
 	}
+}
+
+func (s *Server) canServeCachedBeforeOriginResolution(ctx model.RequestContext, sourceMedia model.MediaSource) bool {
+	if isHTTP(sourceMedia.Path) {
+		return s.cfg.Rollout.InScope(ctx.ItemID, ctx.MediaSourceID, sourceMedia.Path)
+	}
+	if !s.cfg.OpenList.Enabled {
+		return false
+	}
+	_, ok := openlist.PathFromSource(sourceMedia.Path, s.cfg.OpenList.BaseURL)
+	return ok
 }
 
 func (s *Server) preAuthRollout(ctx model.RequestContext) bool {
@@ -852,6 +1005,9 @@ func (s *Server) buildHeadTailBlock(sourceURL string, meta model.SourceMetadata,
 					end := overlapEnd - chunkStart + 1
 					if _, err := responseWriter.Write(chunk[start:end]); err != nil {
 						return err
+					}
+					if flusher, ok := responseWriter.(http.Flusher); ok {
+						flusher.Flush()
 					}
 				}
 			}

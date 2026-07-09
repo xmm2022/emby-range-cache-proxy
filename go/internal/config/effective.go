@@ -7,22 +7,23 @@ import (
 )
 
 type EffectiveConfig struct {
-	EmbyBaseURL                 string                 `json:"emby_base_url"`
-	FallbackBaseURL             string                 `json:"fallback_base_url"`
-	ListenHost                  string                 `json:"listen_host"`
-	ListenPort                  int                    `json:"listen_port"`
-	CacheDir                    string                 `json:"cache_dir"`
-	PrewarmAPIKey               any                    `json:"prewarm_api_key"`
-	PlaybackInfoTimeoutSeconds  int                    `json:"playback_info_timeout_seconds"`
-	PlaybackAuthCacheTTLSeconds int                    `json:"playback_auth_cache_ttl_seconds"`
-	PathMappings                []EffectivePathMapping `json:"path_mappings"`
-	OpenList                    EffectiveOpenList      `json:"openlist"`
-	Rollout                     EffectiveRollout       `json:"rollout"`
-	Cache                       EffectiveCache         `json:"cache"`
-	Prewarm                     EffectivePrewarm       `json:"prewarm"`
-	Session                     EffectiveSession       `json:"session"`
-	MiddleCache                 EffectiveMiddleCache   `json:"middle_cache"`
-	Prefetch                    EffectivePrefetch      `json:"prefetch"`
+	EmbyBaseURL                 string                  `json:"emby_base_url"`
+	FallbackBaseURL             string                  `json:"fallback_base_url"`
+	ListenHost                  string                  `json:"listen_host"`
+	ListenPort                  int                     `json:"listen_port"`
+	CacheDir                    string                  `json:"cache_dir"`
+	PrewarmAPIKey               any                     `json:"prewarm_api_key"`
+	PlaybackInfoTimeoutSeconds  int                     `json:"playback_info_timeout_seconds"`
+	PlaybackAuthCacheTTLSeconds int                     `json:"playback_auth_cache_ttl_seconds"`
+	PathMappings                []EffectivePathMapping  `json:"path_mappings"`
+	OpenList                    EffectiveOpenList       `json:"openlist"`
+	DirectOpenList              EffectiveDirectOpenList `json:"direct_openlist"`
+	Rollout                     EffectiveRollout        `json:"rollout"`
+	Cache                       EffectiveCache          `json:"cache"`
+	Prewarm                     EffectivePrewarm        `json:"prewarm"`
+	Session                     EffectiveSession        `json:"session"`
+	MiddleCache                 EffectiveMiddleCache    `json:"middle_cache"`
+	Prefetch                    EffectivePrefetch       `json:"prefetch"`
 }
 
 type EffectivePathMapping struct {
@@ -36,6 +37,12 @@ type EffectiveOpenList struct {
 	Token          any    `json:"token"`
 	Password       any    `json:"password"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+type EffectiveDirectOpenList struct {
+	Enabled    bool   `json:"enabled"`
+	PathPrefix string `json:"path_prefix"`
+	Token      any    `json:"token"`
 }
 
 type EffectiveRollout struct {
@@ -126,6 +133,14 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			openListPassword = "REDACTED"
 		}
 	}
+	directOpenListToken := any(nil)
+	if cfg.DirectOpenList.Token != "" {
+		if showSecrets {
+			directOpenListToken = cfg.DirectOpenList.Token
+		} else {
+			directOpenListToken = "REDACTED"
+		}
+	}
 	pathMappings := make([]EffectivePathMapping, 0, len(cfg.PathMappings))
 	for _, mapping := range cfg.PathMappings {
 		pathMappings = append(pathMappings, EffectivePathMapping{From: mapping.SourcePrefix, To: mapping.TargetPrefix})
@@ -150,6 +165,11 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			Token:          openListToken,
 			Password:       openListPassword,
 			TimeoutSeconds: cfg.OpenList.TimeoutSeconds,
+		},
+		DirectOpenList: EffectiveDirectOpenList{
+			Enabled:    cfg.DirectOpenList.Enabled,
+			PathPrefix: cfg.DirectOpenList.PathPrefix,
+			Token:      directOpenListToken,
 		},
 		Rollout: EffectiveRollout{
 			Enabled:              cfg.Rollout.Enabled,

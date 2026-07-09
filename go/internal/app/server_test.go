@@ -426,6 +426,159 @@ func TestAuthorizedHeadRangeCacheHitSkipsOriginHead(t *testing.T) {
 	}
 }
 
+func TestDirectOpenListEndpointBuildsAndHitsCache(t *testing.T) {
+	var openListAPICalls int32
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	openList := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/fs/get":
+			atomic.AddInt32(&openListAPICalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":200,"data":{"is_dir":false,"sign":"sig"}}`))
+		case "/d/movie.mkv":
+			if r.URL.Query().Get("sign") != "sig" {
+				t.Fatalf("missing sign: %s", r.URL.RawQuery)
+			}
+			switch r.Method {
+			case http.MethodHead:
+				w.Header().Set("Content-Length", "26")
+				w.Header().Set("Content-Type", "video/x-matroska")
+				w.Header().Set("ETag", `"v1"`)
+			case http.MethodGet:
+				if got := r.Header.Get("Range"); got != "bytes=0-25" {
+					t.Fatalf("origin range = %q", got)
+				}
+				w.Header().Set("Content-Range", "bytes 0-25/26")
+				w.Header().Set("Content-Length", "26")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(originBody)
+			default:
+				t.Fatalf("method = %s", r.Method)
+			}
+		default:
+			t.Fatalf("unexpected openlist request: %s", r.URL.String())
+		}
+	}))
+	defer openList.Close()
+
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.OpenList = config.OpenListConfig{Enabled: true, BaseURL: openList.URL, TimeoutSeconds: 1}
+	cfg.DirectOpenList = config.DirectOpenListConfig{Enabled: true, PathPrefix: "/openlist/", Token: "direct-secret"}
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv?token=direct-secret", nil)
+		req.Header.Set("Range", "bytes=0-3")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+			t.Fatalf("iter=%d code=%d body=%q headers=%v", i, rec.Code, rec.Body.String(), rec.Header())
+		}
+		if got := rec.Header().Get("Content-Range"); got != "bytes 0-3/26" {
+			t.Fatalf("content-range=%q", got)
+		}
+	}
+	if got := atomic.LoadInt32(&openListAPICalls); got != 1 {
+		t.Fatalf("openListAPICalls=%d", got)
+	}
+	stats := server.SnapshotStats()
+	if stats.Counters.CacheBuild != 1 || stats.Counters.CacheHit != 1 {
+		t.Fatalf("counters=%+v", stats.Counters)
+	}
+}
+
+func TestDirectOpenListEndpointRequiresToken(t *testing.T) {
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.OpenList = config.OpenListConfig{Enabled: true, BaseURL: "http://openlist.local", TimeoutSeconds: 1}
+	cfg.DirectOpenList = config.DirectOpenListConfig{Enabled: true, PathPrefix: "/openlist/", Token: "direct-secret"}
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if stats := server.SnapshotStats().Counters; stats.Denied != 1 || stats.ProxyErrors != 0 {
+		t.Fatalf("counters=%+v", stats)
+	}
+}
+
+func TestCachedOpenListHeadRangeSkipsOpenListResolve(t *testing.T) {
+	var openListAPICalls int32
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	openList := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/fs/get":
+			atomic.AddInt32(&openListAPICalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":200,"data":{"is_dir":false,"sign":"sig"}}`))
+		case "/d/movie.mkv":
+			if r.URL.Query().Get("sign") != "sig" {
+				t.Fatalf("missing sign: %s", r.URL.RawQuery)
+			}
+			switch r.Method {
+			case http.MethodHead:
+				w.Header().Set("Content-Length", "26")
+				w.Header().Set("Content-Type", "video/x-matroska")
+				w.Header().Set("ETag", `"v1"`)
+			case http.MethodGet:
+				if got := r.Header.Get("Range"); got != "bytes=0-25" {
+					t.Fatalf("origin range = %q", got)
+				}
+				w.Header().Set("Content-Range", "bytes 0-25/26")
+				w.Header().Set("Content-Length", "26")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(originBody)
+			default:
+				t.Fatalf("method = %s", r.Method)
+			}
+		default:
+			t.Fatalf("unexpected openlist request: %s", r.URL.String())
+		}
+	}))
+	defer openList.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"openlist:///movie.mkv","Protocol":"Http","Size":26}]}`))
+	}))
+	defer emby.Close()
+
+	cfg := testConfig(t, emby.URL, emby.URL)
+	cfg.OpenList = config.OpenListConfig{Enabled: true, BaseURL: openList.URL, TimeoutSeconds: 1}
+	cfg.Rollout.PathPrefixAllowlist = []string{openList.URL + "/"}
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token", nil)
+		req.Header.Set("Range", "bytes=0-9")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcdefghij" {
+			t.Fatalf("iter=%d code=%d body=%q headers=%v", i, rec.Code, rec.Body.String(), rec.Header())
+		}
+		if got := rec.Header().Get("Content-Range"); got != "bytes 0-9/26" {
+			t.Fatalf("content-range=%q", got)
+		}
+	}
+	if got := atomic.LoadInt32(&openListAPICalls); got != 1 {
+		t.Fatalf("openListAPICalls=%d", got)
+	}
+}
+
 func TestAuthorizedNoRangeBuildsAndHitsHeadCache(t *testing.T) {
 	originGets := 0
 	originBody := strings.Repeat("0123456789", 10)

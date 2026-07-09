@@ -36,6 +36,41 @@ func TestHeadFollowsRedirectAndReadsValidators(t *testing.T) {
 	}
 }
 
+func TestHeadFallsBackToRangeProbeWhenHeadForbidden(t *testing.T) {
+	var methods []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		switch r.Method {
+		case http.MethodHead:
+			http.Error(w, "head is forbidden", http.StatusForbidden)
+		case http.MethodGet:
+			if got := r.Header.Get("Range"); got != "bytes=0-0" {
+				t.Fatalf("Range = %q", got)
+			}
+			w.Header().Set("Content-Range", "bytes 0-0/456")
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("Content-Type", "video/x-matroska")
+			w.Header().Set("ETag", `"range-etag"`)
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("x"))
+		default:
+			t.Fatalf("method = %s", r.Method)
+		}
+	}))
+	defer srv.Close()
+
+	meta, err := NewClient(1024).Head(srv.URL + "/movie.mkv")
+	if err != nil {
+		t.Fatalf("Head error: %v", err)
+	}
+	if meta.Size != 456 || meta.ContentType != "video/x-matroska" || meta.ETag != `"range-etag"` {
+		t.Fatalf("metadata = %+v", meta)
+	}
+	if fmt.Sprint(methods) != "[HEAD GET]" {
+		t.Fatalf("methods = %v", methods)
+	}
+}
+
 func TestOpenRangeRequires206AndMatchingContentRange(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Range"); got != "bytes=10-19" {
