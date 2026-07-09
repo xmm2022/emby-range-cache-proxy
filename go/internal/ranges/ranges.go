@@ -88,7 +88,11 @@ func PlanPlaybackRange(value string, size, headBytes, tailBytes, defaultOpenRang
 		return model.ByteRange{}, err
 	}
 	if value == "" {
-		return byteRange, nil
+		headEnd := headBytes
+		if headEnd > size {
+			headEnd = size
+		}
+		return model.ByteRange{Start: 0, End: headEnd - 1}, nil
 	}
 	match := rangeRE.FindStringSubmatch(strings.TrimSpace(value))
 	if match == nil {
@@ -121,11 +125,7 @@ func PlanPlaybackRange(value string, size, headBytes, tailBytes, defaultOpenRang
 	if start >= tailStart {
 		return model.ByteRange{Start: start, End: size - 1}, nil
 	}
-	end := start + defaultOpenRangeBytes - 1
-	if end >= size {
-		end = size - 1
-	}
-	return model.ByteRange{Start: start, End: end}, nil
+	return model.ByteRange{Start: start, End: size - 1}, nil
 }
 
 func ContentRangeHeader(byteRange model.ByteRange, size int64) string {

@@ -130,6 +130,28 @@ func (c *Cache) IterBlock(key, blockName string, requested model.ByteRange, chun
 	return out, nil
 }
 
+func (c *Cache) HasBlockRange(key, blockName string, requested model.ByteRange) (bool, error) {
+	if err := validateKey(key); err != nil {
+		return false, err
+	}
+	if err := validateBlockName(blockName); err != nil {
+		return false, err
+	}
+	path := c.blockPath(key, blockName)
+	meta := c.metaPath(key, blockName)
+	stored, err := readRange(meta)
+	if err != nil {
+		c.removeEntry(path, meta)
+		return false, nil
+	}
+	stat, err := os.Stat(path)
+	if err != nil || stat.Size() != stored.Length() {
+		c.removeEntry(path, meta)
+		return false, nil
+	}
+	return requested.Start >= stored.Start && requested.End <= stored.End, nil
+}
+
 func (c *Cache) EvictIfNeeded() error {
 	if c.MaxBytes <= 0 {
 		return nil

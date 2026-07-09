@@ -116,6 +116,8 @@ type PrefetchStats struct {
 	Failed  int64 `json:"failed"`
 }
 
+var errPrewarmAlreadyCached = errors.New("prewarm already cached")
+
 func New(cfg config.Config) (*Server, error) {
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
 		return nil, err
@@ -329,6 +331,10 @@ func (s *Server) enqueuePrewarm(itemID, mediaSourceID string) string {
 			s.addStat(func(stats *Stats) { stats.Prewarm.Running-- })
 		}()
 		if err := s.prewarmItem(itemID, mediaSourceID); err != nil {
+			if errors.Is(err, errPrewarmAlreadyCached) {
+				s.addStat(func(stats *Stats) { stats.Prewarm.Skipped++ })
+				return
+			}
 			s.addError("prewarm failed: " + errorClass(err))
 			s.addStat(func(stats *Stats) { stats.Prewarm.Skipped++ })
 			return
@@ -377,7 +383,7 @@ func (s *Server) prewarmItem(itemID, mediaSourceID string) error {
 		warmed = true
 	}
 	if !warmed {
-		return fmt.Errorf("already cached")
+		return errPrewarmAlreadyCached
 	}
 	return nil
 }
@@ -427,6 +433,9 @@ func (s *Server) preAuthRollout(ctx model.RequestContext) bool {
 }
 
 func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext) error {
+	if served, err := s.serveCachedHeadTailIfAvailable(w, r, sourceMedia, ctx); served || err != nil {
+		return err
+	}
 	s.originSem <- struct{}{}
 	meta, err := s.origin.Head(sourceMedia.Path)
 	<-s.originSem
@@ -439,9 +448,9 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 		return err
 	}
 	key := cache.Key(sourceMedia, meta)
-	_ = s.store.UpsertSourceMetadata(ctx.ItemID, ctx.MediaSourceID, key, meta.URL, session.OriginSignature(meta), meta.Size, float64(time.Now().Unix()))
+	_ = s.store.UpsertSourceMetadataRecord(sourceMetadataRecord(ctx.ItemID, ctx.MediaSourceID, key, meta, float64(time.Now().Unix())))
 	status := http.StatusOK
-	if r.Header.Get("Range") != "" {
+	if r.Header.Get("Range") != "" || byteRange.Start != 0 || byteRange.End != meta.Size-1 {
 		status = http.StatusPartialContent
 	}
 	writeRangeHeaders(w, status, byteRange, meta)
@@ -551,6 +560,83 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 	s.addStat(func(stats *Stats) { stats.Counters.Origin++ })
 	s.recordSession(ctx, key, meta, byteRange)
 	return nil
+}
+
+func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext) (bool, error) {
+	record, err := s.store.LatestSourceMetadata(ctx.ItemID, ctx.MediaSourceID)
+	if err != nil || record == nil {
+		return false, err
+	}
+	if sourceMedia.Size != nil && *sourceMedia.Size > 0 && *sourceMedia.Size != record.MediaSize {
+		return false, nil
+	}
+	meta := sourceMetadataFromRecord(record)
+	headSize, tailSize := s.headTailBytes(meta.Size)
+	byteRange, err := ranges.PlanPlaybackRange(r.Header.Get("Range"), meta.Size, headSize, tailSize, s.cfg.Cache.DefaultOpenRangeBytes, s.cfg.Cache.OpenHeadResponseBytes)
+	if err != nil {
+		return false, err
+	}
+	blockName, _ := headtail.BlockForRequest(byteRange, meta.Size, headSize, tailSize)
+	if blockName == "" {
+		return false, nil
+	}
+	status := responseStatus(r, byteRange, meta)
+	if r.Method == http.MethodHead {
+		ok, err := s.cache.HasBlockRange(record.CacheKey, blockName, byteRange)
+		if err != nil || !ok {
+			return false, err
+		}
+		s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
+		writeRangeHeaders(w, status, byteRange, meta)
+		w.WriteHeader(status)
+		return true, nil
+	}
+	chunks, err := s.cache.IterBlock(record.CacheKey, blockName, byteRange, s.cfg.Cache.ChunkBytes)
+	if err != nil || chunks == nil {
+		return false, err
+	}
+	s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
+	writeRangeHeaders(w, status, byteRange, meta)
+	w.WriteHeader(status)
+	if err := writeChunks(w, chunks, func() {
+		s.recordSession(ctx, record.CacheKey, meta, byteRange)
+	}); err != nil {
+		s.addError("cache response failed: " + errorClass(err))
+		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+	}
+	return true, nil
+}
+
+func responseStatus(r *http.Request, byteRange model.ByteRange, meta model.SourceMetadata) int {
+	if r.Header.Get("Range") != "" || byteRange.Start != 0 || byteRange.End != meta.Size-1 {
+		return http.StatusPartialContent
+	}
+	return http.StatusOK
+}
+
+func sourceMetadataRecord(itemID, mediaSourceID, key string, meta model.SourceMetadata, updatedAt float64) state.SourceMetadataRecord {
+	return state.SourceMetadataRecord{
+		ItemID:          itemID,
+		MediaSourceID:   mediaSourceID,
+		CacheKey:        key,
+		OriginURL:       meta.URL,
+		OriginSignature: session.OriginSignature(meta),
+		MediaSize:       meta.Size,
+		ContentType:     meta.ContentType,
+		ETag:            meta.ETag,
+		LastModified:    meta.LastModified,
+		UpdatedAt:       updatedAt,
+	}
+}
+
+func sourceMetadataFromRecord(record *state.SourceMetadataRecord) model.SourceMetadata {
+	return model.SourceMetadata{
+		URL:          record.OriginURL,
+		Size:         record.MediaSize,
+		ContentType:  record.ContentType,
+		ETag:         record.ETag,
+		LastModified: record.LastModified,
+	}
 }
 
 func (s *Server) buildHeadTailBlock(sourceURL string, meta model.SourceMetadata, key, blockName string, blockRange, responseRange model.ByteRange, writers ...io.Writer) error {

@@ -80,6 +80,9 @@ type SourceMetadataRecord struct {
 	OriginURL       string
 	OriginSignature string
 	MediaSize       int64
+	ContentType     string
+	ETag            string
+	LastModified    string
 	UpdatedAt       float64
 }
 
@@ -173,6 +176,9 @@ CREATE TABLE IF NOT EXISTS source_metadata (
     origin_url TEXT NOT NULL,
     origin_signature TEXT NOT NULL,
     media_size INTEGER NOT NULL,
+    content_type TEXT,
+    etag TEXT,
+    last_modified TEXT,
     updated_at REAL NOT NULL,
     PRIMARY KEY(item_id, media_source_id, cache_key)
 );
@@ -181,6 +187,15 @@ CREATE TABLE IF NOT EXISTS source_metadata (
 		return err
 	}
 	if err := s.ensureColumn("prefetch_tasks", "next_attempt_at", "REAL"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("source_metadata", "content_type", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("source_metadata", "etag", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("source_metadata", "last_modified", "TEXT"); err != nil {
 		return err
 	}
 	_, err = s.db.Exec(`
@@ -374,28 +389,62 @@ WHERE session_hash = ? AND status != 'expired'`, queuedUntil, queuedUntil, sessi
 }
 
 func (s *Store) UpsertSourceMetadata(itemID, mediaSourceID, cacheKey, originURL, originSignature string, mediaSize int64, updatedAt float64) error {
+	return s.UpsertSourceMetadataRecord(SourceMetadataRecord{
+		ItemID:          itemID,
+		MediaSourceID:   mediaSourceID,
+		CacheKey:        cacheKey,
+		OriginURL:       originURL,
+		OriginSignature: originSignature,
+		MediaSize:       mediaSize,
+		UpdatedAt:       updatedAt,
+	})
+}
+
+func (s *Store) UpsertSourceMetadataRecord(record SourceMetadataRecord) error {
 	_, err := s.db.Exec(`
 INSERT INTO source_metadata (
     item_id, media_source_id, cache_key, origin_url,
-    origin_signature, media_size, updated_at
+    origin_signature, media_size, content_type, etag,
+    last_modified, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(item_id, media_source_id, cache_key) DO UPDATE SET
     origin_url = excluded.origin_url,
     origin_signature = excluded.origin_signature,
     media_size = excluded.media_size,
+    content_type = excluded.content_type,
+    etag = excluded.etag,
+    last_modified = excluded.last_modified,
     updated_at = excluded.updated_at
-`, itemID, mediaSourceID, cacheKey, originURL, originSignature, mediaSize, updatedAt)
+`, record.ItemID, record.MediaSourceID, record.CacheKey, record.OriginURL, record.OriginSignature,
+		record.MediaSize, record.ContentType, record.ETag, record.LastModified, record.UpdatedAt)
 	return err
 }
 
 func (s *Store) GetSourceMetadata(itemID, mediaSourceID, cacheKey string) (*SourceMetadataRecord, error) {
 	row := s.db.QueryRow(`
-SELECT item_id, media_source_id, cache_key, origin_url, origin_signature, media_size, updated_at
+SELECT item_id, media_source_id, cache_key, origin_url, origin_signature, media_size,
+       COALESCE(content_type, ''), COALESCE(etag, ''), COALESCE(last_modified, ''), updated_at
 FROM source_metadata
 WHERE item_id = ? AND media_source_id = ? AND cache_key = ?`, itemID, mediaSourceID, cacheKey)
 	var record SourceMetadataRecord
-	err := row.Scan(&record.ItemID, &record.MediaSourceID, &record.CacheKey, &record.OriginURL, &record.OriginSignature, &record.MediaSize, &record.UpdatedAt)
+	err := row.Scan(&record.ItemID, &record.MediaSourceID, &record.CacheKey, &record.OriginURL, &record.OriginSignature, &record.MediaSize, &record.ContentType, &record.ETag, &record.LastModified, &record.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &record, err
+}
+
+func (s *Store) LatestSourceMetadata(itemID, mediaSourceID string) (*SourceMetadataRecord, error) {
+	row := s.db.QueryRow(`
+SELECT item_id, media_source_id, cache_key, origin_url, origin_signature, media_size,
+       COALESCE(content_type, ''), COALESCE(etag, ''), COALESCE(last_modified, ''), updated_at
+FROM source_metadata
+WHERE item_id = ? AND media_source_id = ?
+ORDER BY updated_at DESC
+LIMIT 1`, itemID, mediaSourceID)
+	var record SourceMetadataRecord
+	err := row.Scan(&record.ItemID, &record.MediaSourceID, &record.CacheKey, &record.OriginURL, &record.OriginSignature, &record.MediaSize, &record.ContentType, &record.ETag, &record.LastModified, &record.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

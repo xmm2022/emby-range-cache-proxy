@@ -53,11 +53,11 @@ func TestPlanPlaybackRange(t *testing.T) {
 		openHead   *int64
 		want       model.ByteRange
 	}{
-		{"no range full", "", 100, 16, 8, 20, nil, model.ByteRange{Start: 0, End: 99}},
+		{"no range defaults to head", "", 100, 16, 8, 20, nil, model.ByteRange{Start: 0, End: 15}},
 		{"open head clamps to head", "bytes=0-", 100, 16, 8, 20, nil, model.ByteRange{Start: 0, End: 15}},
 		{"open head response cap", "bytes=4-", 100, 64, 8, 20, &openHead, model.ByteRange{Start: 4, End: 35}},
 		{"open tail to eof", "bytes=95-", 100, 16, 8, 20, nil, model.ByteRange{Start: 95, End: 99}},
-		{"open middle default", "bytes=40-", 100, 16, 8, 20, nil, model.ByteRange{Start: 40, End: 59}},
+		{"open middle streams to eof", "bytes=40-", 100, 16, 8, 20, nil, model.ByteRange{Start: 40, End: 99}},
 		{"closed range unchanged", "bytes=40-44", 100, 16, 8, 20, nil, model.ByteRange{Start: 40, End: 44}},
 		{"suffix range unchanged", "bytes=-5", 100, 16, 8, 20, nil, model.ByteRange{Start: 95, End: 99}},
 	}

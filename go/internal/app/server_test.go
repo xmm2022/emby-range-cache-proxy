@@ -370,6 +370,162 @@ func TestAuthorizedHeadRangeBuildsAndHitsHeadCache(t *testing.T) {
 	}
 }
 
+func TestAuthorizedHeadRangeCacheHitSkipsOriginHead(t *testing.T) {
+	originHeads := 0
+	originGets := 0
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			originHeads++
+			w.Header().Set("Content-Length", "26")
+			w.Header().Set("Content-Type", "video/x-matroska")
+			w.Header().Set("ETag", `"v1"`)
+			w.Header().Set("Last-Modified", "Thu, 09 Jul 2026 01:00:00 GMT")
+		case http.MethodGet:
+			originGets++
+			if r.Header.Get("Range") != "bytes=0-25" {
+				t.Fatalf("origin range = %q", r.Header.Get("Range"))
+			}
+			w.Header().Set("Content-Range", "bytes 0-25/26")
+			w.Header().Set("Content-Length", "26")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(originBody)
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mkv","Protocol":"Http","Size":26}]}`))
+	}))
+	defer emby.Close()
+
+	server, err := New(testConfig(t, emby.URL, emby.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token", nil)
+		req.Header.Set("Range", "bytes=0-9")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcdefghij" {
+			t.Fatalf("iter=%d code=%d body=%q headers=%v", i, rec.Code, rec.Body.String(), rec.Header())
+		}
+		if got := rec.Header().Get("Content-Type"); got != "video/x-matroska" {
+			t.Fatalf("content-type=%q", got)
+		}
+	}
+	if originHeads != 1 || originGets != 1 {
+		t.Fatalf("originHeads=%d originGets=%d", originHeads, originGets)
+	}
+}
+
+func TestAuthorizedNoRangeBuildsAndHitsHeadCache(t *testing.T) {
+	originGets := 0
+	originBody := strings.Repeat("0123456789", 10)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("ETag", `"v1"`)
+		case http.MethodGet:
+			originGets++
+			if r.Header.Get("Range") != "bytes=0-15" {
+				t.Fatalf("origin range = %q", r.Header.Get("Range"))
+			}
+			w.Header().Set("Content-Range", "bytes 0-15/100")
+			w.Header().Set("Content-Length", "16")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte(originBody[:16]))
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mkv","Protocol":"Http"}]}`))
+	}))
+	defer emby.Close()
+
+	cfg := testConfig(t, emby.URL, emby.URL)
+	cfg.Cache.HeadBytes = 16
+	cfg.Cache.TailBytes = 8
+	cfg.Cache.ChunkBytes = 8
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token", nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != originBody[:16] {
+			t.Fatalf("iter=%d code=%d body=%q headers=%v", i, rec.Code, rec.Body.String(), rec.Header())
+		}
+		if got := rec.Header().Get("Content-Range"); got != "bytes 0-15/100" {
+			t.Fatalf("content-range=%q", got)
+		}
+	}
+	if originGets != 1 {
+		t.Fatalf("originGets=%d", originGets)
+	}
+}
+
+func TestAuthorizedOpenMiddleRangeStreamsToEOF(t *testing.T) {
+	originGets := 0
+	originBody := strings.Repeat("0123456789", 10)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("ETag", `"v1"`)
+		case http.MethodGet:
+			originGets++
+			if r.Header.Get("Range") != "bytes=16-99" {
+				t.Fatalf("origin range = %q", r.Header.Get("Range"))
+			}
+			w.Header().Set("Content-Range", "bytes 16-99/100")
+			w.Header().Set("Content-Length", "84")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte(originBody[16:]))
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mkv","Protocol":"Http"}]}`))
+	}))
+	defer emby.Close()
+
+	cfg := testConfig(t, emby.URL, emby.URL)
+	cfg.Cache.HeadBytes = 16
+	cfg.Cache.TailBytes = 8
+	cfg.Cache.DefaultOpenRangeBytes = 20
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token", nil)
+	req.Header.Set("Range", "bytes=16-")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != originBody[16:] {
+		t.Fatalf("code=%d body=%q headers=%v", rec.Code, rec.Body.String(), rec.Header())
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 16-99/100" {
+		t.Fatalf("content-range=%q", got)
+	}
+	if originGets != 1 {
+		t.Fatalf("originGets=%d", originGets)
+	}
+}
+
 func TestConcurrentHeadRangeRequestsShareInProgressBuild(t *testing.T) {
 	var originGets int32
 	firstGetStarted := make(chan struct{})
@@ -490,6 +646,71 @@ func TestInternalPrewarmQueuesHeadTail(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("prewarm did not complete, stats=%+v", server.SnapshotStats().Prewarm)
+}
+
+func TestInternalPrewarmAlreadyCachedDoesNotRecordError(t *testing.T) {
+	originBody := strings.Repeat("x", 32)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "32")
+			w.Header().Set("ETag", `"v1"`)
+		case http.MethodGet:
+			w.Header().Set("Content-Range", "bytes 0-31/32")
+			w.Header().Set("Content-Length", "32")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte(originBody))
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mkv","Protocol":"Http"}]}`))
+	}))
+	defer emby.Close()
+	server, err := New(testConfig(t, emby.URL, emby.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	queuePrewarm := func() {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/internal/prewarm", strings.NewReader(`{"itemId":"10535","mediaSourceId":"ms1"}`))
+		req.RemoteAddr = "127.0.0.1:12345"
+		req.Header.Set("X-Range-Cache-Prewarm-Key", "internal-secret")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	waitFor := func(done func(Stats) bool) Stats {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			stats := server.SnapshotStats()
+			if done(stats) {
+				return stats
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return server.SnapshotStats()
+	}
+
+	queuePrewarm()
+	stats := waitFor(func(stats Stats) bool { return stats.Prewarm.Completed == 1 })
+	if stats.Prewarm.Completed != 1 {
+		t.Fatalf("first prewarm did not complete, stats=%+v", stats.Prewarm)
+	}
+	queuePrewarm()
+	stats = waitFor(func(stats Stats) bool { return stats.Prewarm.Skipped == 1 })
+	if stats.Prewarm.Skipped != 1 {
+		t.Fatalf("second prewarm did not skip cached item, stats=%+v", stats.Prewarm)
+	}
+	if len(stats.RecentErrors) != 0 {
+		t.Fatalf("cached prewarm recorded errors: %+v", stats.RecentErrors)
+	}
 }
 
 func TestInternalPrewarmRejectsNonLoopbackRemote(t *testing.T) {
