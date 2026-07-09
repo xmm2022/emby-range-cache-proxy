@@ -35,6 +35,21 @@ func TestResolveSTRMThroughMappingAndAllowlist(t *testing.T) {
 	}
 }
 
+func TestResolveSTRMWithOpenListPseudoURL(t *testing.T) {
+	root := t.TempDir()
+	strmPath := filepath.Join(root, "movie.strm")
+	if err := os.WriteFile(strmPath, []byte("openlist:///Movies/movie.mkv\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	src := model.MediaSource{Path: "/strm/movie.strm", Protocol: "File"}
+	got := ResolveMediaSource(src, []config.PathMapping{{SourcePrefix: "/strm/", TargetPrefix: root}}, nil)
+
+	if got.Path != "openlist:///Movies/movie.mkv" || got.Protocol != "OpenList" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 func TestResolveSTRMRejectsTraversalAndNonAllowlistedURL(t *testing.T) {
 	root := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "evil.strm")

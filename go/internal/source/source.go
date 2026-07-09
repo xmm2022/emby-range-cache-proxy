@@ -28,7 +28,15 @@ func ResolveMediaSource(source model.MediaSource, mappings []config.PathMapping,
 		return source
 	}
 	url, err := readSTRMURL(mapped)
-	if err != nil || !isHTTP(url) || !urlPrefixAllowed(url, urlPrefixAllowlist) {
+	if err != nil {
+		return source
+	}
+	if isOpenList(url) {
+		source.Path = url
+		source.Protocol = "OpenList"
+		return source
+	}
+	if !isHTTP(url) || !urlPrefixAllowed(url, urlPrefixAllowlist) {
 		return source
 	}
 	source.Path = url
@@ -89,6 +97,10 @@ func readSTRMURL(path string) (string, error) {
 func isHTTP(value string) bool {
 	lower := strings.ToLower(value)
 	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+func isOpenList(value string) bool {
+	return strings.HasPrefix(strings.ToLower(value), "openlist:")
 }
 
 func urlPrefixAllowed(value string, prefixes []string) bool {

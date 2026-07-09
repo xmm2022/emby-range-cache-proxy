@@ -23,6 +23,7 @@ type Config struct {
 	PlaybackInfoTimeoutSeconds  int
 	PlaybackAuthCacheTTLSeconds int
 	PathMappings                []PathMapping
+	OpenList                    OpenListConfig
 	Rollout                     RolloutConfig
 	Cache                       CacheConfig
 	Prewarm                     PrewarmConfig
@@ -34,6 +35,14 @@ type Config struct {
 type PathMapping struct {
 	SourcePrefix string
 	TargetPrefix string
+}
+
+type OpenListConfig struct {
+	Enabled        bool
+	BaseURL        string
+	Token          string
+	Password       string
+	TimeoutSeconds int
 }
 
 type RolloutConfig struct {
@@ -180,6 +189,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 			PollIntervalSeconds:           5,
 			ErrorBackoffSeconds:           300,
 		},
+		OpenList: OpenListConfig{
+			TimeoutSeconds: 10,
+		},
 	}
 
 	var err error
@@ -214,6 +226,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.PathMappings, err = parsePathMappings(raw["path_mappings"]); err != nil {
+		return Config{}, err
+	}
+	if err := parseOpenList(raw["openlist"], &cfg.OpenList); err != nil {
 		return Config{}, err
 	}
 	if cfg.Rollout, err = parseRollout(raw["rollout"]); err != nil {
@@ -255,6 +270,12 @@ func (c Config) Validate() error {
 	}
 	if c.PlaybackAuthCacheTTLSeconds < 0 {
 		return fmt.Errorf("playback_auth_cache_ttl_seconds must be >= 0")
+	}
+	if c.OpenList.Enabled && c.OpenList.BaseURL == "" {
+		return fmt.Errorf("openlist.base_url is required when openlist.enabled=true")
+	}
+	if c.OpenList.TimeoutSeconds <= 0 {
+		return fmt.Errorf("openlist.timeout_seconds must be positive")
 	}
 	if c.Cache.MaxBytes <= 0 || c.Cache.BuildWaitSeconds < 0 || c.Cache.HeadBytes <= 0 || c.Cache.TailBytes <= 0 || c.Cache.ChunkBytes <= 0 || c.Cache.DefaultOpenRangeBytes <= 0 {
 		return fmt.Errorf("cache values must be positive")
@@ -330,6 +351,30 @@ func parsePathMappings(value any) ([]PathMapping, error) {
 		out = append(out, PathMapping{SourcePrefix: normalized, TargetPrefix: to})
 	}
 	return out, nil
+}
+
+func parseOpenList(value any, cfg *OpenListConfig) error {
+	data, err := object(value, "openlist")
+	if err != nil {
+		return err
+	}
+	if cfg.Enabled, err = boolFieldDefault(data, "enabled", cfg.Enabled); err != nil {
+		return err
+	}
+	if cfg.BaseURL, err = stringFieldDefault(data, "base_url", cfg.BaseURL); err != nil {
+		return err
+	}
+	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
+	if cfg.Token, err = stringFieldDefault(data, "token", cfg.Token); err != nil {
+		return err
+	}
+	if cfg.Password, err = stringFieldDefault(data, "password", cfg.Password); err != nil {
+		return err
+	}
+	if cfg.TimeoutSeconds, err = intFieldDefault(data, "timeout_seconds", cfg.TimeoutSeconds); err != nil {
+		return err
+	}
+	return nil
 }
 
 func parseCache(value any, cfg *CacheConfig) error {

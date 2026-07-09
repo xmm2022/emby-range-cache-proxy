@@ -12,6 +12,13 @@
       "to": "/home/nax/emby/strm"
     }
   ],
+  "openlist": {
+    "enabled": false,
+    "base_url": "http://127.0.0.1:5244",
+    "token": null,
+    "password": "",
+    "timeout_seconds": 10
+  },
   "rollout": {
     "enabled": false,
     "item_allowlist": [],

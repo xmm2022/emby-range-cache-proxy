@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 
 from .config import PathMapping
 from .models import MediaSource
+from .openlist import is_openlist_source
 
 STRM_READ_LIMIT_BYTES = 16 * 1024
 
@@ -29,6 +30,8 @@ def resolve_media_source(
         url = _read_strm_url(mapped_path)
     except OSError:
         return source
+    if is_openlist_source(url):
+        return replace(source, path=url, protocol="OpenList")
     if not _is_http(url) or not _url_prefix_allowed(url, url_prefix_allowlist):
         return source
     return replace(source, path=url, protocol="Http")

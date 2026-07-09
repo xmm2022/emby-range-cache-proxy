@@ -48,6 +48,9 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 	if cfg.PlaybackAuthCacheTTLSeconds != 30 {
 		t.Fatalf("playback auth cache ttl = %d", cfg.PlaybackAuthCacheTTLSeconds)
 	}
+	if cfg.OpenList.Enabled || cfg.OpenList.TimeoutSeconds != 10 {
+		t.Fatalf("openlist defaults = %+v", cfg.OpenList)
+	}
 	if cfg.Cache.MaxBytes != 512*1024*1024*1024 {
 		t.Fatalf("cache max bytes = %d", cfg.Cache.MaxBytes)
 	}
@@ -87,6 +90,13 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 		"path_mappings": []map[string]any{
 			{"from": "/strm", "to": "/srv/strm"},
 			{"source_prefix": "/media/", "target_prefix": "/srv/media"},
+		},
+		"openlist": map[string]any{
+			"enabled":         true,
+			"base_url":        "https://openlist.example/",
+			"token":           "openlist-token",
+			"password":        "path-password",
+			"timeout_seconds": 3,
 		},
 		"rollout": map[string]any{
 			"enabled":                    true,
@@ -161,6 +171,9 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	if len(cfg.PathMappings) != 2 || cfg.PathMappings[0].SourcePrefix != "/strm/" || cfg.PathMappings[1].SourcePrefix != "/media/" {
 		t.Fatalf("path mappings = %+v", cfg.PathMappings)
 	}
+	if !cfg.OpenList.Enabled || cfg.OpenList.BaseURL != "https://openlist.example" || cfg.OpenList.Token != "openlist-token" || cfg.OpenList.Password != "path-password" || cfg.OpenList.TimeoutSeconds != 3 {
+		t.Fatalf("openlist = %+v", cfg.OpenList)
+	}
 	if !cfg.Rollout.InScope("1", "ms1", "http://127.0.0.1:18096/a.mkv") {
 		t.Fatalf("expected rollout in scope")
 	}
@@ -193,6 +206,8 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{"missing cache", map[string]any{"cache_dir": ""}},
 		{"bad playbackinfo timeout", map[string]any{"playback_info_timeout_seconds": 0}},
 		{"bad playback auth cache ttl", map[string]any{"playback_auth_cache_ttl_seconds": -1}},
+		{"bad openlist missing base", map[string]any{"openlist": map[string]any{"enabled": true}}},
+		{"bad openlist timeout", map[string]any{"openlist": map[string]any{"timeout_seconds": 0}}},
 		{"bad cache head", map[string]any{"cache": map[string]any{"head_bytes": 0}}},
 		{"bad cache tail", map[string]any{"cache": map[string]any{"tail_bytes": 0}}},
 		{"bad mapping root", map[string]any{"path_mappings": []map[string]any{{"from": "/", "to": "/tmp"}}}},

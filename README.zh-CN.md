@@ -23,7 +23,7 @@ make check-config CONFIG=/etc/emby-range-cache-proxy/config.json
 ./go/bin/emby-range-cache-proxy --config /etc/emby-range-cache-proxy/config.json --print-effective-config
 ```
 
-`--print-effective-config` 会输出合并默认值后的最终 JSON 配置，适合部署前核对实际生效参数。默认会把 `prewarm_api_key` 显示为 `REDACTED`；只有明确需要检查密钥明文时才加 `--show-secrets`。
+`--print-effective-config` 会输出合并默认值后的最终 JSON 配置，适合部署前核对实际生效参数。默认会把 `prewarm_api_key` 和 OpenList 密钥显示为 `REDACTED`；只有明确需要检查密钥明文时才加 `--show-secrets`。
 
 配置文件建议放在：
 
@@ -52,6 +52,8 @@ make check-config CONFIG=/etc/emby-range-cache-proxy/config.json
 ```
 
 `listen_host` 建议保持 `127.0.0.1`，不要把服务直接暴露到公网。`path_prefix_allowlist` 建议写完整 URL 前缀并带尾部 `/`，例如 `http://127.0.0.1:18096/`。
+
+如果媒体源走 OpenList，配置 `openlist.enabled=true`、`openlist.base_url`，需要鉴权时再填 `openlist.token`。`.strm` 里可以写 `openlist:///Movies/movie.mkv`，并把 OpenList 地址（例如 `http://127.0.0.1:5244/`）加入 `rollout.path_prefix_allowlist`。
 
 ## systemd 部署
 
@@ -185,6 +187,8 @@ curl -fsS -X POST http://127.0.0.1:18180/internal/prewarm \
 | `cache_dir` | head/tail/middle 缓存和状态库目录 | 放在容量足够的磁盘 |
 | `prewarm_api_key` | 内部预热和后台任务密钥 | 使用长随机值，不要复用 Emby 用户 token |
 | `playback_info_timeout_seconds` | 用户播放请求查询 Emby PlaybackInfo 的前台鉴权超时 | 默认 `15`，冷启动慢可调大 |
+| `openlist.enabled` / `openlist.base_url` | 启用 OpenList 源适配并配置 OpenList 地址 | `.strm` 可写 `openlist:///Movies/movie.mkv` |
+| `openlist.token` | 调用 OpenList `/api/fs/get` 的 token | 按 OpenList 原样填，不要加 `Bearer` |
 | `rollout.enabled` | 是否启用缓存代理命中范围 | 灰度时设为 `true` |
 | `rollout.item_allowlist` | 只允许指定 item 进入代理逻辑 | 初期只放一两个影片 |
 | `rollout.media_source_allowlist` | 只允许指定 MediaSource | 避免同影片多源误命中 |
@@ -215,6 +219,7 @@ curl -fsS -X POST http://127.0.0.1:18180/internal/prewarm \
 - 内部接口只接受 loopback 来源。
 - 日志不应包含用户 token、`api_key`、`X-Emby-Token`、`PlaySessionId`、`DeviceId`、源站 URL 或完整 query。
 - `.strm` 本地路径读取只允许配置过的 `path_mappings`，解析出来的 URL 还要命中 `rollout.path_prefix_allowlist`。
+- OpenList 适配会调用 `/api/fs/get` 刷新文件 `sign`，并以 OpenList `/d/...?...sign` 作为回源地址；使用时把 OpenList 地址（如 `http://127.0.0.1:5244/`）加入 `rollout.path_prefix_allowlist`。
 
 ## 开发验证
 

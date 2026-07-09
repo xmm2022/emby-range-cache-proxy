@@ -39,6 +39,24 @@ def test_strm_media_source_uses_configured_path_mapping(tmp_path):
     assert resolved.media_source_id == source.media_source_id
 
 
+def test_strm_media_source_can_use_openlist_pseudo_url(tmp_path):
+    host_root = tmp_path / "strm"
+    host_root.mkdir()
+    (host_root / "movie.strm").write_text("openlist:///Movies/movie.mkv\n")
+    source = MediaSource(
+        item_id="1",
+        media_source_id="ms1",
+        path="/strm/movie.strm",
+        protocol="File",
+        size=100,
+    )
+
+    resolved = resolve_media_source(source, (PathMapping("/strm/", str(host_root)),))
+
+    assert resolved.path == "openlist:///Movies/movie.mkv"
+    assert resolved.protocol == "OpenList"
+
+
 def test_strm_media_source_without_readable_mapping_is_left_unchanged(tmp_path):
     source = MediaSource(
         item_id="1",

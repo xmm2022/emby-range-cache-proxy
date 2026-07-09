@@ -16,6 +16,7 @@ type EffectiveConfig struct {
 	PlaybackInfoTimeoutSeconds  int                    `json:"playback_info_timeout_seconds"`
 	PlaybackAuthCacheTTLSeconds int                    `json:"playback_auth_cache_ttl_seconds"`
 	PathMappings                []EffectivePathMapping `json:"path_mappings"`
+	OpenList                    EffectiveOpenList      `json:"openlist"`
 	Rollout                     EffectiveRollout       `json:"rollout"`
 	Cache                       EffectiveCache         `json:"cache"`
 	Prewarm                     EffectivePrewarm       `json:"prewarm"`
@@ -27,6 +28,14 @@ type EffectiveConfig struct {
 type EffectivePathMapping struct {
 	From string `json:"from"`
 	To   string `json:"to"`
+}
+
+type EffectiveOpenList struct {
+	Enabled        bool   `json:"enabled"`
+	BaseURL        string `json:"base_url"`
+	Token          any    `json:"token"`
+	Password       any    `json:"password"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
 }
 
 type EffectiveRollout struct {
@@ -101,6 +110,22 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			prewarmKey = "REDACTED"
 		}
 	}
+	openListToken := any(nil)
+	if cfg.OpenList.Token != "" {
+		if showSecrets {
+			openListToken = cfg.OpenList.Token
+		} else {
+			openListToken = "REDACTED"
+		}
+	}
+	openListPassword := any(nil)
+	if cfg.OpenList.Password != "" {
+		if showSecrets {
+			openListPassword = cfg.OpenList.Password
+		} else {
+			openListPassword = "REDACTED"
+		}
+	}
 	pathMappings := make([]EffectivePathMapping, 0, len(cfg.PathMappings))
 	for _, mapping := range cfg.PathMappings {
 		pathMappings = append(pathMappings, EffectivePathMapping{From: mapping.SourcePrefix, To: mapping.TargetPrefix})
@@ -119,6 +144,13 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 		PlaybackInfoTimeoutSeconds:  cfg.PlaybackInfoTimeoutSeconds,
 		PlaybackAuthCacheTTLSeconds: cfg.PlaybackAuthCacheTTLSeconds,
 		PathMappings:                pathMappings,
+		OpenList: EffectiveOpenList{
+			Enabled:        cfg.OpenList.Enabled,
+			BaseURL:        cfg.OpenList.BaseURL,
+			Token:          openListToken,
+			Password:       openListPassword,
+			TimeoutSeconds: cfg.OpenList.TimeoutSeconds,
+		},
 		Rollout: EffectiveRollout{
 			Enabled:              cfg.Rollout.Enabled,
 			ItemAllowlist:        sortedSet(cfg.Rollout.ItemAllowlist),

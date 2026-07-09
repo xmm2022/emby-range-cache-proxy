@@ -17,6 +17,7 @@ from .cache import CacheReadError, HeadTailCache, adaptive_head_tail, cache_key
 from .config import Config
 from .middle_cache import MiddleRangeCache
 from .models import ByteRange, MediaSource, RequestContext, SourceMetadata
+from .openlist import resolve_openlist_media_source
 from .origin import OriginClient, OriginError
 from .prefetch import PrefetchWorker, enqueue_prefetch_for_session, short_hash
 from .prewarm import PrewarmWorker
@@ -331,7 +332,10 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         return await stream_fallback(request, config)
 
     try:
-        async with EmbyAuthClient(config.emby_base_url) as auth:
+        async with EmbyAuthClient(
+            config.emby_base_url,
+            timeout_seconds=config.playback_info_timeout_seconds,
+        ) as auth:
             source = await auth.authorize(ctx)
     except AuthorizationError:
         _log_decision("deny", "authorization_failed", request, ctx=ctx)
@@ -345,6 +349,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         config.path_mappings,
         url_prefix_allowlist=config.rollout.path_prefix_allowlist,
     )
+    source = await resolve_openlist_media_source(source, config.openlist)
     if not _is_http_source(source):
         _log_decision("fallback", "non_http_source", request, ctx=ctx)
         return await stream_fallback(request, config)

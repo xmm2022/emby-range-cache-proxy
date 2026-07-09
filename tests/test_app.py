@@ -17,6 +17,7 @@ from emby_range_cache_proxy.config import (
     CacheConfig,
     Config,
     MiddleCacheConfig,
+    OpenListConfig,
     PathMapping,
     PrefetchConfig,
     PrewarmConfig,
@@ -847,6 +848,92 @@ async def test_out_of_scope_falls_back_to_emby(aiohttp_client, tmp_path):
 
     assert response.status == 206
     assert await response.read() == b"emby"
+
+
+async def test_openlist_pseudo_source_is_resolved_and_streamed(aiohttp_client, tmp_path):
+    body = b"0123456789" + b"x" * 90
+    seen = {}
+
+    async def playback_info(request):
+        return web.json_response(
+            {
+                "MediaSources": [
+                    {
+                        "Id": "ms1",
+                        "Path": "openlist:///Movies/movie.mkv",
+                        "Protocol": "File",
+                        "Size": 100,
+                    }
+                ]
+            }
+        )
+
+    async def fallback(request):
+        return web.Response(body=b"fallback")
+
+    async def fs_get(request):
+        seen["authorization"] = request.headers.get("Authorization")
+        seen["payload"] = await request.json()
+        return web.json_response(
+            {
+                "code": 200,
+                "data": {
+                    "name": "movie.mkv",
+                    "size": 100,
+                    "is_dir": False,
+                    "sign": "fresh-sign:0",
+                },
+            }
+        )
+
+    async def openlist_download(request):
+        assert request.query["sign"] == "fresh-sign:0"
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": str(len(body))})
+        range_header = request.headers["Range"]
+        assert range_header.startswith("bytes=")
+        start_s, end_s = range_header.removeprefix("bytes=").split("-", 1)
+        start = int(start_s)
+        end = int(end_s)
+        return web.Response(
+            status=206,
+            body=body[start : end + 1],
+            headers={"Content-Range": f"bytes {start}-{end}/{len(body)}"},
+        )
+
+    emby_app = web.Application()
+    emby_app.router.add_get("/Items/{item_id}/PlaybackInfo", playback_info)
+    emby_app.router.add_get("/emby/videos/{item_id}/original.mkv", fallback)
+    emby_server = await aiohttp_client(emby_app)
+
+    openlist_app = web.Application()
+    openlist_app.router.add_post("/api/fs/get", fs_get)
+    openlist_app.router.add_route("*", "/d/Movies/movie.mkv", openlist_download)
+    openlist_server = await aiohttp_client(openlist_app)
+    openlist_base = str(openlist_server.make_url("/")).rstrip("/")
+
+    app = create_app(
+        Config(
+            emby_base_url=str(emby_server.make_url("")),
+            fallback_base_url=str(emby_server.make_url("")),
+            cache_dir=str(tmp_path),
+            openlist=OpenListConfig(enabled=True, base_url=openlist_base, token="openlist-token"),
+            rollout=RolloutConfig(
+                enabled=True,
+                item_allowlist={"1"},
+                media_source_allowlist={"ms1"},
+                path_prefix_allowlist=(f"{openlist_base}/",),
+            ),
+        )
+    )
+    client = await aiohttp_client(app)
+
+    response = await client.get("/emby/videos/1/original.mkv?MediaSourceId=ms1&api_key=t", headers={"Range": "bytes=0-9"})
+
+    assert response.status == 206
+    assert await response.read() == b"0123456789"
+    assert seen["authorization"] == "openlist-token"
+    assert seen["payload"] == {"path": "/Movies/movie.mkv", "password": ""}
 
 
 async def test_authorized_head_range_is_served_and_cached(aiohttp_client, tmp_path):
@@ -2769,10 +2856,12 @@ async def test_authorization_error_returns_403_without_origin_or_fallback(aiohtt
 
 async def test_authorization_unavailable_falls_back_to_emby(aiohttp_client, monkeypatch, tmp_path):
     fallback_calls = 0
+    auth_timeout_seconds = None
 
     class FakeAuthClient:
-        def __init__(self, base_url):
-            pass
+        def __init__(self, base_url, *, timeout_seconds):
+            nonlocal auth_timeout_seconds
+            auth_timeout_seconds = timeout_seconds
 
         async def __aenter__(self):
             return self
@@ -2798,6 +2887,7 @@ async def test_authorization_unavailable_falls_back_to_emby(aiohttp_client, monk
             emby_base_url=str(fallback_server.make_url("")),
             fallback_base_url=str(fallback_server.make_url("")),
             cache_dir=str(tmp_path),
+            playback_info_timeout_seconds=23,
             rollout=RolloutConfig(enabled=True, item_allowlist={"1"}),
         )
     )
@@ -2808,6 +2898,7 @@ async def test_authorization_unavailable_falls_back_to_emby(aiohttp_client, monk
     assert response.status == 206
     assert await response.read() == b"fallback"
     assert fallback_calls == 1
+    assert auth_timeout_seconds == 23
 
 
 async def test_stream_fallback_uses_long_stream_timeout(monkeypatch, tmp_path):

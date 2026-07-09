@@ -26,6 +26,18 @@ def test_redact_url_query_secrets_case_insensitive_preserves_key_names():
     assert "MediaSourceId=ms1" in redacted
 
 
+def test_redact_url_openlist_signatures():
+    url = "https://openlist.example/d/movie.mkv?sign=download-sign&openlist_ts=timestamp&raw=1"
+
+    redacted = redact_url(url)
+
+    assert "download-sign" not in redacted
+    assert "timestamp" not in redacted
+    assert "sign=%5BREDACTED%5D" in redacted
+    assert "openlist_ts=%5BREDACTED%5D" in redacted
+    assert "raw=1" in redacted
+
+
 def test_stable_token_hash_is_not_plaintext():
     digest = stable_token_hash("secret-token")
 

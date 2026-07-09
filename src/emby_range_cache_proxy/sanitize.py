@@ -3,7 +3,15 @@ from __future__ import annotations
 import hashlib
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-SENSITIVE_QUERY_KEYS = {"api_key", "playsessionid", "deviceid", "x-emby-token", "token"}
+SENSITIVE_QUERY_KEYS = {
+    "api_key",
+    "playsessionid",
+    "deviceid",
+    "x-emby-token",
+    "token",
+    "sign",
+    "openlist_ts",
+}
 
 
 def stable_token_hash(token: str) -> str:

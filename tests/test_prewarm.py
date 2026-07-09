@@ -7,6 +7,41 @@ from emby_range_cache_proxy.models import ByteRange, MediaSource, SourceMetadata
 from emby_range_cache_proxy.prewarm import PrewarmWorker
 
 
+async def test_prewarm_uses_configured_playback_info_timeout(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeSession:
+        def __init__(self, *, timeout):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        def get(self, *args, **kwargs):
+            raise AssertionError("timeout should be asserted before network request")
+
+    monkeypatch.setattr(prewarm_module, "ClientSession", FakeSession)
+    worker = PrewarmWorker(
+        Config(
+            emby_base_url="http://emby",
+            fallback_base_url="http://emby",
+            cache_dir=str(tmp_path),
+            prewarm_api_key="internal",
+            prewarm=PrewarmConfig(enabled=True, playback_info_timeout_seconds=19),
+        )
+    )
+
+    try:
+        await worker.run_once()
+    except AssertionError:
+        pass
+
+    assert captured["timeout"].total == 19
+
+
 async def test_prewarm_uses_internal_key_and_builds_head_tail(aiohttp_client, tmp_path, monkeypatch):
     monkeypatch.setattr(prewarm_module, "adaptive_head_tail", lambda size: (16, 4))
 

@@ -38,6 +38,11 @@ local firewall and reverse proxy rules. `path_prefix_allowlist` values should be
 full URL prefixes with a trailing slash, for example `http://127.0.0.1:18096/`,
 so adjacent hostnames or ports are not accidentally included.
 
+For OpenList-backed `.strm` sources, set `openlist.enabled=true`,
+`openlist.base_url` to your OpenList origin, and optionally `openlist.token`.
+Then add that OpenList base URL to `rollout.path_prefix_allowlist`; `.strm`
+entries can use `openlist:///Movies/movie.mkv`.
+
 ### 2. Build and test the Go binary
 
 ```bash
@@ -49,8 +54,8 @@ make check-config CONFIG=/etc/emby-range-cache-proxy/config.json
 ```
 
 `--print-effective-config` prints the fully defaulted JSON config that the Go
-service will use. It redacts `prewarm_api_key` by default; add `--show-secrets`
-only when you intentionally need to inspect secret values.
+service will use. It redacts `prewarm_api_key` and OpenList secrets by default;
+add `--show-secrets` only when you intentionally need to inspect secret values.
 
 Run it on an unused port first if Python is still serving `18180`:
 
@@ -186,6 +191,7 @@ curl -fsS http://127.0.0.1:18180/healthz
 - The internal prewarm key is only used by the prewarm worker. It is not used to authorize user playback requests.
 - The proxy accepts HTTP and HTTPS media source paths returned by Emby after authorization.
 - `.strm` media source paths can be resolved through configured path mappings such as `/strm/` to `/home/nax/emby/strm`, then cached from the HTTP URL inside the `.strm` file when that URL also matches `rollout.path_prefix_allowlist`.
+- OpenList sources can be resolved by setting `openlist.enabled=true`; `.strm` files may contain `openlist:///Movies/movie.mkv`, or Emby may return an OpenList `/d/...` or `/p/...` URL. The proxy calls OpenList `/api/fs/get`, refreshes the file `sign`, and uses the signed OpenList `/d/...` URL as the cache origin.
 - `.strm` support is not tied to a hard-coded port. The current test server allowlists `http://127.0.0.1:18096/` as its local `.strm` origin; `.strm` files pointing elsewhere fall back to Emby unless that origin prefix is explicitly allowlisted.
 - The cache stores configured head and tail ranges for startup, probing, and container metadata reads.
 - The proxy does not actively cache arbitrary middle playback ranges.
@@ -198,6 +204,7 @@ curl -fsS http://127.0.0.1:18180/healthz
 - Logs must not include user tokens, `api_key`, `X-Emby-Token`, `PlaySessionId`, `DeviceId`, origin URLs, or raw query strings.
 - Cache entries are shared by media source and origin metadata, not by user. Authorization remains per request.
 - Local `.strm` reads are limited to configured path mappings, and resolved `.strm` URLs are limited by `rollout.path_prefix_allowlist`.
+- OpenList tokens are sent as the raw `Authorization` header value expected by OpenList. Add the OpenList base URL, such as `http://127.0.0.1:5244/`, to `rollout.path_prefix_allowlist` when using the signed OpenList origin mode.
 - The prewarm API key only discovers and warms rollout-scoped media. It does not replace user token checks.
 
 ## Internal Prewarm Endpoint

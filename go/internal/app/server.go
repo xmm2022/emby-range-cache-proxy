@@ -24,6 +24,7 @@ import (
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/headtail"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/middle"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/model"
+	"github.com/xmm2022/emby-range-cache-proxy/go/internal/openlist"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/origin"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/prefetch"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/ranges"
@@ -44,6 +45,7 @@ type Server struct {
 	httpClient     *http.Client
 	fallbackClient *http.Client
 	origin         *origin.Client
+	openList       *openlist.Resolver
 	auth           *emby.AuthClient
 	prewarmAuth    *emby.AuthClient
 	authCacheTTL   time.Duration
@@ -219,6 +221,7 @@ func New(cfg config.Config) (*Server, error) {
 		httpClient:      &http.Client{Timeout: prewarmTimeout},
 		fallbackClient:  &http.Client{Timeout: 0},
 		origin:          origin.NewClient(cfg.Cache.ChunkBytes),
+		openList:        openlist.NewResolver(cfg.OpenList),
 		auth:            emby.NewAuthClientWithTimeout(cfg.EmbyBaseURL, playbackInfoTimeout),
 		prewarmAuth:     emby.NewAuthClientWithTimeout(cfg.EmbyBaseURL, prewarmTimeout),
 		authCacheTTL:    time.Duration(cfg.PlaybackAuthCacheTTLSeconds) * time.Second,
@@ -428,6 +431,7 @@ func (s *Server) prewarmItem(itemID, mediaSourceID string) error {
 		return err
 	}
 	sourceMedia = source.ResolveMediaSource(sourceMedia, s.cfg.PathMappings, s.cfg.Rollout.PathPrefixAllowlist)
+	sourceMedia = s.openList.Resolve(context.Background(), sourceMedia)
 	if !isHTTP(sourceMedia.Path) || !s.cfg.Rollout.InScope(itemID, mediaSourceID, sourceMedia.Path) {
 		return fmt.Errorf("source out of scope")
 	}
@@ -502,6 +506,7 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sourceMedia = source.ResolveMediaSource(sourceMedia, s.cfg.PathMappings, s.cfg.Rollout.PathPrefixAllowlist)
+	sourceMedia = s.openList.Resolve(r.Context(), sourceMedia)
 	if !isHTTP(sourceMedia.Path) || !s.cfg.Rollout.InScope(ctx.ItemID, ctx.MediaSourceID, sourceMedia.Path) {
 		trace.route = "fallback"
 		s.addStat(func(stats *Stats) { stats.Counters.Fallback++ })

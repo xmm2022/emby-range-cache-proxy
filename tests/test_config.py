@@ -5,6 +5,7 @@ import pytest
 from emby_range_cache_proxy.config import (
     Config,
     MiddleCacheConfig,
+    OpenListConfig,
     PrefetchConfig,
     PrewarmConfig,
     SessionConfig,
@@ -36,9 +37,12 @@ def test_load_config_with_defaults(tmp_path):
     assert config.cache_dir == str(tmp_path / "cache")
     assert config.fallback_base_url == "http://127.0.0.1:8096"
     assert config.prewarm_api_key == "secret-prewarm-key"
+    assert config.playback_info_timeout_seconds == 15.0
+    assert config.openlist.enabled is False
     assert config.cache.max_bytes == 512 * 1024**3
     assert config.cache.open_head_response_bytes is None
     assert config.prewarm.enabled is False
+    assert config.prewarm.playback_info_timeout_seconds == 15.0
     assert config.path_mappings == ()
     assert config.rollout.enabled is True
     assert config.rollout.item_allowed("151357") is True
@@ -77,6 +81,52 @@ def test_load_config_reads_path_mappings(tmp_path):
     assert len(config.path_mappings) == 1
     assert config.path_mappings[0].source_prefix == "/strm/"
     assert config.path_mappings[0].target_prefix == "/home/nax/emby/strm"
+
+
+def test_load_config_reads_openlist(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "openlist": {
+                    "enabled": True,
+                    "base_url": "https://openlist.example/",
+                    "token": "openlist-token",
+                    "password": "path-password",
+                    "timeout_seconds": 3,
+                },
+            }
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.openlist.enabled is True
+    assert config.openlist.base_url == "https://openlist.example"
+    assert config.openlist.token == "openlist-token"
+    assert config.openlist.password == "path-password"
+    assert config.openlist.timeout_seconds == 3
+
+
+def test_load_config_reads_playback_info_timeouts(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "emby_base_url": "http://127.0.0.1:8096",
+                "cache_dir": str(tmp_path / "cache"),
+                "playback_info_timeout_seconds": 31,
+                "prewarm": {"playback_info_timeout_seconds": 17},
+            }
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.playback_info_timeout_seconds == 31.0
+    assert config.prewarm.playback_info_timeout_seconds == 17.0
 
 
 def test_load_config_normalizes_path_mapping_source_prefix(tmp_path):
@@ -132,6 +182,23 @@ def test_prewarm_config_rejects_non_positive_concurrency(concurrency):
         PrewarmConfig(concurrency=concurrency)
 
 
+@pytest.mark.parametrize("timeout_seconds", [0, -1])
+def test_prewarm_config_rejects_non_positive_playback_info_timeout(timeout_seconds):
+    with pytest.raises(ValueError, match="prewarm\\.playback_info_timeout_seconds"):
+        PrewarmConfig(playback_info_timeout_seconds=timeout_seconds)
+
+
+@pytest.mark.parametrize("timeout_seconds", [0, -1])
+def test_config_rejects_non_positive_playback_info_timeout(tmp_path, timeout_seconds):
+    with pytest.raises(ValueError, match="playback_info_timeout_seconds"):
+        Config(
+            emby_base_url="http://127.0.0.1:8096",
+            fallback_base_url="http://127.0.0.1:8096",
+            cache_dir=str(tmp_path),
+            playback_info_timeout_seconds=timeout_seconds,
+        )
+
+
 @pytest.mark.parametrize("interval_seconds", [0, -1, 59])
 def test_load_config_rejects_short_prewarm_interval(tmp_path, interval_seconds):
     path = tmp_path / "config.json"
@@ -147,6 +214,16 @@ def test_load_config_rejects_short_prewarm_interval(tmp_path, interval_seconds):
 
     with pytest.raises(ValueError, match="prewarm\\.interval_seconds"):
         load_config(path)
+
+
+def test_openlist_config_requires_base_url_when_enabled():
+    with pytest.raises(ValueError, match="openlist\\.base_url"):
+        OpenListConfig(enabled=True)
+
+
+def test_openlist_config_rejects_non_positive_timeout():
+    with pytest.raises(ValueError, match="openlist\\.timeout_seconds"):
+        OpenListConfig(enabled=False, timeout_seconds=0)
 
 
 @pytest.mark.parametrize("concurrency", [0, -1])

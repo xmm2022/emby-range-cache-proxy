@@ -51,12 +51,15 @@ class PrewarmConfig:
     interval_seconds: int = 900
     max_items_per_scan: int = 100
     concurrency: int = 1
+    playback_info_timeout_seconds: float = 15.0
 
     def __post_init__(self) -> None:
         if self.interval_seconds < 60:
             raise ValueError("prewarm.interval_seconds must be >= 60")
         if self.concurrency <= 0:
             raise ValueError("prewarm.concurrency must be positive")
+        if self.playback_info_timeout_seconds <= 0:
+            raise ValueError("prewarm.playback_info_timeout_seconds must be positive")
 
 
 @dataclass
@@ -138,6 +141,22 @@ class PathMapping:
 
 
 @dataclass
+class OpenListConfig:
+    enabled: bool = False
+    base_url: str = ""
+    token: str | None = None
+    password: str = ""
+    timeout_seconds: float = 10.0
+
+    def __post_init__(self) -> None:
+        self.base_url = self.base_url.rstrip("/")
+        if self.enabled and not self.base_url:
+            raise ValueError("openlist.base_url is required when openlist.enabled=true")
+        if self.timeout_seconds <= 0:
+            raise ValueError("openlist.timeout_seconds must be positive")
+
+
+@dataclass
 class Config:
     emby_base_url: str
     fallback_base_url: str
@@ -145,13 +164,19 @@ class Config:
     listen_host: str = "127.0.0.1"
     listen_port: int = 18180
     prewarm_api_key: str | None = None
+    playback_info_timeout_seconds: float = 15.0
     path_mappings: tuple[PathMapping, ...] = ()
+    openlist: OpenListConfig = field(default_factory=OpenListConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     prewarm: PrewarmConfig = field(default_factory=PrewarmConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
     middle_cache: MiddleCacheConfig = field(default_factory=MiddleCacheConfig)
     prefetch: PrefetchConfig = field(default_factory=PrefetchConfig)
+
+    def __post_init__(self) -> None:
+        if self.playback_info_timeout_seconds <= 0:
+            raise ValueError("playback_info_timeout_seconds must be positive")
 
 
 def _string_list(values: Any, field_name: str) -> list[str]:
@@ -192,6 +217,7 @@ def _prewarm(data: dict[str, Any]) -> PrewarmConfig:
         interval_seconds=int(data.get("interval_seconds", 900)),
         max_items_per_scan=int(data.get("max_items_per_scan", 100)),
         concurrency=int(data.get("concurrency", 1)),
+        playback_info_timeout_seconds=float(data.get("playback_info_timeout_seconds", 15.0)),
     )
 
 
@@ -320,6 +346,18 @@ def _path_mappings(values: Any) -> tuple[PathMapping, ...]:
     return tuple(mappings)
 
 
+def _openlist(data: dict[str, Any]) -> OpenListConfig:
+    token = data.get("token")
+    password = data.get("password")
+    return OpenListConfig(
+        enabled=bool(data.get("enabled", False)),
+        base_url=str(data.get("base_url", "")).rstrip("/"),
+        token=None if token is None or token == "" else str(token),
+        password="" if password is None else str(password),
+        timeout_seconds=float(data.get("timeout_seconds", 10.0)),
+    )
+
+
 def load_config(path: str | Path) -> Config:
     raw = json.loads(Path(path).read_text())
     return Config(
@@ -329,7 +367,9 @@ def load_config(path: str | Path) -> Config:
         listen_host=str(raw.get("listen_host", "127.0.0.1")),
         listen_port=int(raw.get("listen_port", 18180)),
         prewarm_api_key=raw.get("prewarm_api_key"),
+        playback_info_timeout_seconds=float(raw.get("playback_info_timeout_seconds", 15.0)),
         path_mappings=_path_mappings(raw.get("path_mappings")),
+        openlist=_openlist(raw.get("openlist", {})),
         rollout=_rollout(raw.get("rollout", {})),
         cache=_cache(raw.get("cache", {})),
         prewarm=_prewarm(raw.get("prewarm", {})),

@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from aiohttp import ClientError, ClientSession
+from aiohttp import ClientError, ClientSession, ClientTimeout
 
 from .cache import HeadTailCache, adaptive_head_tail, cache_key
 from .config import Config
 from .models import ByteRange, MediaSource, SourceMetadata
+from .openlist import resolve_openlist_media_source
 from .origin import OriginClient, OriginError
 from .prefetch import BandwidthLimiter
 from .sources import resolve_media_source
@@ -33,7 +34,8 @@ class PrewarmWorker:
         if not self.config.prewarm.enabled or not self.config.prewarm_api_key:
             return PrewarmResult(scanned=0, prewarmed=0, skipped=0)
 
-        async with ClientSession() as session:
+        timeout = ClientTimeout(total=self.config.prewarm.playback_info_timeout_seconds)
+        async with ClientSession(timeout=timeout) as session:
             items = await self._recent_items(session)
             prewarmed = 0
             skipped = 0
@@ -69,6 +71,7 @@ class PrewarmWorker:
                         self.config.path_mappings,
                         url_prefix_allowlist=self.config.rollout.path_prefix_allowlist,
                     )
+                    source = await resolve_openlist_media_source(source, self.config.openlist)
                     if not self.config.rollout.in_scope(
                         item_id=source.item_id,
                         media_source_id=source.media_source_id,
@@ -96,7 +99,8 @@ class PrewarmWorker:
         if not self.config.prewarm_api_key:
             return PrewarmResult(scanned=0, prewarmed=0, skipped=1)
 
-        async with ClientSession() as session:
+        timeout = ClientTimeout(total=self.config.prewarm.playback_info_timeout_seconds)
+        async with ClientSession(timeout=timeout) as session:
             raw_sources = await self._raw_media_sources(
                 session,
                 item_id,
@@ -114,6 +118,7 @@ class PrewarmWorker:
                     self.config.path_mappings,
                     url_prefix_allowlist=self.config.rollout.path_prefix_allowlist,
                 )
+                source = await resolve_openlist_media_source(source, self.config.openlist)
                 if not self.config.rollout.in_scope(
                     item_id=source.item_id,
                     media_source_id=source.media_source_id,
