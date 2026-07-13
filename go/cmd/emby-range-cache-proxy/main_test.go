@@ -85,6 +85,9 @@ func TestPrintEffectiveConfigRedactsSecretAndIncludesDefaults(t *testing.T) {
 	if cache["head_bytes"].(float64) != 8*1024*1024 || cache["tail_bytes"].(float64) != 8*1024*1024 {
 		t.Fatalf("cache head/tail=%v/%v", cache["head_bytes"], cache["tail_bytes"])
 	}
+	if cache["adaptive_tail_max_bytes"].(float64) != 0 {
+		t.Fatalf("cache adaptive tail max=%v", cache["adaptive_tail_max_bytes"])
+	}
 	prewarm := payload["prewarm"].(map[string]any)
 	if prewarm["interval_seconds"].(float64) != 900 {
 		t.Fatalf("prewarm.interval_seconds=%v", prewarm["interval_seconds"])

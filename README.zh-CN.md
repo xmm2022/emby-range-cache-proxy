@@ -55,6 +55,32 @@ make check-config CONFIG=/etc/emby-range-cache-proxy/config.json
 
 如果媒体源走 OpenList，配置 `openlist.enabled=true`、`openlist.base_url`，需要鉴权时再填 `openlist.token`。`.strm` 里可以写 `openlist:///Movies/movie.mkv`，并把 OpenList 地址（例如 `http://127.0.0.1:5244/`）加入 `rollout.path_prefix_allowlist`。
 
+## 直接边缘路径
+
+Go 服务还可以直接处理稳定的媒体路径，避免每个媒体 Range 请求都再次查询 Emby `PlaybackInfo`：
+
+- `direct_openlist` 把受控路径前缀映射到 OpenList，通过 `/api/fs/get` 刷新下载地址并使用返回的可信文件大小，然后进入统一的 head/tail 和中段缓存流程。
+- `direct_http` 把受控路径前缀映射到固定 HTTP(S) 上游，适合 Google API Proxy 或其他内网源站。
+
+两个功能默认关闭。服务仍应监听 loopback，或放在带鉴权/签名验证的反向代理之后；直接路径本身不等价于用户鉴权。
+
+```json
+{
+  "direct_openlist": {
+    "enabled": true,
+    "path_prefix": "/openlist/",
+    "token": "replace-with-a-long-random-secret"
+  },
+  "direct_http": {
+    "enabled": true,
+    "path_prefix": "/google/",
+    "upstream_base_url": "http://127.0.0.1:18096"
+  }
+}
+```
+
+当容器元数据读取以文件末尾结束、但起点早于固定 tail 块时，`cache.adaptive_tail_max_bytes` 可以扩大尾部缓存；设置为 `0` 即关闭。`open_head_response_bytes_by_extension` 与 `open_initial_response_bytes_by_extension` 可以按容器扩展名调整起播响应大小。
+
 ## systemd 部署
 
 先创建运行用户和缓存目录：
@@ -189,12 +215,17 @@ curl -fsS -X POST http://127.0.0.1:18180/internal/prewarm \
 | `playback_info_timeout_seconds` | 用户播放请求查询 Emby PlaybackInfo 的前台鉴权超时 | 默认 `15`，冷启动慢可调大 |
 | `openlist.enabled` / `openlist.base_url` | 启用 OpenList 源适配并配置 OpenList 地址 | `.strm` 可写 `openlist:///Movies/movie.mkv` |
 | `openlist.token` | 调用 OpenList `/api/fs/get` 的 token | 按 OpenList 原样填，不要加 `Bearer` |
+| `direct_openlist.enabled` / `direct_openlist.path_prefix` | 直接处理受控 OpenList 路径 | 必须置于可信反代之后 |
+| `direct_http.enabled` / `direct_http.upstream_base_url` | 直接处理受控 HTTP 路径并映射到固定上游 | 适合 Google API Proxy 等内网源站 |
 | `rollout.enabled` | 是否启用缓存代理命中范围 | 灰度时设为 `true` |
 | `rollout.item_allowlist` | 只允许指定 item 进入代理逻辑 | 初期只放一两个影片 |
 | `rollout.media_source_allowlist` | 只允许指定 MediaSource | 避免同影片多源误命中 |
 | `rollout.path_prefix_allowlist` | 限制实际源 URL 前缀 | `.strm` 场景必须配置严谨 |
 | `cache.max_bytes` | head/tail 缓存上限 | 按磁盘容量设置 |
 | `cache.head_bytes` / `cache.tail_bytes` | 起播头部块和尾部元数据块大小 | 默认各 `8388608` |
+| `cache.adaptive_tail_max_bytes` | 文件尾部元数据跨出固定 tail 时允许扩展的最大缓存 | `0` 表示关闭，启用值不能小于 `tail_bytes` |
+| `cache.open_head_response_bytes_by_extension` | 按扩展名设置无结束位置 Range 的响应大小 | 键名可写 `mp4` 或 `.mp4` |
+| `cache.open_initial_response_bytes_by_extension` | 按扩展名设置从 0 开始的开放 Range 响应大小 | 用于特定容器起播调优 |
 | `prewarm.concurrency` | 内部预热并发 | 建议从 `1` 开始 |
 | `prewarm.playback_info_timeout_seconds` | 内部预热查询 Emby PlaybackInfo 的超时 | 默认 `15`，与前台播放鉴权超时分开 |
 | `session.enabled` | 记录播放会话 | Phase 2 功能，默认关闭 |

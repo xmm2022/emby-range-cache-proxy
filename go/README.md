@@ -9,6 +9,17 @@ It is an independent Go module under `go/` so the Python service can stay in pla
 - `{cache_dir}/{key}/mid/{start}-{end}.bin`
 - `{cache_dir}/state/phase2.sqlite3`
 
+The current Go runtime additionally supports:
+
+- controlled `direct_openlist` paths with OpenList `/api/fs/get` URL refresh and trusted file-size reuse
+- controlled `direct_http` paths mapped to a fixed HTTP(S) origin such as a Google API proxy
+- adaptive tail blocks for container metadata reads that extend beyond the fixed tail cache
+- per-extension open-range response sizing
+- client-disconnect-safe cache builds: completed cache data is retained even when the response writer disconnects
+
+Direct paths are origin adapters, not user authentication. Keep the listener on
+loopback or place it behind a trusted authentication/signature layer.
+
 ## Build
 
 ```bash

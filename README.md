@@ -43,6 +43,43 @@ For OpenList-backed `.strm` sources, set `openlist.enabled=true`,
 Then add that OpenList base URL to `rollout.path_prefix_allowlist`; `.strm`
 entries can use `openlist:///Movies/movie.mkv`.
 
+### Direct edge paths
+
+The Go runtime can also serve stable edge paths without an Emby `PlaybackInfo`
+round trip on every media request:
+
+- `direct_openlist` maps a controlled path prefix to OpenList. It refreshes the
+  file URL through `/api/fs/get`, trusts the returned file size, and then uses
+  the shared head/tail and middle-cache pipeline.
+- `direct_http` maps a controlled path prefix to a fixed HTTP(S) upstream, which
+  is useful for a Google API proxy or another private origin.
+
+Both modes are disabled by default. Keep the service on loopback or behind an
+authenticated/signature-verifying reverse proxy; a direct path is not a user
+authorization mechanism by itself.
+
+```json
+{
+  "direct_openlist": {
+    "enabled": true,
+    "path_prefix": "/openlist/",
+    "token": "replace-with-a-long-random-secret"
+  },
+  "direct_http": {
+    "enabled": true,
+    "path_prefix": "/google/",
+    "upstream_base_url": "http://127.0.0.1:18096"
+  }
+}
+```
+
+The cache can expand a tail block up to `cache.adaptive_tail_max_bytes` when a
+container metadata read ends at EOF but starts before the fixed tail block.
+`open_head_response_bytes_by_extension` and
+`open_initial_response_bytes_by_extension` allow startup response sizes to be
+tuned per container extension. Set `adaptive_tail_max_bytes` to `0` to disable
+adaptive tails.
+
 ### 2. Build and test the Go binary
 
 ```bash

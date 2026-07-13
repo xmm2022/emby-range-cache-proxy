@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -91,6 +92,7 @@ type ConfigSummary struct {
 	CacheDir               string `json:"cache_dir"`
 	RolloutEnabled         bool   `json:"rollout_enabled"`
 	DirectOpenListEnabled  bool   `json:"direct_openlist_enabled"`
+	DirectHTTPEnabled      bool   `json:"direct_http_enabled"`
 	MiddleCacheEnabled     bool   `json:"middle_cache_enabled"`
 	PrefetchEnabled        bool   `json:"prefetch_enabled"`
 	SessionEnabled         bool   `json:"session_enabled"`
@@ -127,6 +129,18 @@ type PrefetchStats struct {
 }
 
 var errPrewarmAlreadyCached = errors.New("prewarm already cached")
+
+type cacheBuildResponseError struct {
+	err error
+}
+
+func (e *cacheBuildResponseError) Error() string {
+	return e.err.Error()
+}
+
+func (e *cacheBuildResponseError) Unwrap() error {
+	return e.err
+}
 
 var accessLogSeq uint64
 
@@ -255,9 +269,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleInternalPrewarm(w, r)
 	case s.isDirectOpenListRequest(r):
 		s.handleDirectOpenList(w, r)
+	case s.isDirectHTTPRequest(r):
+		s.handleDirectHTTP(w, r)
 	default:
 		s.proxyHandler(w, r)
 	}
+}
+
+func (s *Server) isDirectHTTPRequest(r *http.Request) bool {
+	if !s.cfg.DirectHTTP.Enabled {
+		return false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	return strings.HasPrefix(r.URL.Path, s.cfg.DirectHTTP.PathPrefix)
 }
 
 func (s *Server) isDirectOpenListRequest(r *http.Request) bool {
@@ -315,6 +341,7 @@ func writeMetrics(w io.Writer, stats Stats) {
 
 	writeMetric(w, "emby_range_cache_proxy_rollout_enabled", boolMetric(stats.Config.RolloutEnabled))
 	writeMetric(w, "emby_range_cache_proxy_direct_openlist_enabled", boolMetric(stats.Config.DirectOpenListEnabled))
+	writeMetric(w, "emby_range_cache_proxy_direct_http_enabled", boolMetric(stats.Config.DirectHTTPEnabled))
 	writeMetric(w, "emby_range_cache_proxy_middle_cache_enabled", boolMetric(stats.Config.MiddleCacheEnabled))
 	writeMetric(w, "emby_range_cache_proxy_prefetch_enabled", boolMetric(stats.Config.PrefetchEnabled))
 	writeMetric(w, "emby_range_cache_proxy_session_enabled", boolMetric(stats.Config.SessionEnabled))
@@ -346,6 +373,7 @@ func (s *Server) SnapshotStats() Stats {
 		CacheDir:               s.cfg.CacheDir,
 		RolloutEnabled:         s.cfg.Rollout.Enabled,
 		DirectOpenListEnabled:  s.cfg.DirectOpenList.Enabled,
+		DirectHTTPEnabled:      s.cfg.DirectHTTP.Enabled,
 		MiddleCacheEnabled:     s.cfg.MiddleCache.Enabled,
 		PrefetchEnabled:        s.cfg.Prefetch.Enabled,
 		SessionEnabled:         s.cfg.Session.Enabled,
@@ -460,6 +488,89 @@ func (s *Server) handleDirectOpenList(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleDirectHTTP(w http.ResponseWriter, r *http.Request) {
+	trace := newAccessLogEvent(r)
+	aw := &accessLogResponseWriter{ResponseWriter: w}
+	defer s.logAccess(trace, aw)
+
+	upstreamURL, err := s.directHTTPUpstreamURL(r)
+	if err != nil {
+		trace.route = "direct_http_error"
+		trace.err = errorClass(err)
+		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+		http.Error(aw, "invalid source path", http.StatusBadRequest)
+		return
+	}
+	ctx := directHTTPRequestContext(r, upstreamURL)
+	trace.itemID = ctx.ItemID
+	trace.mediaSourceID = ctx.MediaSourceID
+	sourceMedia := model.MediaSource{
+		ItemID:        ctx.ItemID,
+		MediaSourceID: ctx.MediaSourceID,
+		Path:          upstreamURL,
+		Protocol:      "Http",
+	}
+	if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace); served {
+		return
+	} else if err != nil {
+		trace.route = "direct_http_error"
+		trace.err = errorClass(err)
+		s.addError("direct http cache probe failed: " + errorClass(err))
+		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+		http.Error(aw, "cache unavailable", http.StatusBadGateway)
+		return
+	}
+	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace); err != nil {
+		trace.err = errorClass(err)
+		s.addError("direct http proxy failed: " + errorClass(err))
+		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+		http.Error(aw, "proxy error", http.StatusBadGateway)
+	}
+}
+
+func (s *Server) directHTTPUpstreamURL(r *http.Request) (string, error) {
+	prefix := s.cfg.DirectHTTP.PathPrefix
+	escapedPath := r.URL.EscapedPath()
+	if !strings.HasPrefix(escapedPath, prefix) {
+		return "", fmt.Errorf("path prefix mismatch")
+	}
+	relative, err := url.PathUnescape(strings.TrimPrefix(escapedPath, prefix))
+	if err != nil {
+		return "", err
+	}
+	if relative == "" {
+		return "", fmt.Errorf("empty source path")
+	}
+	for _, segment := range strings.Split(relative, "/") {
+		if segment == "." || segment == ".." {
+			return "", fmt.Errorf("invalid source path")
+		}
+	}
+	base, err := url.Parse(s.cfg.DirectHTTP.UpstreamBaseURL)
+	if err != nil {
+		return "", err
+	}
+	base.Path = strings.TrimRight(base.Path, "/") + "/" + strings.TrimLeft(relative, "/")
+	base.RawPath = ""
+	base.RawQuery = r.URL.RawQuery
+	return base.String(), nil
+}
+
+func directHTTPRequestContext(r *http.Request, upstreamURL string) model.RequestContext {
+	sum := sha256.Sum256([]byte(upstreamURL))
+	mediaSourceID := "direct_http_" + hex.EncodeToString(sum[:8])
+	parsed, _ := url.Parse(upstreamURL)
+	ext := strings.TrimPrefix(pathpkg.Ext(parsed.Path), ".")
+	return model.RequestContext{
+		Method:        r.Method,
+		RawPath:       r.URL.RequestURI(),
+		ItemID:        "direct_http",
+		MediaSourceID: mediaSourceID,
+		Token:         "direct_http",
+		Extension:     strings.ToLower(ext),
+	}
+}
+
 func requestContainsDirectOpenListToken(r *http.Request, token string) bool {
 	if token == "" {
 		return false
@@ -560,7 +671,7 @@ func (s *Server) prewarmItem(itemID, mediaSourceID string) error {
 	if !isHTTP(sourceMedia.Path) || !s.cfg.Rollout.InScope(itemID, mediaSourceID, sourceMedia.Path) {
 		return fmt.Errorf("source out of scope")
 	}
-	meta, err := s.origin.Head(sourceMedia.Path)
+	meta, err := s.sourceMetadata(sourceMedia)
 	if err != nil {
 		return err
 	}
@@ -726,14 +837,12 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 	if served, err := s.serveCachedHeadTailIfAvailable(w, r, sourceMedia, ctx, trace); served || err != nil {
 		return err
 	}
-	s.originSem <- struct{}{}
-	meta, err := s.origin.Head(sourceMedia.Path)
-	<-s.originSem
+	meta, err := s.sourceMetadata(sourceMedia)
 	if err != nil {
 		return err
 	}
 	headSize, tailSize := s.headTailBytes(meta.Size)
-	byteRange, err := ranges.PlanPlaybackRange(r.Header.Get("Range"), meta.Size, headSize, tailSize, s.cfg.Cache.DefaultOpenRangeBytes, s.cfg.Cache.OpenHeadResponseBytes)
+	byteRange, err := ranges.PlanPlaybackRange(r.Header.Get("Range"), meta.Size, headSize, tailSize, s.cfg.Cache.DefaultOpenRangeBytes, s.openHeadResponseBytes(ctx.Extension, r.Header.Get("Range")))
 	if err != nil {
 		if errors.Is(err, ranges.ErrRangeNotSatisfiable) {
 			setAccessRoute(trace, "range_unsatisfiable")
@@ -773,7 +882,13 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 		}
 		s.addStat(func(stats *Stats) { stats.Counters.MiddleMiss++ })
 	}
-	blockName, blockRange := headtail.BlockForRequest(byteRange, meta.Size, headSize, tailSize)
+	blockName, blockRange, adaptiveTail := s.cacheBlockForRequest(byteRange, meta.Size, headSize, tailSize)
+	cacheRoute := "head_tail_cache"
+	buildRoute := "head_tail_build"
+	if adaptiveTail {
+		cacheRoute = "adaptive_tail_cache"
+		buildRoute = "adaptive_tail_build"
+	}
 	if blockName != "" {
 		chunks, err := s.cache.IterBlock(key, blockName, byteRange, s.cfg.Cache.ChunkBytes)
 		if err != nil {
@@ -781,7 +896,7 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 		}
 		if chunks != nil {
 			s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
-			setAccessRoute(trace, "head_tail_cache")
+			setAccessRoute(trace, cacheRoute)
 			w.WriteHeader(status)
 			if err := writeChunks(w, chunks, func() {
 				s.recordSession(ctx, key, meta, byteRange)
@@ -801,7 +916,7 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 			}
 			if chunks != nil {
 				s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
-				setAccessRoute(trace, "head_tail_cache")
+				setAccessRoute(trace, cacheRoute)
 				w.WriteHeader(status)
 				if err := writeChunks(w, chunks, func() {
 					s.recordSession(ctx, key, meta, byteRange)
@@ -833,7 +948,7 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 			if chunks != nil {
 				buildLock.release()
 				s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
-				setAccessRoute(trace, "head_tail_cache")
+				setAccessRoute(trace, cacheRoute)
 				w.WriteHeader(status)
 				if err := writeChunks(w, chunks, func() {
 					s.recordSession(ctx, key, meta, byteRange)
@@ -846,9 +961,19 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 			}
 		}
 		defer buildLock.release()
-		setAccessRoute(trace, "head_tail_build")
+		setAccessRoute(trace, buildRoute)
 		w.WriteHeader(status)
 		if err := s.buildHeadTailBlock(sourceMedia.Path, meta, key, blockName, blockRange, byteRange, w); err != nil {
+			var responseErr *cacheBuildResponseError
+			if errors.As(err, &responseErr) {
+				setAccessError(trace, responseErr.err)
+				s.addError("cache build response failed: " + errorClass(responseErr.err))
+				s.addStat(func(stats *Stats) {
+					stats.Counters.CacheBuild++
+					stats.Counters.ProxyErrors++
+				})
+				return nil
+			}
 			setAccessError(trace, err)
 			s.addError("cache build stream failed: " + errorClass(err))
 			s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
@@ -881,7 +1006,7 @@ func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.R
 	}
 	meta := sourceMetadataFromRecord(record)
 	headSize, tailSize := s.headTailBytes(meta.Size)
-	byteRange, err := ranges.PlanPlaybackRange(r.Header.Get("Range"), meta.Size, headSize, tailSize, s.cfg.Cache.DefaultOpenRangeBytes, s.cfg.Cache.OpenHeadResponseBytes)
+	byteRange, err := ranges.PlanPlaybackRange(r.Header.Get("Range"), meta.Size, headSize, tailSize, s.cfg.Cache.DefaultOpenRangeBytes, s.openHeadResponseBytes(ctx.Extension, r.Header.Get("Range")))
 	if err != nil {
 		if errors.Is(err, ranges.ErrRangeNotSatisfiable) {
 			setAccessRoute(trace, "range_unsatisfiable")
@@ -890,9 +1015,13 @@ func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.R
 		}
 		return false, err
 	}
-	blockName, _ := headtail.BlockForRequest(byteRange, meta.Size, headSize, tailSize)
+	blockName, _, adaptiveTail := s.cacheBlockForRequest(byteRange, meta.Size, headSize, tailSize)
 	if blockName == "" {
 		return false, nil
+	}
+	cacheRoute := "head_tail_cache"
+	if adaptiveTail {
+		cacheRoute = "adaptive_tail_cache"
 	}
 	status := responseStatus(r, byteRange, meta)
 	if r.Method == http.MethodHead {
@@ -901,7 +1030,7 @@ func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.R
 			return false, err
 		}
 		s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
-		setAccessRoute(trace, "head_tail_cache")
+		setAccessRoute(trace, cacheRoute)
 		writeRangeHeaders(w, status, byteRange, meta)
 		w.WriteHeader(status)
 		return true, nil
@@ -911,7 +1040,7 @@ func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.R
 		return false, err
 	}
 	s.addStat(func(stats *Stats) { stats.Counters.CacheHit++ })
-	setAccessRoute(trace, "head_tail_cache")
+	setAccessRoute(trace, cacheRoute)
 	writeRangeHeaders(w, status, byteRange, meta)
 	w.WriteHeader(status)
 	if err := writeChunks(w, chunks, func() {
@@ -922,6 +1051,32 @@ func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.R
 		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
 	}
 	return true, nil
+}
+
+func (s *Server) cacheBlockForRequest(byteRange model.ByteRange, size, headSize, tailSize int64) (string, model.ByteRange, bool) {
+	blockName, blockRange := headtail.BlockForRequest(byteRange, size, headSize, tailSize)
+	if blockName != "" {
+		return blockName, blockRange, false
+	}
+	maxBytes := s.cfg.Cache.AdaptiveTailMaxBytes
+	if maxBytes <= tailSize || byteRange.End != size-1 {
+		return "", model.ByteRange{}, false
+	}
+	maxStart := size - maxBytes
+	if maxStart < 0 {
+		maxStart = 0
+	}
+	if byteRange.Start < maxStart {
+		return "", model.ByteRange{}, false
+	}
+	baseStart := size - tailSize
+	if baseStart < 0 {
+		baseStart = 0
+	}
+	if byteRange.Start < baseStart {
+		baseStart = byteRange.Start
+	}
+	return "tail", model.ByteRange{Start: baseStart, End: size - 1}, true
 }
 
 func responseStatus(r *http.Request, byteRange model.ByteRange, meta model.SourceMetadata) int {
@@ -969,11 +1124,6 @@ func (s *Server) buildHeadTailBlock(sourceURL string, meta model.SourceMetadata,
 			return fmt.Errorf("insufficient disk free space")
 		}
 	}
-	body, err := s.origin.OpenRange(meta.URL, blockRange, meta.Size)
-	if err != nil {
-		return err
-	}
-	defer body.Close()
 	writer, err := s.cache.StageBlock(key, blockName, blockRange)
 	if err != nil {
 		return err
@@ -981,49 +1131,106 @@ func (s *Server) buildHeadTailBlock(sourceURL string, meta model.SourceMetadata,
 	defer writer.Abort()
 	buf := make([]byte, int(s.cfg.Cache.ChunkBytes))
 	offset := blockRange.Start
+	resumeAttempts := 0
 	var responseWriter io.Writer
+	var responseErr error
 	if len(writers) > 0 {
 		responseWriter = writers[0]
 	}
-	for {
-		n, readErr := body.Read(buf)
-		if n > 0 {
-			chunk := buf[:n]
-			if responseWriter == nil && s.cfg.Prefetch.BandwidthBytesPerSecond > 0 {
-				time.Sleep(time.Duration(int64(n) * int64(time.Second) / s.cfg.Prefetch.BandwidthBytesPerSecond))
+	for offset <= blockRange.End {
+		body, openErr := s.origin.OpenRange(meta.URL, model.ByteRange{Start: offset, End: blockRange.End}, meta.Size)
+		if openErr != nil {
+			resumeAttempts++
+			if resumeAttempts > 3 {
+				return openErr
 			}
-			if _, err := writer.Write(chunk); err != nil {
-				return err
-			}
-			if responseWriter != nil && responseRange.End >= responseRange.Start {
-				chunkStart := offset
-				chunkEnd := offset + int64(n) - 1
-				overlapStart := maxInt64(chunkStart, responseRange.Start)
-				overlapEnd := minInt64(chunkEnd, responseRange.End)
-				if overlapStart <= overlapEnd {
-					start := overlapStart - chunkStart
-					end := overlapEnd - chunkStart + 1
-					if _, err := responseWriter.Write(chunk[start:end]); err != nil {
-						return err
-					}
-					if flusher, ok := responseWriter.(http.Flusher); ok {
-						flusher.Flush()
+			time.Sleep(time.Duration(resumeAttempts) * 250 * time.Millisecond)
+			continue
+		}
+		startOffset := offset
+		var readErr error
+		for offset <= blockRange.End {
+			n, err := body.Read(buf)
+			if n > 0 {
+				chunk := buf[:n]
+				if responseWriter == nil && s.cfg.Prefetch.BandwidthBytesPerSecond > 0 {
+					time.Sleep(time.Duration(int64(n) * int64(time.Second) / s.cfg.Prefetch.BandwidthBytesPerSecond))
+				}
+				if _, err := writer.Write(chunk); err != nil {
+					return err
+				}
+				if responseWriter != nil && responseRange.End >= responseRange.Start {
+					chunkStart := offset
+					chunkEnd := offset + int64(n) - 1
+					overlapStart := maxInt64(chunkStart, responseRange.Start)
+					overlapEnd := minInt64(chunkEnd, responseRange.End)
+					if overlapStart <= overlapEnd {
+						start := overlapStart - chunkStart
+						end := overlapEnd - chunkStart + 1
+						if _, err := responseWriter.Write(chunk[start:end]); err != nil {
+							responseErr = err
+							responseWriter = nil
+						} else if flusher, ok := responseWriter.(http.Flusher); ok {
+							flusher.Flush()
+						}
 					}
 				}
+				offset += int64(n)
 			}
-			offset += int64(n)
+			if err != nil {
+				readErr = err
+				break
+			}
 		}
-		if readErr == io.EOF {
+		_ = body.Close()
+		if offset > blockRange.End {
 			break
 		}
-		if readErr != nil {
+		if readErr == nil || readErr == io.EOF {
+			readErr = io.ErrUnexpectedEOF
+		}
+		if offset > startOffset {
+			resumeAttempts = 0
+		} else {
+			resumeAttempts++
+		}
+		if resumeAttempts > 3 {
 			return readErr
 		}
+		time.Sleep(time.Duration(resumeAttempts+1) * 250 * time.Millisecond)
 	}
 	if err := writer.Commit(); err != nil {
 		return err
 	}
-	return s.cache.EvictIfNeeded()
+	if err := s.cache.EvictIfNeeded(); err != nil {
+		return err
+	}
+	if responseErr != nil {
+		return &cacheBuildResponseError{err: responseErr}
+	}
+	return nil
+}
+
+func (s *Server) sourceMetadata(source model.MediaSource) (model.SourceMetadata, error) {
+	if source.SizeTrusted && source.Size != nil && *source.Size > 0 {
+		return model.SourceMetadata{
+			URL:         source.Path,
+			Size:        *source.Size,
+			ContentType: inferredContentType(source.Path),
+		}, nil
+	}
+	s.originSem <- struct{}{}
+	meta, err := s.origin.Head(source.Path)
+	<-s.originSem
+	return meta, err
+}
+
+func inferredContentType(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return ""
+	}
+	return mime.TypeByExtension(pathpkg.Ext(parsed.Path))
 }
 
 func (s *Server) streamOriginRange(url string, meta model.SourceMetadata, byteRange model.ByteRange, w io.Writer) error {
@@ -1038,6 +1245,19 @@ func (s *Server) streamOriginRange(url string, meta model.SourceMetadata, byteRa
 
 func (s *Server) headTailBytes(size int64) (int64, int64) {
 	return ranges.ConfiguredHeadTail(size, s.cfg.Cache.HeadBytes, s.cfg.Cache.TailBytes)
+}
+
+func (s *Server) openHeadResponseBytes(extension, rangeHeader string) *int64 {
+	normalized := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(extension)), ".")
+	if strings.TrimSpace(rangeHeader) == "bytes=0-" {
+		if value, ok := s.cfg.Cache.OpenInitialResponseBytesByExtension[normalized]; ok {
+			return &value
+		}
+	}
+	if value, ok := s.cfg.Cache.OpenHeadResponseBytesByExtension[normalized]; ok {
+		return &value
+	}
+	return s.cfg.Cache.OpenHeadResponseBytes
 }
 
 type cacheBuildLock struct {

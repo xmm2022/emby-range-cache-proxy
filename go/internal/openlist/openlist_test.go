@@ -79,6 +79,9 @@ func TestResolveUsesFSGetSign(t *testing.T) {
 	if resolved.Path != want || resolved.Protocol != "Http" {
 		t.Fatalf("resolved = %+v want path %q", resolved, want)
 	}
+	if resolved.Size == nil || *resolved.Size != 123 || !resolved.SizeTrusted {
+		t.Fatalf("resolved size = %v trusted=%v", resolved.Size, resolved.SizeTrusted)
+	}
 }
 
 func TestResolveFallsBackToRawURL(t *testing.T) {
@@ -102,5 +105,8 @@ func TestResolveFallsBackToRawURL(t *testing.T) {
 
 	if resolved.Path != server.URL+"/p/Movies/a.mkv?sign=proxy" {
 		t.Fatalf("resolved = %+v", resolved)
+	}
+	if resolved.Size == nil || *resolved.Size != 123 || !resolved.SizeTrusted {
+		t.Fatalf("resolved size = %v trusted=%v", resolved.Size, resolved.SizeTrusted)
 	}
 }
