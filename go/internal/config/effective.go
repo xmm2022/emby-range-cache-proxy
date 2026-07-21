@@ -19,6 +19,7 @@ type EffectiveConfig struct {
 	OpenList                    EffectiveOpenList       `json:"openlist"`
 	DirectOpenList              EffectiveDirectOpenList `json:"direct_openlist"`
 	DirectHTTP                  EffectiveDirectHTTP     `json:"direct_http"`
+	DirectCache                 EffectiveDirectCache    `json:"direct_cache"`
 	Rollout                     EffectiveRollout        `json:"rollout"`
 	Cache                       EffectiveCache          `json:"cache"`
 	Prewarm                     EffectivePrewarm        `json:"prewarm"`
@@ -50,6 +51,10 @@ type EffectiveDirectHTTP struct {
 	Enabled         bool   `json:"enabled"`
 	PathPrefix      string `json:"path_prefix"`
 	UpstreamBaseURL string `json:"upstream_base_url"`
+}
+
+type EffectiveDirectCache struct {
+	RequireEligibility bool `json:"require_eligibility"`
 }
 
 type EffectiveRollout struct {
@@ -185,6 +190,9 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			Enabled:         cfg.DirectHTTP.Enabled,
 			PathPrefix:      cfg.DirectHTTP.PathPrefix,
 			UpstreamBaseURL: cfg.DirectHTTP.UpstreamBaseURL,
+		},
+		DirectCache: EffectiveDirectCache{
+			RequireEligibility: cfg.DirectCache.RequireEligibility,
 		},
 		Rollout: EffectiveRollout{
 			Enabled:              cfg.Rollout.Enabled,

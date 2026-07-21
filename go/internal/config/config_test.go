@@ -57,6 +57,9 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 	if cfg.DirectHTTP.Enabled || cfg.DirectHTTP.PathPrefix != "/http/" {
 		t.Fatalf("direct http defaults = %+v", cfg.DirectHTTP)
 	}
+	if cfg.DirectCache.RequireEligibility {
+		t.Fatalf("direct cache defaults = %+v", cfg.DirectCache)
+	}
 	if cfg.Cache.MaxBytes != 512*1024*1024*1024 {
 		t.Fatalf("cache max bytes = %d", cfg.Cache.MaxBytes)
 	}
@@ -122,6 +125,9 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 			"enabled":           true,
 			"path_prefix":       "google",
 			"upstream_base_url": "http://127.0.0.1:18096/",
+		},
+		"direct_cache": map[string]any{
+			"require_eligibility": true,
 		},
 		"rollout": map[string]any{
 			"enabled":                    true,
@@ -207,6 +213,9 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	}
 	if !cfg.DirectHTTP.Enabled || cfg.DirectHTTP.PathPrefix != "/google/" || cfg.DirectHTTP.UpstreamBaseURL != "http://127.0.0.1:18096" {
 		t.Fatalf("direct http = %+v", cfg.DirectHTTP)
+	}
+	if !cfg.DirectCache.RequireEligibility {
+		t.Fatalf("direct cache = %+v", cfg.DirectCache)
 	}
 	if !cfg.Rollout.InScope("1", "ms1", "http://127.0.0.1:18096/a.mkv") {
 		t.Fatalf("expected rollout in scope")

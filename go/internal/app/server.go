@@ -93,6 +93,7 @@ type ConfigSummary struct {
 	RolloutEnabled         bool   `json:"rollout_enabled"`
 	DirectOpenListEnabled  bool   `json:"direct_openlist_enabled"`
 	DirectHTTPEnabled      bool   `json:"direct_http_enabled"`
+	DirectCacheEligibility bool   `json:"direct_cache_require_eligibility"`
 	MiddleCacheEnabled     bool   `json:"middle_cache_enabled"`
 	PrefetchEnabled        bool   `json:"prefetch_enabled"`
 	SessionEnabled         bool   `json:"session_enabled"`
@@ -129,6 +130,8 @@ type PrefetchStats struct {
 }
 
 var errPrewarmAlreadyCached = errors.New("prewarm already cached")
+
+const directCacheEligibilityHeader = "X-Range-Cache-Eligible"
 
 type cacheBuildResponseError struct {
 	err error
@@ -374,6 +377,7 @@ func (s *Server) SnapshotStats() Stats {
 		RolloutEnabled:         s.cfg.Rollout.Enabled,
 		DirectOpenListEnabled:  s.cfg.DirectOpenList.Enabled,
 		DirectHTTPEnabled:      s.cfg.DirectHTTP.Enabled,
+		DirectCacheEligibility: s.cfg.DirectCache.RequireEligibility,
 		MiddleCacheEnabled:     s.cfg.MiddleCache.Enabled,
 		PrefetchEnabled:        s.cfg.Prefetch.Enabled,
 		SessionEnabled:         s.cfg.Session.Enabled,
@@ -460,15 +464,18 @@ func (s *Server) handleDirectOpenList(w http.ResponseWriter, r *http.Request) {
 		Path:          "openlist://" + openListPath,
 		Protocol:      "OpenList",
 	}
-	if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace); served {
-		return
-	} else if err != nil {
-		trace.route = "direct_openlist_error"
-		trace.err = errorClass(err)
-		s.addError("direct openlist cache probe failed: " + errorClass(err))
-		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
-		http.Error(aw, "cache unavailable", http.StatusBadGateway)
-		return
+	cacheEligible := s.directCacheEligible(r)
+	if cacheEligible {
+		if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace); served {
+			return
+		} else if err != nil {
+			trace.route = "direct_openlist_error"
+			trace.err = errorClass(err)
+			s.addError("direct openlist cache probe failed: " + errorClass(err))
+			s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+			http.Error(aw, "cache unavailable", http.StatusBadGateway)
+			return
+		}
 	}
 	sourceMedia = s.openList.Resolve(r.Context(), sourceMedia)
 	if !isHTTP(sourceMedia.Path) {
@@ -479,7 +486,7 @@ func (s *Server) handleDirectOpenList(w http.ResponseWriter, r *http.Request) {
 		http.Error(aw, "openlist unavailable", http.StatusBadGateway)
 		return
 	}
-	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace); err != nil {
+	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace, cacheEligible); err != nil {
 		trace.err = errorClass(err)
 		s.addError("direct openlist proxy failed: " + errorClass(err))
 		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
@@ -510,17 +517,20 @@ func (s *Server) handleDirectHTTP(w http.ResponseWriter, r *http.Request) {
 		Path:          upstreamURL,
 		Protocol:      "Http",
 	}
-	if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace); served {
-		return
-	} else if err != nil {
-		trace.route = "direct_http_error"
-		trace.err = errorClass(err)
-		s.addError("direct http cache probe failed: " + errorClass(err))
-		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
-		http.Error(aw, "cache unavailable", http.StatusBadGateway)
-		return
+	cacheEligible := s.directCacheEligible(r)
+	if cacheEligible {
+		if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace); served {
+			return
+		} else if err != nil {
+			trace.route = "direct_http_error"
+			trace.err = errorClass(err)
+			s.addError("direct http cache probe failed: " + errorClass(err))
+			s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+			http.Error(aw, "cache unavailable", http.StatusBadGateway)
+			return
+		}
 	}
-	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace); err != nil {
+	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace, cacheEligible); err != nil {
 		trace.err = errorClass(err)
 		s.addError("direct http proxy failed: " + errorClass(err))
 		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
@@ -569,6 +579,16 @@ func directHTTPRequestContext(r *http.Request, upstreamURL string) model.Request
 		Token:         "direct_http",
 		Extension:     strings.ToLower(ext),
 	}
+}
+
+func (s *Server) directCacheEligible(r *http.Request) bool {
+	if !s.cfg.DirectCache.RequireEligibility {
+		return true
+	}
+	if strings.TrimSpace(r.Header.Get(directCacheEligibilityHeader)) == "1" {
+		return true
+	}
+	return s.cfg.PrewarmAPIKey != "" && requestContainsInternalKey(r, s.cfg.PrewarmAPIKey)
 }
 
 func requestContainsDirectOpenListToken(r *http.Request, token string) bool {
@@ -766,7 +786,7 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		s.streamFallback(aw, r)
 		return
 	}
-	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace); err != nil {
+	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace, true); err != nil {
 		trace.err = errorClass(err)
 		s.addError("proxy failed: " + errorClass(err))
 		s.addStat(func(stats *Stats) {
@@ -833,9 +853,11 @@ func (s *Server) authorizePlayback(ctx model.RequestContext, trace *accessLogEve
 	return sourceMedia, nil
 }
 
-func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext, trace *accessLogEvent) error {
-	if served, err := s.serveCachedHeadTailIfAvailable(w, r, sourceMedia, ctx, trace); served || err != nil {
-		return err
+func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext, trace *accessLogEvent, cacheEligible bool) error {
+	if cacheEligible {
+		if served, err := s.serveCachedHeadTailIfAvailable(w, r, sourceMedia, ctx, trace); served || err != nil {
+			return err
+		}
 	}
 	meta, err := s.sourceMetadata(sourceMedia)
 	if err != nil {
@@ -851,15 +873,30 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 		}
 		return err
 	}
-	key := cache.Key(sourceMedia, meta)
-	_ = s.store.UpsertSourceMetadataRecord(sourceMetadataRecord(ctx.ItemID, ctx.MediaSourceID, key, meta, float64(time.Now().Unix())))
 	status := http.StatusOK
 	if r.Header.Get("Range") != "" || byteRange.Start != 0 || byteRange.End != meta.Size-1 {
 		status = http.StatusPartialContent
 	}
+	key := ""
+	if cacheEligible {
+		key = cache.Key(sourceMedia, meta)
+		_ = s.store.UpsertSourceMetadataRecord(sourceMetadataRecord(ctx.ItemID, ctx.MediaSourceID, key, meta, float64(time.Now().Unix())))
+	}
 	writeRangeHeaders(w, status, byteRange, meta)
 	if r.Method == http.MethodHead {
 		w.WriteHeader(status)
+		return nil
+	}
+	if !cacheEligible {
+		setAccessRoute(trace, "origin_no_cache")
+		w.WriteHeader(status)
+		if err := s.streamOriginRange(meta.URL, meta, byteRange, w); err != nil {
+			setAccessError(trace, err)
+			s.addError("no-cache origin stream failed: " + errorClass(err))
+			s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+			return nil
+		}
+		s.addStat(func(stats *Stats) { stats.Counters.Origin++ })
 		return nil
 	}
 	if s.cfg.MiddleCache.Enabled {

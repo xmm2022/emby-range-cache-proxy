@@ -525,6 +525,7 @@ func TestDirectOpenListEndpointBuildsAndHitsCache(t *testing.T) {
 	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
 	cfg.OpenList = config.OpenListConfig{Enabled: true, BaseURL: openList.URL, TimeoutSeconds: 1}
 	cfg.DirectOpenList = config.DirectOpenListConfig{Enabled: true, PathPrefix: "/openlist/", Token: "direct-secret"}
+	cfg.DirectCache.RequireEligibility = true
 	server, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -534,6 +535,7 @@ func TestDirectOpenListEndpointBuildsAndHitsCache(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv?token=direct-secret", nil)
 		req.Header.Set("Range", "bytes=0-3")
+		req.Header.Set(directCacheEligibilityHeader, "1")
 		rec := httptest.NewRecorder()
 		server.ServeHTTP(rec, req)
 		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
@@ -632,6 +634,83 @@ func TestDirectHTTPEndpointBuildsAndHitsCache(t *testing.T) {
 	stats := server.SnapshotStats()
 	if stats.Counters.CacheBuild != 1 || stats.Counters.CacheHit != 1 {
 		t.Fatalf("counters=%+v", stats.Counters)
+	}
+}
+
+func TestDirectHTTPEndpointWithoutEligibilityAlwaysStreamsOrigin(t *testing.T) {
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	originHeads := 0
+	originGets := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			originHeads++
+			w.Header().Set("Content-Length", "26")
+			w.Header().Set("Content-Type", "video/mp4")
+		case http.MethodGet:
+			originGets++
+			if got := r.Header.Get("Range"); got != "bytes=0-3" {
+				t.Fatalf("origin range = %q", got)
+			}
+			w.Header().Set("Content-Range", "bytes 0-3/26")
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("Content-Type", "video/mp4")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(originBody[:4])
+		default:
+			t.Fatalf("method = %s", r.Method)
+		}
+	}))
+	defer origin.Close()
+
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.DirectHTTP = config.DirectHTTPConfig{Enabled: true, PathPrefix: "/google/", UpstreamBaseURL: origin.URL}
+	cfg.DirectCache.RequireEligibility = true
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/google/movie.mp4", nil)
+		req.Header.Set("Range", "bytes=0-3")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+			t.Fatalf("iter=%d code=%d body=%q", i, rec.Code, rec.Body.String())
+		}
+	}
+	if originHeads != 2 || originGets != 2 {
+		t.Fatalf("originHeads=%d originGets=%d", originHeads, originGets)
+	}
+	stats := server.SnapshotStats()
+	if stats.Counters.CacheBuild != 0 || stats.Counters.CacheHit != 0 || stats.Counters.Origin != 2 {
+		t.Fatalf("counters=%+v", stats.Counters)
+	}
+}
+
+func TestDirectCacheEligibilityAcceptsSignedPlaybackOrAuthenticatedPrewarm(t *testing.T) {
+	server := &Server{cfg: config.Config{
+		PrewarmAPIKey: "prewarm-secret",
+		DirectCache:   config.DirectCacheConfig{RequireEligibility: true},
+	}}
+
+	plain := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
+	if server.directCacheEligible(plain) {
+		t.Fatal("plain direct request unexpectedly eligible")
+	}
+
+	playback := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
+	playback.Header.Set(directCacheEligibilityHeader, "1")
+	if !server.directCacheEligible(playback) {
+		t.Fatal("signed playback marker was not accepted")
+	}
+
+	prewarm := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
+	prewarm.Header.Set("X-Range-Cache-Prewarm-Key", "prewarm-secret")
+	if !server.directCacheEligible(prewarm) {
+		t.Fatal("authenticated prewarm was not accepted")
 	}
 }
 

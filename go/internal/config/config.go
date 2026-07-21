@@ -26,6 +26,7 @@ type Config struct {
 	OpenList                    OpenListConfig
 	DirectOpenList              DirectOpenListConfig
 	DirectHTTP                  DirectHTTPConfig
+	DirectCache                 DirectCacheConfig
 	Rollout                     RolloutConfig
 	Cache                       CacheConfig
 	Prewarm                     PrewarmConfig
@@ -57,6 +58,13 @@ type DirectHTTPConfig struct {
 	Enabled         bool
 	PathPrefix      string
 	UpstreamBaseURL string
+}
+
+// DirectCacheConfig controls whether direct source routes may use the cache.
+// When eligibility is required, the reverse proxy must explicitly mark trusted
+// playback requests, while authenticated prewarm requests remain eligible.
+type DirectCacheConfig struct {
+	RequireEligibility bool
 }
 
 type RolloutConfig struct {
@@ -258,6 +266,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 		return Config{}, err
 	}
 	if err := parseDirectHTTP(raw["direct_http"], &cfg.DirectHTTP); err != nil {
+		return Config{}, err
+	}
+	if err := parseDirectCache(raw["direct_cache"], &cfg.DirectCache); err != nil {
 		return Config{}, err
 	}
 	if cfg.Rollout, err = parseRollout(raw["rollout"]); err != nil {
@@ -491,6 +502,17 @@ func parseDirectHTTP(value any, cfg *DirectHTTPConfig) error {
 		return err
 	}
 	cfg.UpstreamBaseURL = strings.TrimRight(cfg.UpstreamBaseURL, "/")
+	return nil
+}
+
+func parseDirectCache(value any, cfg *DirectCacheConfig) error {
+	data, err := object(value, "direct_cache")
+	if err != nil {
+		return err
+	}
+	if cfg.RequireEligibility, err = boolFieldDefault(data, "require_eligibility", cfg.RequireEligibility); err != nil {
+		return err
+	}
 	return nil
 }
 

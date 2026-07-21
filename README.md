@@ -69,9 +69,21 @@ authorization mechanism by itself.
     "enabled": true,
     "path_prefix": "/google/",
     "upstream_base_url": "http://127.0.0.1:18096"
+  },
+  "direct_cache": {
+    "require_eligibility": true
   }
 }
 ```
+
+With `direct_cache.require_eligibility=true`, direct source requests use the
+head/tail and middle caches only when the trusted reverse proxy adds
+`X-Range-Cache-Eligible: 1`, or when the caller supplies a valid
+`X-Range-Cache-Prewarm-Key`. Requests without either credential still stream
+the requested origin range, but they do not read cache blocks, write metadata,
+build blocks, or record a playback session. Strip the eligibility header on
+raw STRM routes and set it only after signature verification on playback
+routes. This keeps ffprobe and screenshot reads separate from explicit prewarm.
 
 The cache can expand a tail block up to `cache.adaptive_tail_max_bytes` when a
 container metadata read ends at EOF but starts before the fixed tail block.

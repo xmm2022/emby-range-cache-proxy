@@ -29,6 +29,9 @@
     "path_prefix": "/google/",
     "upstream_base_url": "http://127.0.0.1:18096"
   },
+  "direct_cache": {
+    "require_eligibility": false
+  },
   "rollout": {
     "enabled": false,
     "item_allowlist": [],
