@@ -103,6 +103,7 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 		"listen_port":                     19090,
 		"cache_dir":                       filepath.Join(t.TempDir(), "cache"),
 		"prewarm_api_key":                 "secret",
+		"control_api_key":                 "control-secret",
 		"playback_info_timeout_seconds":   11,
 		"playback_auth_cache_ttl_seconds": 7,
 		"path_mappings": []map[string]any{
@@ -201,6 +202,9 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	}
 	if cfg.PlaybackAuthCacheTTLSeconds != 7 {
 		t.Fatalf("playback auth cache ttl = %d", cfg.PlaybackAuthCacheTTLSeconds)
+	}
+	if cfg.ControlAPIKey != "control-secret" {
+		t.Fatalf("control api key = %q", cfg.ControlAPIKey)
 	}
 	if len(cfg.PathMappings) != 2 || cfg.PathMappings[0].SourcePrefix != "/strm/" || cfg.PathMappings[1].SourcePrefix != "/media/" {
 		t.Fatalf("path mappings = %+v", cfg.PathMappings)

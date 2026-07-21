@@ -23,6 +23,7 @@ Copy `config.example.json` to the host config path, usually
   "listen_port": 18180,
   "cache_dir": "/home/nax/emby/cache/range-proxy",
   "prewarm_api_key": "replace-with-a-long-random-secret",
+  "control_api_key": "replace-with-a-different-long-random-secret",
   "playback_info_timeout_seconds": 15,
   "rollout": {
     "enabled": true,
@@ -269,6 +270,23 @@ Request body:
 The endpoint returns `202` with `queued` for a new in-process prewarm task and `existing` when the same item/source is already queued or running. The task queries Emby PlaybackInfo with the internal key using `prewarm.playback_info_timeout_seconds`, resolves mapped `.strm` files only when the resolved URL matches `rollout.path_prefix_allowlist`, skips already-complete head/tail cache blocks, uses `prewarm.concurrency` for in-process concurrency, throttles downloads with `prefetch.bandwidth_bytes_per_second`, and evicts through the head/tail cache capacity policy. This prewarm timeout is separate from the foreground playback authorization timeout.
 
 `prewarm.enabled` only controls the periodic recent-item scanner. Event-triggered prewarm through `/internal/prewarm` requires `prewarm_api_key` but does not require enabling periodic scans.
+
+## Runtime Cache Mode
+
+`GET /internal/cache-mode` returns the persisted runtime mode. `POST` accepts
+`{"mode":"normal"}`, `{"mode":"read_only"}`, or `{"mode":"bypass"}` and
+requires `X-Range-Cache-Control-Key: <control_api_key>` from a loopback caller.
+The mode is stored in the state SQLite database and survives restarts.
+
+- `normal` reads existing blocks and permits cache builds, prewarm, sessions,
+  and background prefetch.
+- `read_only` may serve existing head/tail or middle blocks, but cache misses
+  stream from origin and no new blocks or sessions are written.
+- `bypass` ignores all cache blocks. Direct routes stream from origin, ordinary
+  Emby proxy routes fall back to Emby, and authenticated prewarm receives `409`.
+
+Expose the control endpoint only through a TLS reverse proxy with a source-IP
+restriction. Do not reuse `prewarm_api_key` as `control_api_key`.
 
 ## Caddy Fallback Boundary
 

@@ -67,6 +67,7 @@ type Server struct {
 	prewarmMu    sync.Mutex
 	prewarmTasks map[string]struct{}
 	prewarmSem   chan struct{}
+	cacheMode    atomic.Int32
 }
 
 type Stats struct {
@@ -94,6 +95,7 @@ type ConfigSummary struct {
 	DirectOpenListEnabled  bool   `json:"direct_openlist_enabled"`
 	DirectHTTPEnabled      bool   `json:"direct_http_enabled"`
 	DirectCacheEligibility bool   `json:"direct_cache_require_eligibility"`
+	CacheMode              string `json:"cache_mode"`
 	MiddleCacheEnabled     bool   `json:"middle_cache_enabled"`
 	PrefetchEnabled        bool   `json:"prefetch_enabled"`
 	SessionEnabled         bool   `json:"session_enabled"`
@@ -132,6 +134,45 @@ type PrefetchStats struct {
 var errPrewarmAlreadyCached = errors.New("prewarm already cached")
 
 const directCacheEligibilityHeader = "X-Range-Cache-Eligible"
+
+const cacheModeSettingKey = "cache_mode"
+
+type cacheMode int32
+
+const (
+	cacheModeNormal cacheMode = iota
+	cacheModeReadOnly
+	cacheModeBypass
+)
+
+func parseCacheMode(value string) (cacheMode, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "normal":
+		return cacheModeNormal, true
+	case "read_only", "readonly":
+		return cacheModeReadOnly, true
+	case "bypass", "off":
+		return cacheModeBypass, true
+	default:
+		return cacheModeNormal, false
+	}
+}
+
+func (m cacheMode) String() string {
+	switch m {
+	case cacheModeReadOnly:
+		return "read_only"
+	case cacheModeBypass:
+		return "bypass"
+	default:
+		return "normal"
+	}
+}
+
+type cacheAccess struct {
+	read  bool
+	write bool
+}
 
 type cacheBuildResponseError struct {
 	err error
@@ -252,6 +293,18 @@ func New(cfg config.Config) (*Server, error) {
 		prewarmTasks:    make(map[string]struct{}),
 		prewarmSem:      make(chan struct{}, prewarmConcurrency),
 	}
+	mode := cacheModeNormal
+	if value, ok, err := store.RuntimeSetting(cacheModeSettingKey); err != nil {
+		store.Close()
+		return nil, err
+	} else if ok {
+		if parsed, valid := parseCacheMode(value); valid {
+			mode = parsed
+		} else {
+			log.Printf("invalid persisted cache mode %q; using normal", value)
+		}
+	}
+	server.cacheMode.Store(int32(mode))
 	server.middle = middle.NewCache(cfg.CacheDir, store, cfg.MiddleCache.MaxBytes, cfg.MiddleCache.TTLSeconds, cfg.MiddleCache.MinFreeBytes)
 	return server, nil
 }
@@ -270,6 +323,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleMetrics(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/internal/prewarm":
 		s.handleInternalPrewarm(w, r)
+	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && r.URL.Path == "/internal/cache-mode":
+		s.handleCacheMode(w, r)
 	case s.isDirectOpenListRequest(r):
 		s.handleDirectOpenList(w, r)
 	case s.isDirectHTTPRequest(r):
@@ -277,6 +332,49 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.proxyHandler(w, r)
 	}
+}
+
+func (s *Server) currentCacheMode() cacheMode {
+	return cacheMode(s.cacheMode.Load())
+}
+
+func (s *Server) setCacheMode(mode cacheMode) error {
+	if err := s.store.SetRuntimeSetting(cacheModeSettingKey, mode.String(), float64(time.Now().Unix())); err != nil {
+		return err
+	}
+	s.cacheMode.Store(int32(mode))
+	return nil
+}
+
+func (s *Server) handleCacheMode(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.ControlAPIKey == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if !isInternalCaller(r) || !requestContainsControlKey(r, s.cfg.ControlAPIKey) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if r.Method == http.MethodPost {
+		var payload struct {
+			Mode string `json:"mode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		mode, ok := parseCacheMode(payload.Mode)
+		if !ok {
+			http.Error(w, "invalid cache mode", http.StatusBadRequest)
+			return
+		}
+		if err := s.setCacheMode(mode); err != nil {
+			http.Error(w, "failed to persist cache mode", http.StatusInternalServerError)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"mode": s.currentCacheMode().String()})
 }
 
 func (s *Server) isDirectHTTPRequest(r *http.Request) bool {
@@ -378,6 +476,7 @@ func (s *Server) SnapshotStats() Stats {
 		DirectOpenListEnabled:  s.cfg.DirectOpenList.Enabled,
 		DirectHTTPEnabled:      s.cfg.DirectHTTP.Enabled,
 		DirectCacheEligibility: s.cfg.DirectCache.RequireEligibility,
+		CacheMode:              s.currentCacheMode().String(),
 		MiddleCacheEnabled:     s.cfg.MiddleCache.Enabled,
 		PrefetchEnabled:        s.cfg.Prefetch.Enabled,
 		SessionEnabled:         s.cfg.Session.Enabled,
@@ -415,6 +514,10 @@ func (s *Server) handleInternalPrewarm(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	if s.currentCacheMode() != cacheModeNormal {
+		http.Error(w, "range cache is not writable", http.StatusConflict)
+		return
+	}
 	var payload struct {
 		ItemID        string `json:"itemId"`
 		ItemIDAlt     string `json:"item_id"`
@@ -441,6 +544,10 @@ func (s *Server) handleDirectOpenList(w http.ResponseWriter, r *http.Request) {
 	trace := newAccessLogEvent(r)
 	aw := &accessLogResponseWriter{ResponseWriter: w}
 	defer s.logAccess(trace, aw)
+	if s.rejectDisabledPrewarm(aw, r) {
+		trace.route = "prewarm_disabled"
+		return
+	}
 	if !requestContainsDirectOpenListToken(r, s.cfg.DirectOpenList.Token) {
 		trace.route = "denied"
 		s.addStat(func(stats *Stats) { stats.Counters.Denied++ })
@@ -464,9 +571,9 @@ func (s *Server) handleDirectOpenList(w http.ResponseWriter, r *http.Request) {
 		Path:          "openlist://" + openListPath,
 		Protocol:      "OpenList",
 	}
-	cacheEligible := s.directCacheEligible(r)
-	if cacheEligible {
-		if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace); served {
+	cacheAccess := s.directCacheAccess(r)
+	if cacheAccess.read {
+		if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace, cacheAccess.write); served {
 			return
 		} else if err != nil {
 			trace.route = "direct_openlist_error"
@@ -486,7 +593,7 @@ func (s *Server) handleDirectOpenList(w http.ResponseWriter, r *http.Request) {
 		http.Error(aw, "openlist unavailable", http.StatusBadGateway)
 		return
 	}
-	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace, cacheEligible); err != nil {
+	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace, cacheAccess); err != nil {
 		trace.err = errorClass(err)
 		s.addError("direct openlist proxy failed: " + errorClass(err))
 		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
@@ -499,6 +606,10 @@ func (s *Server) handleDirectHTTP(w http.ResponseWriter, r *http.Request) {
 	trace := newAccessLogEvent(r)
 	aw := &accessLogResponseWriter{ResponseWriter: w}
 	defer s.logAccess(trace, aw)
+	if s.rejectDisabledPrewarm(aw, r) {
+		trace.route = "prewarm_disabled"
+		return
+	}
 
 	upstreamURL, err := s.directHTTPUpstreamURL(r)
 	if err != nil {
@@ -517,9 +628,9 @@ func (s *Server) handleDirectHTTP(w http.ResponseWriter, r *http.Request) {
 		Path:          upstreamURL,
 		Protocol:      "Http",
 	}
-	cacheEligible := s.directCacheEligible(r)
-	if cacheEligible {
-		if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace); served {
+	cacheAccess := s.directCacheAccess(r)
+	if cacheAccess.read {
+		if served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace, cacheAccess.write); served {
 			return
 		} else if err != nil {
 			trace.route = "direct_http_error"
@@ -530,7 +641,7 @@ func (s *Server) handleDirectHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace, cacheEligible); err != nil {
+	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace, cacheAccess); err != nil {
 		trace.err = errorClass(err)
 		s.addError("direct http proxy failed: " + errorClass(err))
 		s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
@@ -581,14 +692,31 @@ func directHTTPRequestContext(r *http.Request, upstreamURL string) model.Request
 	}
 }
 
-func (s *Server) directCacheEligible(r *http.Request) bool {
-	if !s.cfg.DirectCache.RequireEligibility {
-		return true
+func (s *Server) directCacheAccess(r *http.Request) cacheAccess {
+	eligible := !s.cfg.DirectCache.RequireEligibility ||
+		strings.TrimSpace(r.Header.Get(directCacheEligibilityHeader)) == "1" ||
+		(s.cfg.PrewarmAPIKey != "" && requestContainsInternalKey(r, s.cfg.PrewarmAPIKey))
+	if !eligible {
+		return cacheAccess{}
 	}
-	if strings.TrimSpace(r.Header.Get(directCacheEligibilityHeader)) == "1" {
-		return true
+	switch s.currentCacheMode() {
+	case cacheModeNormal:
+		return cacheAccess{read: true, write: true}
+	case cacheModeReadOnly:
+		return cacheAccess{read: true}
+	default:
+		return cacheAccess{}
 	}
-	return s.cfg.PrewarmAPIKey != "" && requestContainsInternalKey(r, s.cfg.PrewarmAPIKey)
+}
+
+func (s *Server) rejectDisabledPrewarm(w http.ResponseWriter, r *http.Request) bool {
+	if s.currentCacheMode() == cacheModeNormal ||
+		s.cfg.PrewarmAPIKey == "" ||
+		!requestContainsInternalKey(r, s.cfg.PrewarmAPIKey) {
+		return false
+	}
+	http.Error(w, "range cache is not writable", http.StatusConflict)
+	return true
 }
 
 func requestContainsDirectOpenListToken(r *http.Request, token string) bool {
@@ -644,6 +772,9 @@ func directOpenListRequestContext(r *http.Request, openListPath string) model.Re
 }
 
 func (s *Server) enqueuePrewarm(itemID, mediaSourceID string) string {
+	if s.currentCacheMode() != cacheModeNormal {
+		return "disabled"
+	}
 	key := itemID + "\x00" + mediaSourceID
 	s.prewarmMu.Lock()
 	if _, exists := s.prewarmTasks[key]; exists {
@@ -681,6 +812,9 @@ func (s *Server) enqueuePrewarm(itemID, mediaSourceID string) string {
 }
 
 func (s *Server) prewarmItem(itemID, mediaSourceID string) error {
+	if s.currentCacheMode() != cacheModeNormal {
+		return fmt.Errorf("range cache is not writable")
+	}
 	ctx := model.RequestContext{Method: http.MethodGet, ItemID: itemID, MediaSourceID: mediaSourceID, Token: s.cfg.PrewarmAPIKey}
 	sourceMedia, err := s.prewarmAuth.Authorize(ctx)
 	if err != nil {
@@ -706,6 +840,9 @@ func (s *Server) prewarmItem(itemID, mediaSourceID string) error {
 	}
 	warmed := false
 	for _, item := range toWarm {
+		if s.currentCacheMode() != cacheModeNormal {
+			return fmt.Errorf("range cache is not writable")
+		}
 		cached, err := s.cache.IterBlock(key, item.name, item.rng, s.cfg.Cache.ChunkBytes)
 		if err != nil {
 			return err
@@ -740,6 +877,12 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		trace.itemID = ctx.ItemID
 		trace.mediaSourceID = ctx.MediaSourceID
 	}
+	if s.currentCacheMode() == cacheModeBypass {
+		trace.route = "cache_bypass"
+		s.addStat(func(stats *Stats) { stats.Counters.Fallback++ })
+		s.streamFallback(aw, r)
+		return
+	}
 	if !ok || !s.preAuthRollout(ctx) {
 		trace.route = "fallback"
 		s.addStat(func(stats *Stats) { stats.Counters.Fallback++ })
@@ -762,8 +905,9 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sourceMedia = source.ResolveMediaSource(sourceMedia, s.cfg.PathMappings, s.cfg.Rollout.PathPrefixAllowlist)
-	if s.canServeCachedBeforeOriginResolution(ctx, sourceMedia) {
-		served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace)
+	access := cacheAccess{read: true, write: s.currentCacheMode() == cacheModeNormal}
+	if access.read && s.canServeCachedBeforeOriginResolution(ctx, sourceMedia) {
+		served, err := s.serveCachedHeadTailIfAvailable(aw, r, sourceMedia, ctx, trace, access.write)
 		if served {
 			return
 		}
@@ -786,7 +930,7 @@ func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		s.streamFallback(aw, r)
 		return
 	}
-	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace, true); err != nil {
+	if err := s.serveAuthorizedRange(aw, r, sourceMedia, ctx, trace, access); err != nil {
 		trace.err = errorClass(err)
 		s.addError("proxy failed: " + errorClass(err))
 		s.addStat(func(stats *Stats) {
@@ -853,9 +997,9 @@ func (s *Server) authorizePlayback(ctx model.RequestContext, trace *accessLogEve
 	return sourceMedia, nil
 }
 
-func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext, trace *accessLogEvent, cacheEligible bool) error {
-	if cacheEligible {
-		if served, err := s.serveCachedHeadTailIfAvailable(w, r, sourceMedia, ctx, trace); served || err != nil {
+func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext, trace *accessLogEvent, access cacheAccess) error {
+	if access.read {
+		if served, err := s.serveCachedHeadTailIfAvailable(w, r, sourceMedia, ctx, trace, access.write); served || err != nil {
 			return err
 		}
 	}
@@ -878,8 +1022,10 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 		status = http.StatusPartialContent
 	}
 	key := ""
-	if cacheEligible {
+	if access.read || access.write {
 		key = cache.Key(sourceMedia, meta)
+	}
+	if access.write {
 		_ = s.store.UpsertSourceMetadataRecord(sourceMetadataRecord(ctx.ItemID, ctx.MediaSourceID, key, meta, float64(time.Now().Unix())))
 	}
 	writeRangeHeaders(w, status, byteRange, meta)
@@ -887,19 +1033,7 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 		w.WriteHeader(status)
 		return nil
 	}
-	if !cacheEligible {
-		setAccessRoute(trace, "origin_no_cache")
-		w.WriteHeader(status)
-		if err := s.streamOriginRange(meta.URL, meta, byteRange, w); err != nil {
-			setAccessError(trace, err)
-			s.addError("no-cache origin stream failed: " + errorClass(err))
-			s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
-			return nil
-		}
-		s.addStat(func(stats *Stats) { stats.Counters.Origin++ })
-		return nil
-	}
-	if s.cfg.MiddleCache.Enabled {
+	if access.read && s.cfg.MiddleCache.Enabled {
 		chunks, err := s.middle.IterBlock(key, byteRange, s.cfg.Cache.ChunkBytes, float64(time.Now().Unix()))
 		if err == nil && chunks != nil {
 			s.addStat(func(stats *Stats) {
@@ -909,7 +1043,9 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 			setAccessRoute(trace, "middle_cache")
 			w.WriteHeader(status)
 			if err := writeChunks(w, chunks, func() {
-				s.recordSession(ctx, key, meta, byteRange)
+				if access.write {
+					s.recordSession(ctx, key, meta, byteRange)
+				}
 			}); err != nil {
 				setAccessError(trace, err)
 				s.addError("middle cache response failed: " + errorClass(err))
@@ -918,6 +1054,22 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 			return nil
 		}
 		s.addStat(func(stats *Stats) { stats.Counters.MiddleMiss++ })
+	}
+	if !access.write {
+		route := "origin_no_cache"
+		if access.read {
+			route = "origin_read_only"
+		}
+		setAccessRoute(trace, route)
+		w.WriteHeader(status)
+		if err := s.streamOriginRange(meta.URL, meta, byteRange, w); err != nil {
+			setAccessError(trace, err)
+			s.addError("non-writable origin stream failed: " + errorClass(err))
+			s.addStat(func(stats *Stats) { stats.Counters.ProxyErrors++ })
+			return nil
+		}
+		s.addStat(func(stats *Stats) { stats.Counters.Origin++ })
+		return nil
 	}
 	blockName, blockRange, adaptiveTail := s.cacheBlockForRequest(byteRange, meta.Size, headSize, tailSize)
 	cacheRoute := "head_tail_cache"
@@ -1033,7 +1185,7 @@ func (s *Server) serveAuthorizedRange(w http.ResponseWriter, r *http.Request, so
 	return nil
 }
 
-func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext, trace *accessLogEvent) (bool, error) {
+func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.Request, sourceMedia model.MediaSource, ctx model.RequestContext, trace *accessLogEvent, recordSession bool) (bool, error) {
 	record, err := s.store.LatestSourceMetadata(ctx.ItemID, ctx.MediaSourceID)
 	if err != nil || record == nil {
 		return false, err
@@ -1081,7 +1233,9 @@ func (s *Server) serveCachedHeadTailIfAvailable(w http.ResponseWriter, r *http.R
 	writeRangeHeaders(w, status, byteRange, meta)
 	w.WriteHeader(status)
 	if err := writeChunks(w, chunks, func() {
-		s.recordSession(ctx, record.CacheKey, meta, byteRange)
+		if recordSession {
+			s.recordSession(ctx, record.CacheKey, meta, byteRange)
+		}
 	}); err != nil {
 		setAccessError(trace, err)
 		s.addError("cache response failed: " + errorClass(err))
@@ -1543,6 +1697,13 @@ func requestContainsInternalKey(r *http.Request, internalKey string) bool {
 	return false
 }
 
+func requestContainsControlKey(r *http.Request, controlKey string) bool {
+	if controlKey == "" {
+		return false
+	}
+	return subtleEqual(strings.TrimSpace(r.Header.Get("X-Range-Cache-Control-Key")), controlKey)
+}
+
 func authorizationBearerMatches(value, internalKey string) bool {
 	scheme, token, ok := strings.Cut(value, " ")
 	return ok && strings.EqualFold(scheme, "Bearer") && subtleEqual(token, internalKey)
@@ -1731,6 +1892,9 @@ func (s *Server) sessionPlannerLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if s.currentCacheMode() != cacheModeNormal {
+				continue
+			}
 			now := float64(time.Now().Unix())
 			if s.cfg.Session.ObserverEnabled {
 				_ = s.observeSessions(now)
@@ -1770,6 +1934,9 @@ func (s *Server) prefetchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if s.currentCacheMode() != cacheModeNormal {
+				continue
+			}
 			if s.cfg.Prefetch.PauseWhenRolloutSessionActive {
 				active, _ := s.store.RecentActiveSessions(float64(time.Now().Unix()), s.cfg.Session.IdleSeconds)
 				if len(active) > 0 {
@@ -1797,6 +1964,9 @@ func (s *Server) prewarmScanLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if s.currentCacheMode() != cacheModeNormal {
+				continue
+			}
 			if err := s.prewarmRecentItems(); err != nil {
 				s.addError("prewarm scan failed: " + errorClass(err))
 			}
@@ -1805,7 +1975,7 @@ func (s *Server) prewarmScanLoop(ctx context.Context) {
 }
 
 func (s *Server) prewarmRecentItems() error {
-	if s.cfg.PrewarmAPIKey == "" {
+	if s.cfg.PrewarmAPIKey == "" || s.currentCacheMode() != cacheModeNormal {
 		return nil
 	}
 	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(s.cfg.EmbyBaseURL, "/")+"/Items", nil)

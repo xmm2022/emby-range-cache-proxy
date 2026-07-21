@@ -697,20 +697,143 @@ func TestDirectCacheEligibilityAcceptsSignedPlaybackOrAuthenticatedPrewarm(t *te
 	}}
 
 	plain := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
-	if server.directCacheEligible(plain) {
+	if access := server.directCacheAccess(plain); access.read || access.write {
 		t.Fatal("plain direct request unexpectedly eligible")
 	}
 
 	playback := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
 	playback.Header.Set(directCacheEligibilityHeader, "1")
-	if !server.directCacheEligible(playback) {
+	if access := server.directCacheAccess(playback); !access.read || !access.write {
 		t.Fatal("signed playback marker was not accepted")
 	}
 
 	prewarm := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
 	prewarm.Header.Set("X-Range-Cache-Prewarm-Key", "prewarm-secret")
-	if !server.directCacheEligible(prewarm) {
+	if access := server.directCacheAccess(prewarm); !access.read || !access.write {
 		t.Fatal("authenticated prewarm was not accepted")
+	}
+}
+
+func TestCacheModeControlPersistsAndRequiresAuthentication(t *testing.T) {
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.ControlAPIKey = "control-secret"
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unauthorized := httptest.NewRequest(http.MethodPost, "/internal/cache-mode", strings.NewReader(`{"mode":"bypass"}`))
+	unauthorized.RemoteAddr = "127.0.0.1:12345"
+	unauthorizedRecorder := httptest.NewRecorder()
+	server.ServeHTTP(unauthorizedRecorder, unauthorized)
+	if unauthorizedRecorder.Code != http.StatusForbidden {
+		t.Fatalf("unauthorized code=%d", unauthorizedRecorder.Code)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/internal/cache-mode", strings.NewReader(`{"mode":"bypass"}`))
+	request.RemoteAddr = "127.0.0.1:12345"
+	request.Header.Set("X-Range-Cache-Control-Key", "control-secret")
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || server.currentCacheMode() != cacheModeBypass {
+		t.Fatalf("code=%d mode=%s body=%q", recorder.Code, server.currentCacheMode(), recorder.Body.String())
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if restarted.currentCacheMode() != cacheModeBypass {
+		t.Fatalf("persisted mode=%s", restarted.currentCacheMode())
+	}
+}
+
+func TestReadOnlyModeHitsExistingHeadButDoesNotBuildMissingHead(t *testing.T) {
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	originGets := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "26")
+			w.Header().Set("Content-Type", "video/mp4")
+		case http.MethodGet:
+			originGets++
+			start, end := 0, 25
+			if r.Header.Get("Range") == "bytes=0-3" {
+				end = 3
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/26", start, end))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(originBody[start : end+1])
+		}
+	}))
+	defer origin.Close()
+
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.DirectHTTP = config.DirectHTTPConfig{Enabled: true, PathPrefix: "/google/", UpstreamBaseURL: origin.URL}
+	cfg.DirectCache.RequireEligibility = true
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	requestRange := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Range", "bytes=0-3")
+		req.Header.Set(directCacheEligibilityHeader, "1")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := requestRange("/google/cached.mp4"); rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+		t.Fatalf("normal code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if stats := server.SnapshotStats().Counters; stats.CacheBuild != 1 {
+		t.Fatalf("normal counters=%+v", stats)
+	}
+	if err := server.setCacheMode(cacheModeReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if rec := requestRange("/google/cached.mp4"); rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+		t.Fatalf("read-only hit code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	before := server.SnapshotStats().Counters
+	if rec := requestRange("/google/missing.mp4"); rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+		t.Fatalf("read-only miss code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	after := server.SnapshotStats().Counters
+	if after.CacheBuild != before.CacheBuild || after.Origin != before.Origin+1 || after.CacheHit != before.CacheHit {
+		t.Fatalf("before=%+v after=%+v originGets=%d", before, after, originGets)
+	}
+}
+
+func TestBypassModeRejectsAuthenticatedPrewarmDirectRequest(t *testing.T) {
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.DirectHTTP = config.DirectHTTPConfig{Enabled: true, PathPrefix: "/google/", UpstreamBaseURL: "http://127.0.0.1:1"}
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if err := server.setCacheMode(cacheModeBypass); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/google/movie.mp4", nil)
+	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("X-Range-Cache-Prewarm-Key", "internal-secret")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code=%d body=%q", rec.Code, rec.Body.String())
 	}
 }
 

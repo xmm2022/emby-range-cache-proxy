@@ -19,12 +19,20 @@ func openTestStore(t *testing.T) *Store {
 
 func TestOpenCreatesPythonCompatibleSchema(t *testing.T) {
 	store := openTestStore(t)
-	for _, table := range []string{"playback_sessions", "prefetch_tasks", "middle_blocks", "source_metadata"} {
+	for _, table := range []string{"playback_sessions", "prefetch_tasks", "middle_blocks", "source_metadata", "runtime_settings"} {
 		var name string
 		err := store.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
 		if err != nil {
 			t.Fatalf("missing table %s: %v", table, err)
 		}
+	}
+
+	if err := store.SetRuntimeSetting("cache_mode", "bypass", 123); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := store.RuntimeSetting("cache_mode")
+	if err != nil || !ok || value != "bypass" {
+		t.Fatalf("runtime setting value=%q ok=%v err=%v", value, ok, err)
 	}
 }
 

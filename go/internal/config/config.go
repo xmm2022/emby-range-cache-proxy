@@ -20,6 +20,7 @@ type Config struct {
 	ListenPort                  int
 	CacheDir                    string
 	PrewarmAPIKey               string
+	ControlAPIKey               string
 	PlaybackInfoTimeoutSeconds  int
 	PlaybackAuthCacheTTLSeconds int
 	PathMappings                []PathMapping
@@ -248,6 +249,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.PrewarmAPIKey, err = stringField(raw, "prewarm_api_key", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.ControlAPIKey, err = stringField(raw, "control_api_key", false); err != nil {
 		return Config{}, err
 	}
 	if cfg.PlaybackInfoTimeoutSeconds, err = intFieldDefault(raw, "playback_info_timeout_seconds", cfg.PlaybackInfoTimeoutSeconds); err != nil {

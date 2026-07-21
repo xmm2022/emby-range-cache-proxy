@@ -13,6 +13,7 @@ type EffectiveConfig struct {
 	ListenPort                  int                     `json:"listen_port"`
 	CacheDir                    string                  `json:"cache_dir"`
 	PrewarmAPIKey               any                     `json:"prewarm_api_key"`
+	ControlAPIKey               any                     `json:"control_api_key"`
 	PlaybackInfoTimeoutSeconds  int                     `json:"playback_info_timeout_seconds"`
 	PlaybackAuthCacheTTLSeconds int                     `json:"playback_auth_cache_ttl_seconds"`
 	PathMappings                []EffectivePathMapping  `json:"path_mappings"`
@@ -132,6 +133,14 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			prewarmKey = "REDACTED"
 		}
 	}
+	controlKey := any(nil)
+	if cfg.ControlAPIKey != "" {
+		if showSecrets {
+			controlKey = cfg.ControlAPIKey
+		} else {
+			controlKey = "REDACTED"
+		}
+	}
 	openListToken := any(nil)
 	if cfg.OpenList.Token != "" {
 		if showSecrets {
@@ -171,6 +180,7 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 		ListenPort:                  cfg.ListenPort,
 		CacheDir:                    cfg.CacheDir,
 		PrewarmAPIKey:               prewarmKey,
+		ControlAPIKey:               controlKey,
 		PlaybackInfoTimeoutSeconds:  cfg.PlaybackInfoTimeoutSeconds,
 		PlaybackAuthCacheTTLSeconds: cfg.PlaybackAuthCacheTTLSeconds,
 		PathMappings:                pathMappings,
