@@ -40,12 +40,16 @@ func (r *Resolver) Resolve(ctx context.Context, source model.MediaSource) model.
 	if !ok {
 		return source
 	}
-	resolvedURL, ok := r.resolveURL(ctx, openListPath)
+	resolvedURL, size, ok := r.resolveURL(ctx, openListPath)
 	if !ok {
 		return source
 	}
 	source.Path = resolvedURL
 	source.Protocol = "Http"
+	if size > 0 {
+		source.Size = &size
+		source.SizeTrusted = true
+	}
 	return source
 }
 
@@ -88,17 +92,17 @@ func PathFromSource(value, baseURL string) (string, bool) {
 	return "", false
 }
 
-func (r *Resolver) resolveURL(ctx context.Context, openListPath string) (string, bool) {
+func (r *Resolver) resolveURL(ctx context.Context, openListPath string) (string, int64, bool) {
 	body, err := json.Marshal(map[string]string{
 		"path":     openListPath,
 		"password": r.cfg.Password,
 	})
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(r.cfg.BaseURL, "/")+"/api/fs/get", bytes.NewReader(body))
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if r.cfg.Token != "" {
@@ -106,11 +110,11 @@ func (r *Resolver) resolveURL(ctx context.Context, openListPath string) (string,
 	}
 	resp, err := r.http.Do(req)
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return "", false
+		return "", 0, false
 	}
 	var payload struct {
 		Code int `json:"code"`
@@ -118,24 +122,25 @@ func (r *Resolver) resolveURL(ctx context.Context, openListPath string) (string,
 			IsDir  bool   `json:"is_dir"`
 			Sign   string `json:"sign"`
 			RawURL string `json:"raw_url"`
+			Size   int64  `json:"size"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", false
+		return "", 0, false
 	}
 	if payload.Code != 0 && payload.Code != http.StatusOK {
-		return "", false
+		return "", 0, false
 	}
 	if payload.Data.IsDir {
-		return "", false
+		return "", 0, false
 	}
 	if payload.Data.Sign != "" {
-		return signedDownloadURL(r.cfg.BaseURL, openListPath, payload.Data.Sign), true
+		return signedDownloadURL(r.cfg.BaseURL, openListPath, payload.Data.Sign), payload.Data.Size, true
 	}
 	if payload.Data.RawURL != "" {
-		return absoluteOpenListURL(r.cfg.BaseURL, payload.Data.RawURL), true
+		return absoluteOpenListURL(r.cfg.BaseURL, payload.Data.RawURL), payload.Data.Size, true
 	}
-	return "", false
+	return "", 0, false
 }
 
 func normalizePath(value string) (string, bool) {

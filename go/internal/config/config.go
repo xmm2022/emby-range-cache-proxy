@@ -20,11 +20,14 @@ type Config struct {
 	ListenPort                  int
 	CacheDir                    string
 	PrewarmAPIKey               string
+	ControlAPIKey               string
 	PlaybackInfoTimeoutSeconds  int
 	PlaybackAuthCacheTTLSeconds int
 	PathMappings                []PathMapping
 	OpenList                    OpenListConfig
 	DirectOpenList              DirectOpenListConfig
+	DirectHTTP                  DirectHTTPConfig
+	DirectCache                 DirectCacheConfig
 	Rollout                     RolloutConfig
 	Cache                       CacheConfig
 	Prewarm                     PrewarmConfig
@@ -50,6 +53,19 @@ type DirectOpenListConfig struct {
 	Enabled    bool
 	PathPrefix string
 	Token      string
+}
+
+type DirectHTTPConfig struct {
+	Enabled         bool
+	PathPrefix      string
+	UpstreamBaseURL string
+}
+
+// DirectCacheConfig controls whether direct source routes may use the cache.
+// When eligibility is required, the reverse proxy must explicitly mark trusted
+// playback requests, while authenticated prewarm requests remain eligible.
+type DirectCacheConfig struct {
+	RequireEligibility bool
 }
 
 type RolloutConfig struct {
@@ -87,13 +103,16 @@ func (r RolloutConfig) InScope(itemID, mediaSourceID, path string) bool {
 }
 
 type CacheConfig struct {
-	MaxBytes              int64
-	BuildWaitSeconds      float64
-	HeadBytes             int64
-	TailBytes             int64
-	ChunkBytes            int64
-	DefaultOpenRangeBytes int64
-	OpenHeadResponseBytes *int64
+	MaxBytes                            int64
+	BuildWaitSeconds                    float64
+	HeadBytes                           int64
+	TailBytes                           int64
+	AdaptiveTailMaxBytes                int64
+	ChunkBytes                          int64
+	DefaultOpenRangeBytes               int64
+	OpenHeadResponseBytes               *int64
+	OpenHeadResponseBytesByExtension    map[string]int64
+	OpenInitialResponseBytesByExtension map[string]int64
 }
 
 type PrewarmConfig struct {
@@ -202,6 +221,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 		DirectOpenList: DirectOpenListConfig{
 			PathPrefix: "/openlist/",
 		},
+		DirectHTTP: DirectHTTPConfig{
+			PathPrefix: "/http/",
+		},
 	}
 
 	var err error
@@ -229,6 +251,9 @@ func parseRaw(raw map[string]any) (Config, error) {
 	if cfg.PrewarmAPIKey, err = stringField(raw, "prewarm_api_key", false); err != nil {
 		return Config{}, err
 	}
+	if cfg.ControlAPIKey, err = stringField(raw, "control_api_key", false); err != nil {
+		return Config{}, err
+	}
 	if cfg.PlaybackInfoTimeoutSeconds, err = intFieldDefault(raw, "playback_info_timeout_seconds", cfg.PlaybackInfoTimeoutSeconds); err != nil {
 		return Config{}, err
 	}
@@ -242,6 +267,12 @@ func parseRaw(raw map[string]any) (Config, error) {
 		return Config{}, err
 	}
 	if err := parseDirectOpenList(raw["direct_openlist"], &cfg.DirectOpenList); err != nil {
+		return Config{}, err
+	}
+	if err := parseDirectHTTP(raw["direct_http"], &cfg.DirectHTTP); err != nil {
+		return Config{}, err
+	}
+	if err := parseDirectCache(raw["direct_cache"], &cfg.DirectCache); err != nil {
 		return Config{}, err
 	}
 	if cfg.Rollout, err = parseRollout(raw["rollout"]); err != nil {
@@ -301,8 +332,32 @@ func (c Config) Validate() error {
 			return fmt.Errorf("direct_openlist.token is required when direct_openlist.enabled=true")
 		}
 	}
+	if c.DirectHTTP.Enabled {
+		if c.DirectHTTP.PathPrefix == "" || !strings.HasPrefix(c.DirectHTTP.PathPrefix, "/") || !strings.HasSuffix(c.DirectHTTP.PathPrefix, "/") {
+			return fmt.Errorf("direct_http.path_prefix must start and end with /")
+		}
+		if !strings.HasPrefix(c.DirectHTTP.UpstreamBaseURL, "http://") && !strings.HasPrefix(c.DirectHTTP.UpstreamBaseURL, "https://") {
+			return fmt.Errorf("direct_http.upstream_base_url must be http or https")
+		}
+	}
 	if c.Cache.MaxBytes <= 0 || c.Cache.BuildWaitSeconds < 0 || c.Cache.HeadBytes <= 0 || c.Cache.TailBytes <= 0 || c.Cache.ChunkBytes <= 0 || c.Cache.DefaultOpenRangeBytes <= 0 {
 		return fmt.Errorf("cache values must be positive")
+	}
+	if c.Cache.AdaptiveTailMaxBytes < 0 || (c.Cache.AdaptiveTailMaxBytes > 0 && c.Cache.AdaptiveTailMaxBytes < c.Cache.TailBytes) {
+		return fmt.Errorf("cache.adaptive_tail_max_bytes must be zero or at least cache.tail_bytes")
+	}
+	if c.Cache.OpenHeadResponseBytes != nil && *c.Cache.OpenHeadResponseBytes <= 0 {
+		return fmt.Errorf("cache.open_head_response_bytes must be positive")
+	}
+	for extension, value := range c.Cache.OpenHeadResponseBytesByExtension {
+		if extension == "" || value <= 0 {
+			return fmt.Errorf("cache.open_head_response_bytes_by_extension values must use non-empty extensions and positive sizes")
+		}
+	}
+	for extension, value := range c.Cache.OpenInitialResponseBytesByExtension {
+		if extension == "" || value <= 0 {
+			return fmt.Errorf("cache.open_initial_response_bytes_by_extension values must use non-empty extensions and positive sizes")
+		}
 	}
 	if c.Prewarm.IntervalSeconds < 60 {
 		return fmt.Errorf("prewarm.interval_seconds must be >= 60")
@@ -427,6 +482,44 @@ func parseDirectOpenList(value any, cfg *DirectOpenListConfig) error {
 	return nil
 }
 
+func parseDirectHTTP(value any, cfg *DirectHTTPConfig) error {
+	data, err := object(value, "direct_http")
+	if err != nil {
+		return err
+	}
+	if cfg.Enabled, err = boolFieldDefault(data, "enabled", cfg.Enabled); err != nil {
+		return err
+	}
+	if cfg.PathPrefix, err = stringFieldDefault(data, "path_prefix", cfg.PathPrefix); err != nil {
+		return err
+	}
+	if cfg.PathPrefix == "" {
+		cfg.PathPrefix = "/http/"
+	}
+	if !strings.HasPrefix(cfg.PathPrefix, "/") {
+		cfg.PathPrefix = "/" + cfg.PathPrefix
+	}
+	if !strings.HasSuffix(cfg.PathPrefix, "/") {
+		cfg.PathPrefix += "/"
+	}
+	if cfg.UpstreamBaseURL, err = stringFieldDefault(data, "upstream_base_url", cfg.UpstreamBaseURL); err != nil {
+		return err
+	}
+	cfg.UpstreamBaseURL = strings.TrimRight(cfg.UpstreamBaseURL, "/")
+	return nil
+}
+
+func parseDirectCache(value any, cfg *DirectCacheConfig) error {
+	data, err := object(value, "direct_cache")
+	if err != nil {
+		return err
+	}
+	if cfg.RequireEligibility, err = boolFieldDefault(data, "require_eligibility", cfg.RequireEligibility); err != nil {
+		return err
+	}
+	return nil
+}
+
 func parseCache(value any, cfg *CacheConfig) error {
 	data, err := object(value, "cache")
 	if err != nil {
@@ -444,6 +537,9 @@ func parseCache(value any, cfg *CacheConfig) error {
 	if cfg.TailBytes, err = int64FieldDefault(data, "tail_bytes", cfg.TailBytes); err != nil {
 		return err
 	}
+	if cfg.AdaptiveTailMaxBytes, err = int64FieldDefault(data, "adaptive_tail_max_bytes", cfg.AdaptiveTailMaxBytes); err != nil {
+		return err
+	}
 	if cfg.ChunkBytes, err = int64FieldDefault(data, "chunk_bytes", cfg.ChunkBytes); err != nil {
 		return err
 	}
@@ -457,7 +553,39 @@ func parseCache(value any, cfg *CacheConfig) error {
 		}
 		cfg.OpenHeadResponseBytes = &parsed
 	}
+	if value, ok := data["open_head_response_bytes_by_extension"]; ok && value != nil {
+		cfg.OpenHeadResponseBytesByExtension, err = parseExtensionByteMap(value, "cache.open_head_response_bytes_by_extension")
+		if err != nil {
+			return err
+		}
+	}
+	if value, ok := data["open_initial_response_bytes_by_extension"]; ok && value != nil {
+		cfg.OpenInitialResponseBytesByExtension, err = parseExtensionByteMap(value, "cache.open_initial_response_bytes_by_extension")
+		if err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func parseExtensionByteMap(value any, name string) (map[string]int64, error) {
+	values, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an object", name)
+	}
+	out := make(map[string]int64, len(values))
+	for extension, raw := range values {
+		normalized := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(extension)), ".")
+		if normalized == "" {
+			return nil, fmt.Errorf("%s contains an empty extension", name)
+		}
+		parsed, err := int64FromAny(raw, name+"."+extension)
+		if err != nil {
+			return nil, err
+		}
+		out[normalized] = parsed
+	}
+	return out, nil
 }
 
 func parsePrewarm(value any, cfg *PrewarmConfig) error {

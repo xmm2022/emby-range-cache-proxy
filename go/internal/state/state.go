@@ -182,6 +182,11 @@ CREATE TABLE IF NOT EXISTS source_metadata (
     updated_at REAL NOT NULL,
     PRIMARY KEY(item_id, media_source_id, cache_key)
 );
+CREATE TABLE IF NOT EXISTS runtime_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 `)
 	if err != nil {
 		return err
@@ -208,6 +213,26 @@ WHERE status IN ('failed', 'skipped')
      OR last_error_class NOT IN ('PermanentError', 'PrefetchSourceMismatch', 'RangeTooLarge')
   )
 `)
+	return err
+}
+
+func (s *Store) RuntimeSetting(key string) (string, bool, error) {
+	var value string
+	err := s.db.QueryRow(`SELECT value FROM runtime_settings WHERE key = ?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	return value, err == nil, err
+}
+
+func (s *Store) SetRuntimeSetting(key, value string, updatedAt float64) error {
+	_, err := s.db.Exec(`
+INSERT INTO runtime_settings (key, value, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET
+    value = excluded.value,
+    updated_at = excluded.updated_at
+`, key, value, updatedAt)
 	return err
 }
 

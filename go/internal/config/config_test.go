@@ -54,11 +54,26 @@ func TestLoadConfigDefaultsAndUnknownFields(t *testing.T) {
 	if cfg.DirectOpenList.Enabled || cfg.DirectOpenList.PathPrefix != "/openlist/" {
 		t.Fatalf("direct openlist defaults = %+v", cfg.DirectOpenList)
 	}
+	if cfg.DirectHTTP.Enabled || cfg.DirectHTTP.PathPrefix != "/http/" {
+		t.Fatalf("direct http defaults = %+v", cfg.DirectHTTP)
+	}
+	if cfg.DirectCache.RequireEligibility {
+		t.Fatalf("direct cache defaults = %+v", cfg.DirectCache)
+	}
 	if cfg.Cache.MaxBytes != 512*1024*1024*1024 {
 		t.Fatalf("cache max bytes = %d", cfg.Cache.MaxBytes)
 	}
 	if cfg.Cache.HeadBytes != 8*1024*1024 || cfg.Cache.TailBytes != 8*1024*1024 {
 		t.Fatalf("cache head/tail = %d/%d", cfg.Cache.HeadBytes, cfg.Cache.TailBytes)
+	}
+	if cfg.Cache.AdaptiveTailMaxBytes != 0 {
+		t.Fatalf("adaptive tail max = %d", cfg.Cache.AdaptiveTailMaxBytes)
+	}
+	if len(cfg.Cache.OpenHeadResponseBytesByExtension) != 0 {
+		t.Fatalf("open head response by extension = %+v", cfg.Cache.OpenHeadResponseBytesByExtension)
+	}
+	if len(cfg.Cache.OpenInitialResponseBytesByExtension) != 0 {
+		t.Fatalf("open initial response by extension = %+v", cfg.Cache.OpenInitialResponseBytesByExtension)
 	}
 	if cfg.Cache.DefaultOpenRangeBytes != 16*1024*1024 {
 		t.Fatalf("default open range = %d", cfg.Cache.DefaultOpenRangeBytes)
@@ -88,6 +103,7 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 		"listen_port":                     19090,
 		"cache_dir":                       filepath.Join(t.TempDir(), "cache"),
 		"prewarm_api_key":                 "secret",
+		"control_api_key":                 "control-secret",
 		"playback_info_timeout_seconds":   11,
 		"playback_auth_cache_ttl_seconds": 7,
 		"path_mappings": []map[string]any{
@@ -106,6 +122,14 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 			"path_prefix": "edge-openlist",
 			"token":       "direct-token",
 		},
+		"direct_http": map[string]any{
+			"enabled":           true,
+			"path_prefix":       "google",
+			"upstream_base_url": "http://127.0.0.1:18096/",
+		},
+		"direct_cache": map[string]any{
+			"require_eligibility": true,
+		},
 		"rollout": map[string]any{
 			"enabled":                    true,
 			"item_allowlist":             []string{"1"},
@@ -114,13 +138,16 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 			"ignored_future_rollout_key": true,
 		},
 		"cache": map[string]any{
-			"max_bytes":                "123",
-			"build_wait_seconds":       1.5,
-			"head_bytes":               32,
-			"tail_bytes":               64,
-			"chunk_bytes":              4096,
-			"default_open_range_bytes": 8192,
-			"open_head_response_bytes": 16384,
+			"max_bytes":                                "123",
+			"build_wait_seconds":                       1.5,
+			"head_bytes":                               32,
+			"tail_bytes":                               64,
+			"adaptive_tail_max_bytes":                  128,
+			"chunk_bytes":                              4096,
+			"default_open_range_bytes":                 8192,
+			"open_head_response_bytes":                 16384,
+			"open_head_response_bytes_by_extension":    map[string]any{".MP4": 4096, "mkv": "8192"},
+			"open_initial_response_bytes_by_extension": map[string]any{".MP4": 256},
 		},
 		"prewarm": map[string]any{
 			"enabled":                       true,
@@ -176,6 +203,9 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	if cfg.PlaybackAuthCacheTTLSeconds != 7 {
 		t.Fatalf("playback auth cache ttl = %d", cfg.PlaybackAuthCacheTTLSeconds)
 	}
+	if cfg.ControlAPIKey != "control-secret" {
+		t.Fatalf("control api key = %q", cfg.ControlAPIKey)
+	}
 	if len(cfg.PathMappings) != 2 || cfg.PathMappings[0].SourcePrefix != "/strm/" || cfg.PathMappings[1].SourcePrefix != "/media/" {
 		t.Fatalf("path mappings = %+v", cfg.PathMappings)
 	}
@@ -185,11 +215,23 @@ func TestLoadConfigParsesExplicitPhase2AndPathMappings(t *testing.T) {
 	if !cfg.DirectOpenList.Enabled || cfg.DirectOpenList.PathPrefix != "/edge-openlist/" || cfg.DirectOpenList.Token != "direct-token" {
 		t.Fatalf("direct openlist = %+v", cfg.DirectOpenList)
 	}
+	if !cfg.DirectHTTP.Enabled || cfg.DirectHTTP.PathPrefix != "/google/" || cfg.DirectHTTP.UpstreamBaseURL != "http://127.0.0.1:18096" {
+		t.Fatalf("direct http = %+v", cfg.DirectHTTP)
+	}
+	if !cfg.DirectCache.RequireEligibility {
+		t.Fatalf("direct cache = %+v", cfg.DirectCache)
+	}
 	if !cfg.Rollout.InScope("1", "ms1", "http://127.0.0.1:18096/a.mkv") {
 		t.Fatalf("expected rollout in scope")
 	}
-	if cfg.Cache.MaxBytes != 123 || cfg.Cache.HeadBytes != 32 || cfg.Cache.TailBytes != 64 || cfg.Cache.OpenHeadResponseBytes == nil || *cfg.Cache.OpenHeadResponseBytes != 16384 {
+	if cfg.Cache.MaxBytes != 123 || cfg.Cache.HeadBytes != 32 || cfg.Cache.TailBytes != 64 || cfg.Cache.AdaptiveTailMaxBytes != 128 || cfg.Cache.OpenHeadResponseBytes == nil || *cfg.Cache.OpenHeadResponseBytes != 16384 {
 		t.Fatalf("cache = %+v", cfg.Cache)
+	}
+	if cfg.Cache.OpenHeadResponseBytesByExtension["mp4"] != 4096 || cfg.Cache.OpenHeadResponseBytesByExtension["mkv"] != 8192 {
+		t.Fatalf("open head response by extension = %+v", cfg.Cache.OpenHeadResponseBytesByExtension)
+	}
+	if cfg.Cache.OpenInitialResponseBytesByExtension["mp4"] != 256 {
+		t.Fatalf("open initial response by extension = %+v", cfg.Cache.OpenInitialResponseBytesByExtension)
 	}
 	if !cfg.Prewarm.Enabled || cfg.Prewarm.IntervalSeconds != 60 || cfg.Prewarm.Concurrency != 2 || cfg.Prewarm.PlaybackInfoTimeoutSeconds != 17 {
 		t.Fatalf("prewarm = %+v", cfg.Prewarm)
@@ -221,8 +263,11 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{"bad openlist timeout", map[string]any{"openlist": map[string]any{"timeout_seconds": 0}}},
 		{"bad direct openlist without openlist", map[string]any{"direct_openlist": map[string]any{"enabled": true, "token": "secret"}}},
 		{"bad direct openlist without token", map[string]any{"openlist": map[string]any{"enabled": true, "base_url": "http://openlist.local"}, "direct_openlist": map[string]any{"enabled": true}}},
+		{"bad direct http without upstream", map[string]any{"direct_http": map[string]any{"enabled": true}}},
+		{"bad direct http upstream scheme", map[string]any{"direct_http": map[string]any{"enabled": true, "upstream_base_url": "file:///tmp/media"}}},
 		{"bad cache head", map[string]any{"cache": map[string]any{"head_bytes": 0}}},
 		{"bad cache tail", map[string]any{"cache": map[string]any{"tail_bytes": 0}}},
+		{"bad adaptive tail max", map[string]any{"cache": map[string]any{"adaptive_tail_max_bytes": 1}}},
 		{"bad mapping root", map[string]any{"path_mappings": []map[string]any{{"from": "/", "to": "/tmp"}}}},
 		{"string bool", map[string]any{"session": map[string]any{"enabled": "false"}}},
 		{"short prewarm", map[string]any{"prewarm": map[string]any{"interval_seconds": 59}}},

@@ -4,6 +4,38 @@ Unified local cache proxy for Emby original media direct-play requests.
 
 [中文说明](README.zh-CN.md)
 
+## Companion Emby Plugin
+
+This service can work with [MediaInfoKeeper](https://github.com/xmm2022/MediaInfoKeeper), while both projects remain independently deployable:
+
+- MediaInfoKeeper runs inside Emby and turns item-added, manual extraction,
+  scheduled extraction, and next-episode playback events into explicit prewarm
+  requests.
+- Emby Range Cache Proxy is the independent Go data plane. It validates cache
+  eligibility, reads the origin, owns head/tail and optional middle blocks, and
+  enforces the persisted `normal`, `read_only`, and `bypass` modes.
+- A trusted reverse proxy verifies playback signatures and adds
+  `X-Range-Cache-Eligible: 1` only to approved playback routes. Raw STRM,
+  ffprobe, screenshot, and other probe requests must not receive that header.
+
+The services do not need to share a host. In a split-host deployment, keep the
+plugin endpoints on an Emby-host loopback bridge. The bridge forwards prewarm
+and cache-mode requests to this service over TLS with a source-IP restriction
+and a separate control key.
+
+```text
+Emby + MediaInfoKeeper
+  |-- itemId/mediaSourceId --> /internal/prewarm
+  `-- master switch --> local bridge --> /internal/cache-mode
+
+playback client --> trusted signature proxy --> Range Cache Proxy --> origin
+```
+
+MediaInfo extraction is not cache eligibility. MediaInfoKeeper detail-page
+extraction and MediaInfo preload do not implicitly prewarm this service. See
+the [MediaInfoKeeper Range Cache section](https://github.com/xmm2022/MediaInfoKeeper#readme)
+for the plugin-side switch semantics.
+
 ## Usage
 
 The Go implementation under `go/` is the recommended runtime for production. It
@@ -23,6 +55,7 @@ Copy `config.example.json` to the host config path, usually
   "listen_port": 18180,
   "cache_dir": "/home/nax/emby/cache/range-proxy",
   "prewarm_api_key": "replace-with-a-long-random-secret",
+  "control_api_key": "replace-with-a-different-long-random-secret",
   "playback_info_timeout_seconds": 15,
   "rollout": {
     "enabled": true,
@@ -42,6 +75,55 @@ For OpenList-backed `.strm` sources, set `openlist.enabled=true`,
 `openlist.base_url` to your OpenList origin, and optionally `openlist.token`.
 Then add that OpenList base URL to `rollout.path_prefix_allowlist`; `.strm`
 entries can use `openlist:///Movies/movie.mkv`.
+
+### Direct edge paths
+
+The Go runtime can also serve stable edge paths without an Emby `PlaybackInfo`
+round trip on every media request:
+
+- `direct_openlist` maps a controlled path prefix to OpenList. It refreshes the
+  file URL through `/api/fs/get`, trusts the returned file size, and then uses
+  the shared head/tail and middle-cache pipeline.
+- `direct_http` maps a controlled path prefix to a fixed HTTP(S) upstream, which
+  is useful for a Google API proxy or another private origin.
+
+Both modes are disabled by default. Keep the service on loopback or behind an
+authenticated/signature-verifying reverse proxy; a direct path is not a user
+authorization mechanism by itself.
+
+```json
+{
+  "direct_openlist": {
+    "enabled": true,
+    "path_prefix": "/openlist/",
+    "token": "replace-with-a-long-random-secret"
+  },
+  "direct_http": {
+    "enabled": true,
+    "path_prefix": "/google/",
+    "upstream_base_url": "http://127.0.0.1:18096"
+  },
+  "direct_cache": {
+    "require_eligibility": true
+  }
+}
+```
+
+With `direct_cache.require_eligibility=true`, direct source requests use the
+head/tail and middle caches only when the trusted reverse proxy adds
+`X-Range-Cache-Eligible: 1`, or when the caller supplies a valid
+`X-Range-Cache-Prewarm-Key`. Requests without either credential still stream
+the requested origin range, but they do not read cache blocks, write metadata,
+build blocks, or record a playback session. Strip the eligibility header on
+raw STRM routes and set it only after signature verification on playback
+routes. This keeps ffprobe and screenshot reads separate from explicit prewarm.
+
+The cache can expand a tail block up to `cache.adaptive_tail_max_bytes` when a
+container metadata read ends at EOF but starts before the fixed tail block.
+`open_head_response_bytes_by_extension` and
+`open_initial_response_bytes_by_extension` allow startup response sizes to be
+tuned per container extension. Set `adaptive_tail_max_bytes` to `0` to disable
+adaptive tails.
 
 ### 2. Build and test the Go binary
 
@@ -220,6 +302,23 @@ Request body:
 The endpoint returns `202` with `queued` for a new in-process prewarm task and `existing` when the same item/source is already queued or running. The task queries Emby PlaybackInfo with the internal key using `prewarm.playback_info_timeout_seconds`, resolves mapped `.strm` files only when the resolved URL matches `rollout.path_prefix_allowlist`, skips already-complete head/tail cache blocks, uses `prewarm.concurrency` for in-process concurrency, throttles downloads with `prefetch.bandwidth_bytes_per_second`, and evicts through the head/tail cache capacity policy. This prewarm timeout is separate from the foreground playback authorization timeout.
 
 `prewarm.enabled` only controls the periodic recent-item scanner. Event-triggered prewarm through `/internal/prewarm` requires `prewarm_api_key` but does not require enabling periodic scans.
+
+## Runtime Cache Mode
+
+`GET /internal/cache-mode` returns the persisted runtime mode. `POST` accepts
+`{"mode":"normal"}`, `{"mode":"read_only"}`, or `{"mode":"bypass"}` and
+requires `X-Range-Cache-Control-Key: <control_api_key>` from a loopback caller.
+The mode is stored in the state SQLite database and survives restarts.
+
+- `normal` reads existing blocks and permits cache builds, prewarm, sessions,
+  and background prefetch.
+- `read_only` may serve existing head/tail or middle blocks, but cache misses
+  stream from origin and no new blocks or sessions are written.
+- `bypass` ignores all cache blocks. Direct routes stream from origin, ordinary
+  Emby proxy routes fall back to Emby, and authenticated prewarm receives `409`.
+
+Expose the control endpoint only through a TLS reverse proxy with a source-IP
+restriction. Do not reuse `prewarm_api_key` as `control_api_key`.
 
 ## Caddy Fallback Boundary
 

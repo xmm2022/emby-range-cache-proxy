@@ -26,6 +26,7 @@ type MediaSource struct {
 	Path          string
 	Protocol      string
 	Size          *int64
+	SizeTrusted   bool
 	Container     string
 	Bitrate       *int64
 }

@@ -13,11 +13,14 @@ type EffectiveConfig struct {
 	ListenPort                  int                     `json:"listen_port"`
 	CacheDir                    string                  `json:"cache_dir"`
 	PrewarmAPIKey               any                     `json:"prewarm_api_key"`
+	ControlAPIKey               any                     `json:"control_api_key"`
 	PlaybackInfoTimeoutSeconds  int                     `json:"playback_info_timeout_seconds"`
 	PlaybackAuthCacheTTLSeconds int                     `json:"playback_auth_cache_ttl_seconds"`
 	PathMappings                []EffectivePathMapping  `json:"path_mappings"`
 	OpenList                    EffectiveOpenList       `json:"openlist"`
 	DirectOpenList              EffectiveDirectOpenList `json:"direct_openlist"`
+	DirectHTTP                  EffectiveDirectHTTP     `json:"direct_http"`
+	DirectCache                 EffectiveDirectCache    `json:"direct_cache"`
 	Rollout                     EffectiveRollout        `json:"rollout"`
 	Cache                       EffectiveCache          `json:"cache"`
 	Prewarm                     EffectivePrewarm        `json:"prewarm"`
@@ -45,6 +48,16 @@ type EffectiveDirectOpenList struct {
 	Token      any    `json:"token"`
 }
 
+type EffectiveDirectHTTP struct {
+	Enabled         bool   `json:"enabled"`
+	PathPrefix      string `json:"path_prefix"`
+	UpstreamBaseURL string `json:"upstream_base_url"`
+}
+
+type EffectiveDirectCache struct {
+	RequireEligibility bool `json:"require_eligibility"`
+}
+
 type EffectiveRollout struct {
 	Enabled              bool     `json:"enabled"`
 	ItemAllowlist        []string `json:"item_allowlist"`
@@ -53,13 +66,16 @@ type EffectiveRollout struct {
 }
 
 type EffectiveCache struct {
-	MaxBytes              int64   `json:"max_bytes"`
-	BuildWaitSeconds      float64 `json:"build_wait_seconds"`
-	HeadBytes             int64   `json:"head_bytes"`
-	TailBytes             int64   `json:"tail_bytes"`
-	ChunkBytes            int64   `json:"chunk_bytes"`
-	DefaultOpenRangeBytes int64   `json:"default_open_range_bytes"`
-	OpenHeadResponseBytes *int64  `json:"open_head_response_bytes"`
+	MaxBytes                            int64            `json:"max_bytes"`
+	BuildWaitSeconds                    float64          `json:"build_wait_seconds"`
+	HeadBytes                           int64            `json:"head_bytes"`
+	TailBytes                           int64            `json:"tail_bytes"`
+	AdaptiveTailMaxBytes                int64            `json:"adaptive_tail_max_bytes"`
+	ChunkBytes                          int64            `json:"chunk_bytes"`
+	DefaultOpenRangeBytes               int64            `json:"default_open_range_bytes"`
+	OpenHeadResponseBytes               *int64           `json:"open_head_response_bytes"`
+	OpenHeadResponseBytesByExtension    map[string]int64 `json:"open_head_response_bytes_by_extension"`
+	OpenInitialResponseBytesByExtension map[string]int64 `json:"open_initial_response_bytes_by_extension"`
 }
 
 type EffectivePrewarm struct {
@@ -117,6 +133,14 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			prewarmKey = "REDACTED"
 		}
 	}
+	controlKey := any(nil)
+	if cfg.ControlAPIKey != "" {
+		if showSecrets {
+			controlKey = cfg.ControlAPIKey
+		} else {
+			controlKey = "REDACTED"
+		}
+	}
 	openListToken := any(nil)
 	if cfg.OpenList.Token != "" {
 		if showSecrets {
@@ -156,6 +180,7 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 		ListenPort:                  cfg.ListenPort,
 		CacheDir:                    cfg.CacheDir,
 		PrewarmAPIKey:               prewarmKey,
+		ControlAPIKey:               controlKey,
 		PlaybackInfoTimeoutSeconds:  cfg.PlaybackInfoTimeoutSeconds,
 		PlaybackAuthCacheTTLSeconds: cfg.PlaybackAuthCacheTTLSeconds,
 		PathMappings:                pathMappings,
@@ -171,6 +196,14 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			PathPrefix: cfg.DirectOpenList.PathPrefix,
 			Token:      directOpenListToken,
 		},
+		DirectHTTP: EffectiveDirectHTTP{
+			Enabled:         cfg.DirectHTTP.Enabled,
+			PathPrefix:      cfg.DirectHTTP.PathPrefix,
+			UpstreamBaseURL: cfg.DirectHTTP.UpstreamBaseURL,
+		},
+		DirectCache: EffectiveDirectCache{
+			RequireEligibility: cfg.DirectCache.RequireEligibility,
+		},
 		Rollout: EffectiveRollout{
 			Enabled:              cfg.Rollout.Enabled,
 			ItemAllowlist:        sortedSet(cfg.Rollout.ItemAllowlist),
@@ -178,13 +211,16 @@ func Effective(cfg Config, showSecrets bool) EffectiveConfig {
 			PathPrefixAllowlist:  append([]string(nil), cfg.Rollout.PathPrefixAllowlist...),
 		},
 		Cache: EffectiveCache{
-			MaxBytes:              cfg.Cache.MaxBytes,
-			BuildWaitSeconds:      cfg.Cache.BuildWaitSeconds,
-			HeadBytes:             cfg.Cache.HeadBytes,
-			TailBytes:             cfg.Cache.TailBytes,
-			ChunkBytes:            cfg.Cache.ChunkBytes,
-			DefaultOpenRangeBytes: cfg.Cache.DefaultOpenRangeBytes,
-			OpenHeadResponseBytes: cfg.Cache.OpenHeadResponseBytes,
+			MaxBytes:                            cfg.Cache.MaxBytes,
+			BuildWaitSeconds:                    cfg.Cache.BuildWaitSeconds,
+			HeadBytes:                           cfg.Cache.HeadBytes,
+			TailBytes:                           cfg.Cache.TailBytes,
+			AdaptiveTailMaxBytes:                cfg.Cache.AdaptiveTailMaxBytes,
+			ChunkBytes:                          cfg.Cache.ChunkBytes,
+			DefaultOpenRangeBytes:               cfg.Cache.DefaultOpenRangeBytes,
+			OpenHeadResponseBytes:               cfg.Cache.OpenHeadResponseBytes,
+			OpenHeadResponseBytesByExtension:    cfg.Cache.OpenHeadResponseBytesByExtension,
+			OpenInitialResponseBytesByExtension: cfg.Cache.OpenInitialResponseBytesByExtension,
 		},
 		Prewarm: EffectivePrewarm{
 			Enabled:                    cfg.Prewarm.Enabled,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,7 +18,42 @@ import (
 
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/config"
 	"github.com/xmm2022/emby-range-cache-proxy/go/internal/emby"
+	"github.com/xmm2022/emby-range-cache-proxy/go/internal/model"
 )
+
+var errTestClientDisconnected = errors.New("simulated client disconnect")
+
+type disconnectingResponseWriter struct {
+	header    http.Header
+	status    int
+	remaining int
+}
+
+func (w *disconnectingResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *disconnectingResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *disconnectingResponseWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, errTestClientDisconnected
+	}
+	n := len(p)
+	if n > w.remaining {
+		n = w.remaining
+	}
+	w.remaining -= n
+	if n < len(p) {
+		return n, errTestClientDisconnected
+	}
+	return n, nil
+}
 
 func testConfig(t *testing.T, embyBase, fallbackBase string) config.Config {
 	t.Helper()
@@ -87,6 +123,29 @@ func TestNewUsesSeparatePrewarmAuthTimeout(t *testing.T) {
 	}
 	if server.fallbackClient.Timeout != 0 {
 		t.Fatalf("fallback timeout = %s", server.fallbackClient.Timeout)
+	}
+}
+
+func TestOpenHeadResponseBytesUsesExtensionOverride(t *testing.T) {
+	defaultBytes := int64(8 * 1024 * 1024)
+	server := &Server{cfg: config.Config{Cache: config.CacheConfig{
+		OpenHeadResponseBytes: &defaultBytes,
+		OpenHeadResponseBytesByExtension: map[string]int64{
+			"mp4": 4 * 1024 * 1024,
+		},
+		OpenInitialResponseBytesByExtension: map[string]int64{
+			"mp4": 256 * 1024,
+		},
+	}}}
+
+	if got := server.openHeadResponseBytes(".MP4", "bytes=0-"); got == nil || *got != 256*1024 {
+		t.Fatalf("mp4 initial override = %v", got)
+	}
+	if got := server.openHeadResponseBytes(".MP4", "bytes=48-"); got == nil || *got != 4*1024*1024 {
+		t.Fatalf("mp4 override = %v", got)
+	}
+	if got := server.openHeadResponseBytes("mkv", "bytes=0-"); got == nil || *got != defaultBytes {
+		t.Fatalf("mkv fallback = %v", got)
 	}
 }
 
@@ -428,19 +487,21 @@ func TestAuthorizedHeadRangeCacheHitSkipsOriginHead(t *testing.T) {
 
 func TestDirectOpenListEndpointBuildsAndHitsCache(t *testing.T) {
 	var openListAPICalls int32
+	var originHeads int32
 	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
 	openList := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/fs/get":
 			atomic.AddInt32(&openListAPICalls, 1)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"code":200,"data":{"is_dir":false,"sign":"sig"}}`))
+			_, _ = w.Write([]byte(`{"code":200,"data":{"is_dir":false,"size":26,"sign":"sig"}}`))
 		case "/d/movie.mkv":
 			if r.URL.Query().Get("sign") != "sig" {
 				t.Fatalf("missing sign: %s", r.URL.RawQuery)
 			}
 			switch r.Method {
 			case http.MethodHead:
+				atomic.AddInt32(&originHeads, 1)
 				w.Header().Set("Content-Length", "26")
 				w.Header().Set("Content-Type", "video/x-matroska")
 				w.Header().Set("ETag", `"v1"`)
@@ -464,6 +525,7 @@ func TestDirectOpenListEndpointBuildsAndHitsCache(t *testing.T) {
 	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
 	cfg.OpenList = config.OpenListConfig{Enabled: true, BaseURL: openList.URL, TimeoutSeconds: 1}
 	cfg.DirectOpenList = config.DirectOpenListConfig{Enabled: true, PathPrefix: "/openlist/", Token: "direct-secret"}
+	cfg.DirectCache.RequireEligibility = true
 	server, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -473,6 +535,7 @@ func TestDirectOpenListEndpointBuildsAndHitsCache(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv?token=direct-secret", nil)
 		req.Header.Set("Range", "bytes=0-3")
+		req.Header.Set(directCacheEligibilityHeader, "1")
 		rec := httptest.NewRecorder()
 		server.ServeHTTP(rec, req)
 		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
@@ -484,6 +547,9 @@ func TestDirectOpenListEndpointBuildsAndHitsCache(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&openListAPICalls); got != 1 {
 		t.Fatalf("openListAPICalls=%d", got)
+	}
+	if got := atomic.LoadInt32(&originHeads); got != 0 {
+		t.Fatalf("originHeads=%d", got)
 	}
 	stats := server.SnapshotStats()
 	if stats.Counters.CacheBuild != 1 || stats.Counters.CacheHit != 1 {
@@ -510,6 +576,395 @@ func TestDirectOpenListEndpointRequiresToken(t *testing.T) {
 	}
 	if stats := server.SnapshotStats().Counters; stats.Denied != 1 || stats.ProxyErrors != 0 {
 		t.Fatalf("counters=%+v", stats)
+	}
+}
+
+func TestDirectHTTPEndpointBuildsAndHitsCache(t *testing.T) {
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	originHeads := 0
+	originGets := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/gdredir-admin/Movies/a.mp4" || r.URL.Query().Get("account") != "main" {
+			t.Fatalf("unexpected upstream request: %s", r.URL.String())
+		}
+		switch r.Method {
+		case http.MethodHead:
+			originHeads++
+			w.Header().Set("Content-Length", "26")
+			w.Header().Set("Content-Type", "video/mp4")
+		case http.MethodGet:
+			originGets++
+			if got := r.Header.Get("Range"); got != "bytes=0-25" {
+				t.Fatalf("origin range = %q", got)
+			}
+			w.Header().Set("Content-Range", "bytes 0-25/26")
+			w.Header().Set("Content-Length", "26")
+			w.Header().Set("Content-Type", "video/mp4")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(originBody)
+		default:
+			t.Fatalf("method = %s", r.Method)
+		}
+	}))
+	defer origin.Close()
+
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.DirectHTTP = config.DirectHTTPConfig{Enabled: true, PathPrefix: "/google/", UpstreamBaseURL: origin.URL}
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/google/gdredir-admin/Movies/a.mp4?account=main", nil)
+		req.Header.Set("Range", "bytes=0-3")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+			t.Fatalf("iter=%d code=%d body=%q", i, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Type"); got != "video/mp4" {
+			t.Fatalf("content-type=%q", got)
+		}
+	}
+	if originHeads != 1 || originGets != 1 {
+		t.Fatalf("originHeads=%d originGets=%d", originHeads, originGets)
+	}
+	stats := server.SnapshotStats()
+	if stats.Counters.CacheBuild != 1 || stats.Counters.CacheHit != 1 {
+		t.Fatalf("counters=%+v", stats.Counters)
+	}
+}
+
+func TestDirectHTTPEndpointWithoutEligibilityAlwaysStreamsOrigin(t *testing.T) {
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	originHeads := 0
+	originGets := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			originHeads++
+			w.Header().Set("Content-Length", "26")
+			w.Header().Set("Content-Type", "video/mp4")
+		case http.MethodGet:
+			originGets++
+			if got := r.Header.Get("Range"); got != "bytes=0-3" {
+				t.Fatalf("origin range = %q", got)
+			}
+			w.Header().Set("Content-Range", "bytes 0-3/26")
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("Content-Type", "video/mp4")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(originBody[:4])
+		default:
+			t.Fatalf("method = %s", r.Method)
+		}
+	}))
+	defer origin.Close()
+
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.DirectHTTP = config.DirectHTTPConfig{Enabled: true, PathPrefix: "/google/", UpstreamBaseURL: origin.URL}
+	cfg.DirectCache.RequireEligibility = true
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/google/movie.mp4", nil)
+		req.Header.Set("Range", "bytes=0-3")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+			t.Fatalf("iter=%d code=%d body=%q", i, rec.Code, rec.Body.String())
+		}
+	}
+	if originHeads != 2 || originGets != 2 {
+		t.Fatalf("originHeads=%d originGets=%d", originHeads, originGets)
+	}
+	stats := server.SnapshotStats()
+	if stats.Counters.CacheBuild != 0 || stats.Counters.CacheHit != 0 || stats.Counters.Origin != 2 {
+		t.Fatalf("counters=%+v", stats.Counters)
+	}
+}
+
+func TestDirectCacheEligibilityAcceptsSignedPlaybackOrAuthenticatedPrewarm(t *testing.T) {
+	server := &Server{cfg: config.Config{
+		PrewarmAPIKey: "prewarm-secret",
+		DirectCache:   config.DirectCacheConfig{RequireEligibility: true},
+	}}
+
+	plain := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
+	if access := server.directCacheAccess(plain); access.read || access.write {
+		t.Fatal("plain direct request unexpectedly eligible")
+	}
+
+	playback := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
+	playback.Header.Set(directCacheEligibilityHeader, "1")
+	if access := server.directCacheAccess(playback); !access.read || !access.write {
+		t.Fatal("signed playback marker was not accepted")
+	}
+
+	prewarm := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv", nil)
+	prewarm.Header.Set("X-Range-Cache-Prewarm-Key", "prewarm-secret")
+	if access := server.directCacheAccess(prewarm); !access.read || !access.write {
+		t.Fatal("authenticated prewarm was not accepted")
+	}
+}
+
+func TestCacheModeControlPersistsAndRequiresAuthentication(t *testing.T) {
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.ControlAPIKey = "control-secret"
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unauthorized := httptest.NewRequest(http.MethodPost, "/internal/cache-mode", strings.NewReader(`{"mode":"bypass"}`))
+	unauthorized.RemoteAddr = "127.0.0.1:12345"
+	unauthorizedRecorder := httptest.NewRecorder()
+	server.ServeHTTP(unauthorizedRecorder, unauthorized)
+	if unauthorizedRecorder.Code != http.StatusForbidden {
+		t.Fatalf("unauthorized code=%d", unauthorizedRecorder.Code)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/internal/cache-mode", strings.NewReader(`{"mode":"bypass"}`))
+	request.RemoteAddr = "127.0.0.1:12345"
+	request.Header.Set("X-Range-Cache-Control-Key", "control-secret")
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || server.currentCacheMode() != cacheModeBypass {
+		t.Fatalf("code=%d mode=%s body=%q", recorder.Code, server.currentCacheMode(), recorder.Body.String())
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if restarted.currentCacheMode() != cacheModeBypass {
+		t.Fatalf("persisted mode=%s", restarted.currentCacheMode())
+	}
+}
+
+func TestReadOnlyModeHitsExistingHeadButDoesNotBuildMissingHead(t *testing.T) {
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	originGets := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "26")
+			w.Header().Set("Content-Type", "video/mp4")
+		case http.MethodGet:
+			originGets++
+			start, end := 0, 25
+			if r.Header.Get("Range") == "bytes=0-3" {
+				end = 3
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/26", start, end))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(originBody[start : end+1])
+		}
+	}))
+	defer origin.Close()
+
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.DirectHTTP = config.DirectHTTPConfig{Enabled: true, PathPrefix: "/google/", UpstreamBaseURL: origin.URL}
+	cfg.DirectCache.RequireEligibility = true
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	requestRange := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Range", "bytes=0-3")
+		req.Header.Set(directCacheEligibilityHeader, "1")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := requestRange("/google/cached.mp4"); rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+		t.Fatalf("normal code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if stats := server.SnapshotStats().Counters; stats.CacheBuild != 1 {
+		t.Fatalf("normal counters=%+v", stats)
+	}
+	if err := server.setCacheMode(cacheModeReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if rec := requestRange("/google/cached.mp4"); rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+		t.Fatalf("read-only hit code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	before := server.SnapshotStats().Counters
+	if rec := requestRange("/google/missing.mp4"); rec.Code != http.StatusPartialContent || rec.Body.String() != "abcd" {
+		t.Fatalf("read-only miss code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	after := server.SnapshotStats().Counters
+	if after.CacheBuild != before.CacheBuild || after.Origin != before.Origin+1 || after.CacheHit != before.CacheHit {
+		t.Fatalf("before=%+v after=%+v originGets=%d", before, after, originGets)
+	}
+}
+
+func TestBypassModeRejectsAuthenticatedPrewarmDirectRequest(t *testing.T) {
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.DirectHTTP = config.DirectHTTPConfig{Enabled: true, PathPrefix: "/google/", UpstreamBaseURL: "http://127.0.0.1:1"}
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if err := server.setCacheMode(cacheModeBypass); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/google/movie.mp4", nil)
+	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("X-Range-Cache-Prewarm-Key", "internal-secret")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDirectHTTPAdaptiveTailExpandsToObservedRangeAndHitsCache(t *testing.T) {
+	originBody := []byte(strings.Repeat("0123456789", 10))
+	originHeads := 0
+	originGets := 0
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			originHeads++
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("Content-Type", "video/mp4")
+		case http.MethodGet:
+			originGets++
+			if got := r.Header.Get("Range"); got != "bytes=75-99" {
+				t.Fatalf("origin range = %q", got)
+			}
+			w.Header().Set("Content-Range", "bytes 75-99/100")
+			w.Header().Set("Content-Length", "25")
+			w.Header().Set("Content-Type", "video/mp4")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(originBody[75:])
+		default:
+			t.Fatalf("method = %s", r.Method)
+		}
+	}))
+	defer origin.Close()
+
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.DirectHTTP = config.DirectHTTPConfig{Enabled: true, PathPrefix: "/google/", UpstreamBaseURL: origin.URL}
+	cfg.Cache.HeadBytes = 8
+	cfg.Cache.TailBytes = 10
+	cfg.Cache.AdaptiveTailMaxBytes = 30
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/google/gdredir-admin/Movies/adaptive.mp4", nil)
+		req.Header.Set("Range", "bytes=75-")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || !bytes.Equal(rec.Body.Bytes(), originBody[75:]) {
+			t.Fatalf("iter=%d code=%d body=%q", i, rec.Code, rec.Body.String())
+		}
+	}
+	if originHeads != 1 || originGets != 1 {
+		t.Fatalf("originHeads=%d originGets=%d", originHeads, originGets)
+	}
+	stats := server.SnapshotStats()
+	if stats.Counters.CacheBuild != 1 || stats.Counters.CacheHit != 1 {
+		t.Fatalf("counters=%+v", stats.Counters)
+	}
+}
+
+func TestAdaptiveTailRangeHonorsConfiguredMaximum(t *testing.T) {
+	server := &Server{cfg: config.Config{Cache: config.CacheConfig{AdaptiveTailMaxBytes: 30}}}
+
+	name, block, adaptive := server.cacheBlockForRequest(model.ByteRange{Start: 75, End: 99}, 100, 8, 10)
+	if name != "tail" || !adaptive || block.Start != 75 || block.End != 99 {
+		t.Fatalf("adaptive block = %q %+v adaptive=%v", name, block, adaptive)
+	}
+
+	name, _, adaptive = server.cacheBlockForRequest(model.ByteRange{Start: 69, End: 99}, 100, 8, 10)
+	if name != "" || adaptive {
+		t.Fatalf("out-of-limit request unexpectedly adaptive: name=%q adaptive=%v", name, adaptive)
+	}
+}
+
+func TestDirectOpenListCacheBuildResumesAfterShortOriginResponse(t *testing.T) {
+	originBody := []byte("abcdefghijklmnopqrstuvwxyz")
+	originGets := 0
+	var requestedRanges []string
+	openList := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/fs/get":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":200,"data":{"is_dir":false,"size":26,"sign":"sig"}}`))
+		case "/d/movie.mkv":
+			if r.Method != http.MethodGet {
+				t.Fatalf("method = %s", r.Method)
+			}
+			originGets++
+			requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+			switch originGets {
+			case 1:
+				w.Header().Set("Content-Range", "bytes 0-25/26")
+				w.Header().Set("Content-Length", "26")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(originBody[:8])
+			case 2:
+				w.Header().Set("Content-Range", "bytes 8-25/26")
+				w.Header().Set("Content-Length", "18")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(originBody[8:])
+			default:
+				t.Fatalf("unexpected origin GET %d", originGets)
+			}
+		default:
+			t.Fatalf("unexpected openlist request: %s", r.URL.String())
+		}
+	}))
+	defer openList.Close()
+
+	cfg := testConfig(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	cfg.OpenList = config.OpenListConfig{Enabled: true, BaseURL: openList.URL, TimeoutSeconds: 1}
+	cfg.DirectOpenList = config.DirectOpenListConfig{Enabled: true, PathPrefix: "/openlist/", Token: "direct-secret"}
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/openlist/movie.mkv?token=direct-secret", nil)
+		req.Header.Set("Range", "bytes=0-9")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent || rec.Body.String() != "abcdefghij" {
+			t.Fatalf("iter=%d code=%d body=%q", i, rec.Code, rec.Body.String())
+		}
+	}
+	if got, want := strings.Join(requestedRanges, ","), "bytes=0-25,bytes=8-25"; got != want {
+		t.Fatalf("ranges=%q want=%q", got, want)
+	}
+	stats := server.SnapshotStats()
+	if originGets != 2 || stats.Counters.CacheBuild != 1 || stats.Counters.CacheHit != 1 {
+		t.Fatalf("originGets=%d counters=%+v", originGets, stats.Counters)
 	}
 }
 
@@ -976,6 +1431,58 @@ func TestConcurrentHeadRangeRequestsShareInProgressBuild(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&originGets); got != 1 {
 		t.Fatalf("originGets=%d", got)
+	}
+}
+
+func TestHeadCacheBuildFinishesAfterClientDisconnect(t *testing.T) {
+	var originGets int32
+	originBody := strings.Repeat("x", 32)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "32")
+			w.Header().Set("ETag", `"v1"`)
+		case http.MethodGet:
+			atomic.AddInt32(&originGets, 1)
+			w.Header().Set("Content-Range", "bytes 0-31/32")
+			w.Header().Set("Content-Length", "32")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte(originBody))
+		}
+	}))
+	defer origin.Close()
+	emby := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"MediaSources":[{"Id":"ms1","Path":"` + origin.URL + `/movie.mkv","Protocol":"Http"}]}`))
+	}))
+	defer emby.Close()
+
+	cfg := testConfig(t, emby.URL, emby.URL)
+	cfg.Cache.ChunkBytes = 8
+	server, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token", nil)
+	req.Header.Set("Range", "bytes=0-15")
+	disconnected := &disconnectingResponseWriter{remaining: 4}
+	server.ServeHTTP(disconnected, req)
+
+	req = httptest.NewRequest(http.MethodGet, "/emby/videos/10535/original.mkv?MediaSourceId=ms1&api_key=user-token", nil)
+	req.Header.Set("Range", "bytes=0-15")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPartialContent || rec.Body.String() != strings.Repeat("x", 16) {
+		t.Fatalf("code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&originGets); got != 1 {
+		t.Fatalf("originGets=%d", got)
+	}
+	stats := server.SnapshotStats()
+	if stats.Counters.CacheBuild != 1 || stats.Counters.CacheHit != 1 || stats.Counters.ProxyErrors != 1 {
+		t.Fatalf("counters=%+v", stats.Counters)
 	}
 }
 
