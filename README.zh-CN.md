@@ -2,15 +2,35 @@
 
 Emby 原盘直放请求的本地 Range 缓存代理。生产环境建议使用 Go 版本；Python 版本保留为兼容实现和回滚路径。
 
+## 与 MediaInfoKeeper 联动
+
+本服务可以与 [MediaInfoKeeper](https://github.com/xmm2022/MediaInfoKeeper) 配合使用，但两个项目保持独立部署：
+
+- MediaInfoKeeper 运行在 Emby 进程内，把新入库、快捷菜单提取、计划任务提取和播放下一集等事件转换为明确的预热请求。
+- Emby Range Cache Proxy 是独立的 Go 数据面，负责缓存资格校验、源站访问、head/tail 与可选 middle cache，并执行持久化的 `normal`、`read_only`、`bypass` 模式。
+- Caddy 或其他可信反向代理负责验证播放签名，只对合格播放路由设置 `X-Range-Cache-Eligible: 1`。普通 STRM、ffprobe、截图和其他探测请求不得携带该资格头。
+
+两个服务不需要位于同一台主机。分离部署时，插件建议只访问 Emby 主机上的 loopback 控制桥；控制桥再通过 TLS、来源 IP 白名单和独立控制密钥访问远端 Go 服务。
+
+```text
+Emby + MediaInfoKeeper
+  ├─ itemId/mediaSourceId ──> /internal/prewarm
+  └─ Range Cache 总开关 ──> 本机控制桥 ──> /internal/cache-mode
+
+客户端播放 ──> 可信签名反向代理 ──> Range Cache Proxy ──> 源站
+```
+
+MediaInfo 提取本身不等于缓存资格。MediaInfoKeeper 的详情页提取和 MediaInfo 预加载不会隐式预热本服务；插件侧三个 Range Cache 开关的优先级和作用见 [MediaInfoKeeper README](https://github.com/xmm2022/MediaInfoKeeper#readme)。
+
 ## 当前版本适合怎么用
 
 这个版本已经可以作为独立服务部署，控制入口主要分三层：
 
 - 服务控制：用 systemd 或 Docker Compose 启停 Go 服务。
 - 流量控制：用 Caddy 只把指定影片、指定 `MediaSourceId` 的原盘直放请求转到缓存代理。
-- 功能控制：用 `/etc/emby-range-cache-proxy/config.json` 开关预热、会话观察、中段缓存、预取、白名单和缓存容量。
+- 功能控制：用 `/etc/emby-range-cache-proxy/config.json` 开关预热、会话观察、中段缓存、预取、白名单和缓存容量；用 `/internal/cache-mode` 热切换总运行模式。
 
-需要注意：当前配置是启动时加载的 JSON 配置，修改后需要重启服务生效；还没有 Web 管理界面，也没有热加载接口。对服务器部署来说这样更简单、可审计；如果后续要频繁远程调整，可以再加一个本机管理 API 或管理面板。
+需要注意：普通 JSON 配置仍在启动时加载，修改后需要重启服务；只有 Range Cache 总运行模式通过内部接口热切换并写入 SQLite，服务重启后仍会保留。当前没有 Web 管理界面。
 
 ## 推荐部署方式
 
@@ -41,6 +61,7 @@ make check-config CONFIG=/etc/emby-range-cache-proxy/config.json
   "listen_port": 18180,
   "cache_dir": "/home/nax/emby/cache/range-proxy",
   "prewarm_api_key": "replace-with-a-long-random-secret",
+  "control_api_key": "replace-with-a-different-long-random-secret",
   "playback_info_timeout_seconds": 15,
   "rollout": {
     "enabled": true,
@@ -201,7 +222,17 @@ curl -fsS -X POST http://127.0.0.1:18180/internal/prewarm \
 - `queued`：新任务已进入队列。
 - `existing`：同一个 item/source 已经在排队或运行。
 
-当前预热触发可以由你魔改过的 Emby 插件在媒体信息提取完成后调用这个本机接口；缓存代理本身不依赖 Emby 插件，也可以用脚本、定时任务或其他控制面调用。
+[MediaInfoKeeper](https://github.com/xmm2022/MediaInfoKeeper) 可以按插件开关在入库、快捷菜单、计划任务或播放下一集时调用这个接口；缓存代理本身不依赖 Emby 插件，也可以由脚本、定时任务或其他控制面调用。
+
+## 运行时总模式
+
+`GET /internal/cache-mode` 返回持久化的当前模式。`POST` 接受 `normal`、`read_only` 或 `bypass`，并要求 loopback 调用者携带 `X-Range-Cache-Control-Key: <control_api_key>`。模式写入状态 SQLite，服务重启后仍然生效。
+
+- `normal`：读取已有缓存，并允许新建缓存、预热、会话记录和后台预取。
+- `read_only`：可以读取已有 head/tail/middle；缓存未命中时直接回源，不建立新缓存或会话。
+- `bypass`：完全忽略已有缓存。直接路由回源，普通 Emby 路由回退到 Emby，已鉴权预热返回 `409`。
+
+控制接口如需跨主机暴露，必须置于 TLS 反向代理之后，并限制来源 IP。`control_api_key` 不应复用 `prewarm_api_key`。
 
 ## 常用配置项
 
@@ -212,6 +243,7 @@ curl -fsS -X POST http://127.0.0.1:18180/internal/prewarm \
 | `listen_host` / `listen_port` | 缓存代理监听地址 | 建议 `127.0.0.1:18180` |
 | `cache_dir` | head/tail/middle 缓存和状态库目录 | 放在容量足够的磁盘 |
 | `prewarm_api_key` | 内部预热和后台任务密钥 | 使用长随机值，不要复用 Emby 用户 token |
+| `control_api_key` | `/internal/cache-mode` 的独立控制密钥 | 不要与 `prewarm_api_key` 复用 |
 | `playback_info_timeout_seconds` | 用户播放请求查询 Emby PlaybackInfo 的前台鉴权超时 | 默认 `15`，冷启动慢可调大 |
 | `openlist.enabled` / `openlist.base_url` | 启用 OpenList 源适配并配置 OpenList 地址 | `.strm` 可写 `openlist:///Movies/movie.mkv` |
 | `openlist.token` | 调用 OpenList `/api/fs/get` 的 token | 按 OpenList 原样填，不要加 `Bearer` |

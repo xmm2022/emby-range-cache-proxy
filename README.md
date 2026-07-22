@@ -4,6 +4,38 @@ Unified local cache proxy for Emby original media direct-play requests.
 
 [中文说明](README.zh-CN.md)
 
+## Companion Emby Plugin
+
+This service can work with [MediaInfoKeeper](https://github.com/xmm2022/MediaInfoKeeper), while both projects remain independently deployable:
+
+- MediaInfoKeeper runs inside Emby and turns item-added, manual extraction,
+  scheduled extraction, and next-episode playback events into explicit prewarm
+  requests.
+- Emby Range Cache Proxy is the independent Go data plane. It validates cache
+  eligibility, reads the origin, owns head/tail and optional middle blocks, and
+  enforces the persisted `normal`, `read_only`, and `bypass` modes.
+- A trusted reverse proxy verifies playback signatures and adds
+  `X-Range-Cache-Eligible: 1` only to approved playback routes. Raw STRM,
+  ffprobe, screenshot, and other probe requests must not receive that header.
+
+The services do not need to share a host. In a split-host deployment, keep the
+plugin endpoints on an Emby-host loopback bridge. The bridge forwards prewarm
+and cache-mode requests to this service over TLS with a source-IP restriction
+and a separate control key.
+
+```text
+Emby + MediaInfoKeeper
+  |-- itemId/mediaSourceId --> /internal/prewarm
+  `-- master switch --> local bridge --> /internal/cache-mode
+
+playback client --> trusted signature proxy --> Range Cache Proxy --> origin
+```
+
+MediaInfo extraction is not cache eligibility. MediaInfoKeeper detail-page
+extraction and MediaInfo preload do not implicitly prewarm this service. See
+the [MediaInfoKeeper Range Cache section](https://github.com/xmm2022/MediaInfoKeeper#readme)
+for the plugin-side switch semantics.
+
 ## Usage
 
 The Go implementation under `go/` is the recommended runtime for production. It
